@@ -78,103 +78,125 @@ fn main() {
     let env = Env::default().default_filter_or("warn");
     env_logger::init_from_env(env);
     let cli = Cli::parse();
-
+    let (app_id, instance_id, listener) = obtain_listener(&cli);
     let sandbox_engine = cli.sandbox_engine;
-    let (app_id, instance_id, listener) = match (cli.socket_activation, cli.listen) {
-        (true, None) => match sd_notify::listen_fds_with_names(true).map(|mut it| it.next()) {
-            Ok(Some((raw_fd, name))) => {
-                info!("Received socket {name} ({raw_fd:#?}) from parent");
-                // SAFETY: sd_notify::listen_fds_with_names(true) unsets the LISTEN_FDS variable so we should be
-                // the only user of this fd
-                let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
-                // The IDs are taken from --app-id/--instance-id (or their
-                // environment variables). They used to be derived from the
-                // fd name, but that only worked for "app@instance" instance
-                // names and wlsctx@.socket sets FileDescriptorName=%i, so
-                // the name normally contains no '@' and the derivation
-                // panicked.
-                let (app_id, instance_id) = (
-                    cli.app_id.expect("clap guarantees --app-id is present"),
-                    cli
-                        .instance_id
-                        .expect("clap guarantees --instance-id is present"),
-                );
-                (app_id, instance_id, listener)
-            }
-            _ => {
-                panic!("Failed to get socket FD from activation environment")
-            }
-        },
-        (_, Some(socket_path)) => {
-            let socket_abspath = match socket_path.is_absolute() {
-                true => socket_path,
-                false => xdg::BaseDirectories::new()
-                    .place_runtime_file(socket_path)
-                    .unwrap(),
-            };
-            // A stale socket left by a previous run is removed; any other
-            // pre-existing path is an error, since binding would fail.
-            match fs::metadata(&socket_abspath) {
-                Ok(meta) if meta.file_type().is_socket() => {
-                    info!("Removing old socket {socket_abspath:?}");
-                    let _ = fs::remove_file(&socket_abspath)
-                        .inspect_err(|e| {
-                            error!("Failed to remove stale socket {socket_abspath:?}: {e}")
-                        });
-                }
-                Ok(_) => {
-                    error!("Path already exists and is not a socket: {socket_abspath:?}");
-                    std::process::exit(1);
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    error!("Failed to stat {socket_abspath:?}: {e}");
-                    std::process::exit(1);
-                }
-            }
-            (
-                cli.app_id.unwrap(),
-                cli.instance_id.unwrap(),
-                UnixListener::bind(socket_abspath).expect("Failed to bind to Unix socket"),
-            )
-        }
-        _ => {
-            panic!("No listening socket provided")
-        }
-    };
     if log_enabled!(Level::Info) {
         if let Ok(local_addr) = listener.local_addr() {
             info!("Listening on {local_addr:?}")
         }
     }
 
-    let close_fd: OwnedFd = {
-        // Create a Wayland connection by connecting to the server through the
-        // environment-provided configuration.
-        let conn = Connection::connect_to_env().expect("upstream Wayland connection failed");
-        let (globals, mut event_queue) = registry_queue_init::<State>(&conn).unwrap();
-        let qh = &event_queue.handle();
-        let security_context_manager: wp_security_context_manager_v1::WpSecurityContextManagerV1 =
-            globals.bind(qh, 1..=1, ()).unwrap();
-        let (reader, writer) = io::pipe().unwrap();
-        let security_context =
-            security_context_manager.create_listener(listener.as_fd(), reader.as_fd(), qh, ());
-        security_context_manager.destroy();
-        info!("Create security context mapping for {sandbox_engine} app: {app_id} ({instance_id})");
-        security_context.set_sandbox_engine(sandbox_engine);
-        security_context.set_app_id(app_id.clone());
-        security_context.set_instance_id(instance_id.clone());
-        security_context.commit();
-        security_context.destroy();
-        event_queue.roundtrip(&mut State {}).unwrap();
-        writer.into()
-    };
+    let close_fd =
+        create_security_context(&listener, &sandbox_engine, &app_id, &instance_id);
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
 
-    // This signal handler is inspired by the implementation in catatonit:
-    // https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588
-    //
+    run_signal_loop();
+    info!("Shutting down.");
+}
+
+/// Get the Unix listener to tag, either from a systemd socket activation
+/// or by binding the socket ourselves. Returns (app_id, instance_id,
+/// listener).
+fn obtain_listener(cli: &Cli) -> (String, String, UnixListener) {
+    let (app_id, instance_id) = (
+        cli.app_id
+            .as_deref()
+            .expect("clap guarantees --app-id is present")
+            .to_string(),
+        cli.instance_id
+            .as_deref()
+            .expect("clap guarantees --instance-id is present")
+            .to_string(),
+    );
+    if cli.socket_activation {
+        // The IDs come from --app-id/--instance-id (or the
+        // WLSCTX_APP_ID / WLSCTX_INSTANCE_ID environment variables). They
+        // used to be derived from the fd name, but that only worked for
+        // "app@instance" instance names and wlsctx@.socket sets
+        // FileDescriptorName=%i, so the name normally contains no '@' and
+        // the derivation panicked.
+        match sd_notify::listen_fds_with_names(true).map(|mut it| it.next()) {
+            Ok(Some((raw_fd, name))) => {
+                info!("Received socket {name} ({raw_fd:#?}) from parent");
+                // SAFETY: sd_notify::listen_fds_with_names(true) unsets the LISTEN_FDS variable so we should be
+                // the only user of this fd
+                let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
+                (app_id, instance_id, listener)
+            }
+            _ => panic!("Failed to get socket FD from activation environment"),
+        }
+    } else {
+        let socket_path = cli.listen.as_ref().expect("clap guarantees --listen is present");
+        let socket_abspath = match socket_path.is_absolute() {
+            true => socket_path.clone(),
+            false => xdg::BaseDirectories::new()
+                .place_runtime_file(socket_path)
+                .unwrap(),
+        };
+        // A stale socket left by a previous run is removed; any other
+        // pre-existing path is an error, since binding would fail.
+        match fs::metadata(&socket_abspath) {
+            Ok(meta) if meta.file_type().is_socket() => {
+                info!("Removing old socket {socket_abspath:?}");
+                let _ = fs::remove_file(&socket_abspath)
+                    .inspect_err(|e| {
+                        error!("Failed to remove stale socket {socket_abspath:?}: {e}")
+                    });
+            }
+            Ok(_) => {
+                error!("Path already exists and is not a socket: {socket_abspath:?}");
+                std::process::exit(1);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                error!("Failed to stat {socket_abspath:?}: {e}");
+                std::process::exit(1);
+            }
+        }
+        let listener = UnixListener::bind(socket_abspath).expect("Failed to bind to Unix socket");
+        (app_id, instance_id, listener)
+    }
+}
+
+/// Create a tagged Wayland listening socket for the given app/instance.
+///
+/// The tagged socket is the listener itself: the compositor keeps it alive
+/// as long as the reference pipe (the protocol "close" fd) is open, so this
+/// function hands the write end of that pipe back to the caller, which must
+/// keep it open for as long as the socket should stay tagged.
+fn create_security_context(
+    listener: &UnixListener,
+    sandbox_engine: &str,
+    app_id: &str,
+    instance_id: &str,
+) -> OwnedFd {
+    // Create a Wayland connection by connecting to the server through the
+    // environment-provided configuration.
+    let conn = Connection::connect_to_env().expect("upstream Wayland connection failed");
+    let (globals, mut event_queue) = registry_queue_init::<State>(&conn).unwrap();
+    let qh = &event_queue.handle();
+    let security_context_manager: wp_security_context_manager_v1::WpSecurityContextManagerV1 =
+        globals.bind(qh, 1..=1, ()).unwrap();
+    let (reader, writer) = io::pipe().unwrap();
+    let security_context =
+        security_context_manager.create_listener(listener.as_fd(), reader.as_fd(), qh, ());
+    security_context_manager.destroy();
+    info!("Create security context mapping for {sandbox_engine} app: {app_id} ({instance_id})");
+    security_context.set_sandbox_engine(sandbox_engine.to_string());
+    security_context.set_app_id(app_id.to_string());
+    security_context.set_instance_id(instance_id.to_string());
+    security_context.commit();
+    security_context.destroy();
+    event_queue.roundtrip(&mut State {}).unwrap();
+    writer.into()
+}
+
+/// Block on a signalfd(2) until the process should exit.
+///
+/// This signal handler is inspired by the implementation in catatonit:
+/// https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588
+fn run_signal_loop() {
     // Block all signals except the ones generated by the kernel if we have a problem in our own program.
     let mask: SigSet = SigSet::all()
         .iter()
@@ -221,5 +243,4 @@ fn main() {
             }
         }
     }
-    info!("Shutting down.");
 }
