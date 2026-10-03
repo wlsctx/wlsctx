@@ -40,7 +40,7 @@ network* are discriminated. Containment is layered:
 | Layer | What it blocks |
 |---|---|
 | Unprivileged podman container | kernel escape; `NoNewPrivileges`, `DropCapability=ALL`, read-only rootfs |
-| SELinux CIL blocks (`selinux/`) | sidecars get their own confined `process` context instead of unconfined userspace |
+| SELinux CIL blocks (`selinux/`) | sidecars get their own confined `process` context instead of unconfined userspace (see the [caveat](#selinux-caveat-wl_dbus_proxy) below) |
 | D-Bus proxy (`wl-dbus@`) | the host session bus is unreachable directly: only `org.freedesktop.portal.Desktop` calls/broadcasts plus per-app names (e.g. `--own=io.gitlab.librewolf.*`) pass through |
 | Volume layout | XDG home dirs are **pod named volumes**, not the real homedir; `~/Downloads` is a separate `noexec` volume; everything else read-only |
 | Pod network namespace | one private podman network per instance; the app has outbound connectivity but no direct LAN presence |
@@ -136,8 +136,9 @@ immutable. The only per-user file is the license key (`Secret=` in
    `~/.config/containers/systemd/`; plain user units from `systemd/user/`
    go to `~/.config/systemd/user/`.
 3. **Load the SELinux CIL blocks** in `selinux/` (`wlsctx`,
-   `wl_dbus_proxy`) as local modules with the checkpolicy toolchain.
-   *The exact build/load recipe for local CIL modules is not yet
+   `wl_dbus_proxy`) as local modules with the checkpolicy toolchain
+   (see the [caveat](#selinux-caveat-wl_dbus_proxy) before relying on
+   them). *The exact build/load recipe for local CIL modules is not yet
    documented here — it depends on your checkpolicy setup.*
 4. `systemctl --user daemon-reload`
 5. `systemctl --user start app-podman-rustrover@rustrover` (or
@@ -250,6 +251,28 @@ confirmation), and forward the agent into the pod (bind the host's
 `$SSH_AUTH_SOCK` into the pod's `/run/pod` and set `SSH_AUTH_SOCK` in
 the app container's environment; not yet wired up in the units in this
 repo — add it in the app's drop-in).
+
+## SELinux caveat: `wl_dbus_proxy`
+
+`selinux/wl_dbus_proxy.cil` contains the global rule
+
+```
+(allow container_t wl_dbus_proxy.process (unix_stream_socket (connectto)))
+```
+
+which lets **any** `container_t` process connect to **any**
+`wl_dbus_proxy.process` socket — it is not scoped to a specific pod's
+proxy. In the current layout this is bounded in practice, because each
+pod's proxy sockets live in that pod's private `/run/pod` and each
+sidecar runs with its own MCS-constrained label; **MCS separation, not
+this rule, is what prevents pod A's containers from talking to pod B's
+D-Bus proxies.** The policy does not itself enforce that, so **verify
+the MCS separation between pods on your system** (check that sidecar
+socket files carry per-pod `s0:cN,cM` suffixes and that a container from
+one pod cannot `connect` to another pod's proxy socket). If you ever
+expose a proxy socket outside the pod's private runtime dir (e.g. mode A
+style, in `$XDG_RUNTIME_DIR`), this rule means *every* container on the
+system can reach it.
 
 ## Known gaps / WIP
 
