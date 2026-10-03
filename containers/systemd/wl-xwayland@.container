@@ -16,6 +16,8 @@ AddDevice=-/dev/dri/renderD128
 AddDevice=-/dev/dri/renderD129
 AddDevice=-/dev/dri/renderD130
 AddDevice=-/dev/dri/renderD131
-PodmanArgs=--ipc=host
+# (no --ipc=host: the pod's IPC namespace is already shared with the app
+# containers, which is all MIT-SHM needs; --ipc=host would leak the host's
+# /dev/shm and IPC namespace into the sandbox)
 Volume=wl-%j_cache:%h/.cache
 PodmanArgs=--hostuser=%u
