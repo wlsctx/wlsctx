@@ -217,6 +217,10 @@ fn create_security_context(
 
 /// Block on a signalfd(2) until the process should exit.
 ///
+/// SIGHUP is not treated as a restart (none is implemented); the process
+/// exits with status 129 (128+SIGHUP), like a process killed by the
+/// signal, so the cause is distinguishable in the journal.
+///
 /// This signal handler is inspired by the implementation in catatonit:
 /// https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588
 fn run_signal_loop() -> Result<()> {
@@ -248,8 +252,10 @@ fn run_signal_loop() -> Result<()> {
                 break;
             }
             SIGHUP => {
-                warn!("TODO: SIGHUP restart");
-                break;
+                // No restart is implemented: exit with 129 (128+SIGHUP),
+                // like a process killed by the signal.
+                info!("SIGHUP received; exiting with status 129 (no restart is implemented)");
+                std::process::exit(129);
             }
             SIGCHLD => {
                 debug!("reap zombies");
