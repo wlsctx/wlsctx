@@ -80,14 +80,13 @@ fn main() -> Result<()> {
     let (app_id, instance_id, listener) = obtain_listener(&cli)?;
     let sandbox_engine = cli.sandbox_engine;
 
-    if log_enabled!(Level::Info) {
-        if let Ok(local_addr) = listener.local_addr() {
-            info!("Listening on {local_addr:?}")
-        }
+    if log_enabled!(Level::Info)
+        && let Ok(local_addr) = listener.local_addr()
+    {
+        info!("Listening on {local_addr:?}")
     }
 
-    let close_fd =
-        create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
+    let close_fd = create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
 
@@ -184,7 +183,7 @@ fn create_security_context(
         "connecting to the upstream Wayland compositor failed (NoCompositor); \
          check that WAYLAND_DISPLAY/WAYLAND_SOCKET reach the host compositor \
          (the wl-display@ sidecar passes the host wayland-1 socket via stdin, \
-         wlsctx@ mounts it into the container)"
+         wlsctx@ mounts it into the container)",
     )?;
     let (globals, mut event_queue) =
         registry_queue_init::<State>(&conn).context("initialising the Wayland protocol queue")?;
@@ -208,7 +207,7 @@ fn create_security_context(
     security_context.destroy();
     event_queue.roundtrip(&mut State {}).context(
         "the compositor returned a protocol error while committing the security context \
-         (the tagged socket is still in an inconsistent state); check the compositor log"
+         (the tagged socket is still in an inconsistent state); check the compositor log",
     )?;
     Ok(writer.into())
 }
