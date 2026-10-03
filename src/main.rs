@@ -56,7 +56,7 @@ struct Cli {
     )]
     listen: Option<path::PathBuf>,
     /// Receive socket via systemd socket activation (LISTEN_FDS)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "listen")]
     socket_activation: bool,
 }
 
