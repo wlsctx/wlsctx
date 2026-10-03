@@ -112,15 +112,26 @@ fn main() {
                     .place_runtime_file(socket_path)
                     .unwrap(),
             };
-            let _ = fs::metadata(&socket_abspath).map(|meta| {
-                    meta.file_type().is_socket().then(|| {
-                        info!("Removing old socket {socket_abspath:?}");
-                        let _ = fs::remove_file(&socket_abspath)
-                            .inspect_err(|e| error!("Remove existing socket failed with error {e}. bind() will likely fail."));
-                    }).unwrap_or_else(||{
-                        error!("Path already exists and is not a socket {socket_abspath:?}");
-                    });
-            });
+            // A stale socket left by a previous run is removed; any other
+            // pre-existing path is an error, since binding would fail.
+            match fs::metadata(&socket_abspath) {
+                Ok(meta) if meta.file_type().is_socket() => {
+                    info!("Removing old socket {socket_abspath:?}");
+                    let _ = fs::remove_file(&socket_abspath)
+                        .inspect_err(|e| {
+                            error!("Failed to remove stale socket {socket_abspath:?}: {e}")
+                        });
+                }
+                Ok(_) => {
+                    error!("Path already exists and is not a socket: {socket_abspath:?}");
+                    std::process::exit(1);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    error!("Failed to stat {socket_abspath:?}: {e}");
+                    std::process::exit(1);
+                }
+            }
             (
                 cli.app_id.unwrap(),
                 cli.instance_id.unwrap(),
