@@ -1,3 +1,4 @@
+use anyhow::{Context, Result, bail};
 use log::{Level, debug, error, info, log_enabled, warn};
 
 use clap::Parser;
@@ -32,11 +33,11 @@ use xdg;
 #[command(version, about, long_about)]
 struct Cli {
     /// Application ID in security context
-    #[arg(long, env = "WLSCTX_APP_ID", required = true)]
-    app_id: Option<String>,
+    #[arg(long, env = "WLSCTX_APP_ID")]
+    app_id: String,
     /// Instance ID in security context
-    #[arg(long, env = "WLSCTX_INSTANCE_ID", required = true)]
-    instance_id: Option<String>,
+    #[arg(long, env = "WLSCTX_INSTANCE_ID")]
+    instance_id: String,
     /// Sandbox engine ID in security context
     #[arg(long, env = "WLSCTX_SANDBOX_ENGINE")]
     sandbox_engine: String,
@@ -74,12 +75,13 @@ delegate_noop!(State: wp_security_context_manager_v1::WpSecurityContextManagerV1
 delegate_noop!(State: wp_security_context_v1::WpSecurityContextV1);
 
 // The main function of our program
-fn main() {
+fn main() -> Result<()> {
     let env = Env::default().default_filter_or("warn");
     env_logger::init_from_env(env);
     let cli = Cli::parse();
-    let (app_id, instance_id, listener) = obtain_listener(&cli);
+    let (app_id, instance_id, listener) = obtain_listener(&cli)?;
     let sandbox_engine = cli.sandbox_engine;
+
     if log_enabled!(Level::Info) {
         if let Ok(local_addr) = listener.local_addr() {
             info!("Listening on {local_addr:?}")
@@ -87,28 +89,21 @@ fn main() {
     }
 
     let close_fd =
-        create_security_context(&listener, &sandbox_engine, &app_id, &instance_id);
+        create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
 
-    run_signal_loop();
+    run_signal_loop()?;
     info!("Shutting down.");
+    Ok(())
 }
 
 /// Get the Unix listener to tag, either from a systemd socket activation
 /// or by binding the socket ourselves. Returns (app_id, instance_id,
 /// listener).
-fn obtain_listener(cli: &Cli) -> (String, String, UnixListener) {
-    let (app_id, instance_id) = (
-        cli.app_id
-            .as_deref()
-            .expect("clap guarantees --app-id is present")
-            .to_string(),
-        cli.instance_id
-            .as_deref()
-            .expect("clap guarantees --instance-id is present")
-            .to_string(),
-    );
+fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
+    let app_id = cli.app_id.clone();
+    let instance_id = cli.instance_id.clone();
     if cli.socket_activation {
         // The IDs come from --app-id/--instance-id (or the
         // WLSCTX_APP_ID / WLSCTX_INSTANCE_ID environment variables). They
@@ -122,40 +117,54 @@ fn obtain_listener(cli: &Cli) -> (String, String, UnixListener) {
                 // SAFETY: sd_notify::listen_fds_with_names(true) unsets the LISTEN_FDS variable so we should be
                 // the only user of this fd
                 let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
-                (app_id, instance_id, listener)
+                Ok((app_id, instance_id, listener))
             }
-            _ => panic!("Failed to get socket FD from activation environment"),
+            _ => bail!(
+                "no socket was received via systemd socket activation (LISTEN_FDS is not set \
+                 or empty); run wlsctx through the wlsctx@.socket unit or use --listen instead"
+            ),
         }
     } else {
-        let socket_path = cli.listen.as_ref().expect("clap guarantees --listen is present");
+        let socket_path = cli.listen.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--listen is required when --socket-activation is not set \
+                 (or set WLSCTX_SOCKET_PATH)"
+            )
+        })?;
         let socket_abspath = match socket_path.is_absolute() {
             true => socket_path.clone(),
             false => xdg::BaseDirectories::new()
                 .place_runtime_file(socket_path)
-                .unwrap(),
+                .with_context(|| {
+                    format!(
+                        "placing {socket_path:?} in the runtime directory \
+                         (is XDG_RUNTIME_DIR set?)"
+                    )
+                })?,
         };
         // A stale socket left by a previous run is removed; any other
         // pre-existing path is an error, since binding would fail.
         match fs::metadata(&socket_abspath) {
             Ok(meta) if meta.file_type().is_socket() => {
                 info!("Removing old socket {socket_abspath:?}");
-                let _ = fs::remove_file(&socket_abspath)
-                    .inspect_err(|e| {
-                        error!("Failed to remove stale socket {socket_abspath:?}: {e}")
-                    });
+                let _ = fs::remove_file(&socket_abspath).inspect_err(|e| {
+                    error!("Failed to remove stale socket {socket_abspath:?}: {e}")
+                });
             }
-            Ok(_) => {
-                error!("Path already exists and is not a socket: {socket_abspath:?}");
-                std::process::exit(1);
-            }
+            Ok(_) => bail!(
+                "{socket_abspath:?} already exists and is not a socket; \
+                 move or delete it before starting wlsctx"
+            ),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                error!("Failed to stat {socket_abspath:?}: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => bail!("stat {socket_abspath:?} failed: {e}"),
         }
-        let listener = UnixListener::bind(socket_abspath).expect("Failed to bind to Unix socket");
-        (app_id, instance_id, listener)
+        let listener = UnixListener::bind(&socket_abspath).with_context(|| {
+            format!(
+                "binding {socket_abspath:?} failed (a stale socket could not be removed, \
+                 or the path is not writable)"
+            )
+        })?;
+        Ok((app_id, instance_id, listener))
     }
 }
 
@@ -170,15 +179,26 @@ fn create_security_context(
     sandbox_engine: &str,
     app_id: &str,
     instance_id: &str,
-) -> OwnedFd {
+) -> Result<OwnedFd> {
     // Create a Wayland connection by connecting to the server through the
     // environment-provided configuration.
-    let conn = Connection::connect_to_env().expect("upstream Wayland connection failed");
-    let (globals, mut event_queue) = registry_queue_init::<State>(&conn).unwrap();
+    let conn = Connection::connect_to_env().context(
+        "connecting to the upstream Wayland compositor failed (NoCompositor); \
+         check that WAYLAND_DISPLAY/WAYLAND_SOCKET reach the host compositor \
+         (the wl-display@ sidecar passes the host wayland-1 socket via stdin, \
+         wlsctx@ mounts it into the container)"
+    )?;
+    let (globals, mut event_queue) =
+        registry_queue_init::<State>(&conn).context("initialising the Wayland protocol queue")?;
     let qh = &event_queue.handle();
     let security_context_manager: wp_security_context_manager_v1::WpSecurityContextManagerV1 =
-        globals.bind(qh, 1..=1, ()).unwrap();
-    let (reader, writer) = io::pipe().unwrap();
+        globals.bind(qh, 1..=1, ()).with_context(|| {
+            "the compositor does not provide wp_security_context_manager_v1; this needs a \
+             wlroots compositor (e.g. sway) — check with `wlsinfo -t` that the global \
+             wp_security_context_manager_v1 is present"
+        })?;
+    let (reader, writer) =
+        io::pipe().context("creating the reference pipe that keeps the tagged socket alive")?;
     let security_context =
         security_context_manager.create_listener(listener.as_fd(), reader.as_fd(), qh, ());
     security_context_manager.destroy();
@@ -188,15 +208,18 @@ fn create_security_context(
     security_context.set_instance_id(instance_id.to_string());
     security_context.commit();
     security_context.destroy();
-    event_queue.roundtrip(&mut State {}).unwrap();
-    writer.into()
+    event_queue.roundtrip(&mut State {}).context(
+        "the compositor returned a protocol error while committing the security context \
+         (the tagged socket is still in an inconsistent state); check the compositor log"
+    )?;
+    Ok(writer.into())
 }
 
 /// Block on a signalfd(2) until the process should exit.
 ///
 /// This signal handler is inspired by the implementation in catatonit:
 /// https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588
-fn run_signal_loop() {
+fn run_signal_loop() -> Result<()> {
     // Block all signals except the ones generated by the kernel if we have a problem in our own program.
     let mask: SigSet = SigSet::all()
         .iter()
@@ -206,13 +229,20 @@ fn run_signal_loop() {
                 .not()
         })
         .collect();
-    mask.thread_block().unwrap();
+    mask.thread_block()
+        .map_err(|e| anyhow::anyhow!("blocking signals failed: {e}"))?;
 
     // Handle signals synchronously via signalfd(2)
-    let sigfd = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC).unwrap();
-    while let Some(siginfo) = sigfd.read_signal().unwrap() {
+    let sigfd = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC)
+        .map_err(|e| anyhow::anyhow!("creating signalfd failed: {e}"))?;
+    while let Some(siginfo) = sigfd
+        .read_signal()
+        .map_err(|e| anyhow::anyhow!("reading from signalfd failed: {e}"))?
+    {
         debug!("Signal: {siginfo:?}");
-        match Signal::try_from(siginfo.ssi_signo as i32).unwrap() {
+        let signal = Signal::try_from(siginfo.ssi_signo as i32)
+            .map_err(|e| anyhow::anyhow!("unknown signal number {}: {e}", siginfo.ssi_signo))?;
+        match signal {
             SIGTERM | SIGINT => {
                 debug!("Stopping");
                 break;
@@ -243,4 +273,5 @@ fn run_signal_loop() {
             }
         }
     }
+    Ok(())
 }
