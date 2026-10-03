@@ -11,17 +11,34 @@ Network=none
 Volume=%t/bus:/run/host/session-bus:ro
 Volume=%t/at-spi/bus_0:/run/host/at-spi-bus:ro
 SecurityLabelType=wl_dbus_proxy.process
+# Per-app proxy arguments for the session-bus filter (e.g. --own=... so a
+# browser can own its names). Passed through from the unit environment
+# only if set (it stays absent rather than empty); each app sets it in
+# its own drop-in (app-podman-<app>@.container.d/).
+# CAVEAT: systemd does not share environment variables across units, so if
+# the sidecar does not pick up the value the app's drop-in sets, set it
+# here (or in a wl-dbus@.container.d drop-in / environment.d file) instead.
+Environment=DBUS_PROXY_EXTRA_ARGS
 Exec=xdg-dbus-proxy \
   unix:path=/run/host/session-bus \
   ${POD_RUNTIME_DIR}/session-bus-proxy \
   --filter \
-  --call='org.freedesktop.portal.*=*' \
-  --broadcast='org.freedesktop.portal.*=@/org/freedesktop/portal/*' \
-  --own=io.gitlab.librewolf.'*' \
+  # Only the Desktop portal is allowed. The old wildcard
+  # org.freedesktop.portal.* also matched org.freedesktop.portal.Documents
+  # and org.freedesktop.portal.Flatpak (document-portal storage, flatpak
+  # host interface), which the sandboxed app should not be able to reach.
+  --call='org.freedesktop.portal.Desktop=*' \
+  --broadcast='org.freedesktop.portal.Desktop=@/org/freedesktop/portal/*' \
+  ${DBUS_PROXY_EXTRA_ARGS} \
   unix:path=/run/host/at-spi-bus \
   ${POD_RUNTIME_DIR}/at-spi-bus-proxy \
   --filter \
   --sloppy-names
+# The strict per-method at-spi rules below are kept for reference only —
+# they are intentionally disabled: with no --call/--broadcast rules the
+# at-spi proxy allows nothing through, which is the desired default.
+# Re-enable (and narrow) them if accessibility inside the sandbox is ever
+# needed.
 #  --broadcast=org.a11y.atspi.Registry.EventListenerRegistered=@/org/a11y/atspi/registry \
 #  --broadcast=org.a11y.atspi.Registry.EventListenerDeregistered=@/org/a11y/atspi/registry \
 #  --call=org.a11y.atspi.Registry=org.a11y.atspi.Socket.Embed@/org/a11y/atspi/accessible/root \
