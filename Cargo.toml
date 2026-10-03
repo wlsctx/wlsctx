@@ -13,5 +13,3 @@ sd-notify = "0.4.5"
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
 xdg = "3.0.0"
-
-[features]

@@ -62,7 +62,3 @@ target "devel" {
   target = "${tgt}-devel"
   tags = tags("${tgt}-devel")
 }
-
-target "_app_common" {
-
-}
