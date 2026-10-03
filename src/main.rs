@@ -278,3 +278,193 @@ fn run_signal_loop() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // clap reads the process environment for its `env` attributes, and
+    // tests run in parallel, so environment-mutating tests must be
+    // serialised against each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set (Some) or unset (None) the given environment variables for the
+    /// duration of `f`, restoring whatever was there before.
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+        // SAFETY: ENV_LOCK guarantees no other test or code path reads or
+        // writes these variables while they are held.
+        unsafe {
+            for (name, value) in vars {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        f();
+        // SAFETY: as above.
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn without_wlsctx_env(f: impl FnOnce()) {
+        with_env(
+            &[
+                ("WLSCTX_APP_ID", None),
+                ("WLSCTX_INSTANCE_ID", None),
+                ("WLSCTX_SANDBOX_ENGINE", None),
+                ("WLSCTX_SOCKET_PATH", None),
+            ],
+            f,
+        );
+    }
+
+    #[test]
+    fn parses_explicit_arguments() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--app-id",
+                "rustrover",
+                "--instance-id",
+                "work",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("explicit arguments must parse");
+            assert_eq!(
+                cli.listen.as_deref(),
+                Some(std::path::Path::new("/run/pod/wayland-1"))
+            );
+            assert_eq!(cli.app_id, "rustrover");
+            assert_eq!(cli.instance_id, "work");
+            assert_eq!(cli.sandbox_engine, "podman");
+            assert!(!cli.socket_activation);
+        });
+    }
+
+    #[test]
+    fn requires_listen_without_socket_activation() {
+        without_wlsctx_env(|| {
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("--listen is required unless --socket-activation is set");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        });
+    }
+
+    #[test]
+    fn requires_app_id_and_instance_id() {
+        without_wlsctx_env(|| {
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("app_id/instance_id are always required (no fd-name fallback)");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            assert!(err.to_string().contains("--app-id"));
+            assert!(err.to_string().contains("--instance-id"));
+        });
+    }
+
+    #[test]
+    fn socket_activation_conflicts_with_listen() {
+        without_wlsctx_env(|| {
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--socket-activation",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("--socket-activation and --listen must conflict");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        });
+    }
+
+    #[test]
+    fn socket_activation_parsing_needs_no_listen() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--socket-activation",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("socket activation mode needs no --listen");
+            assert!(cli.socket_activation);
+            assert!(cli.listen.is_none());
+        });
+    }
+
+    #[test]
+    fn socket_activation_still_requires_explicit_ids() {
+        without_wlsctx_env(|| {
+            // The IDs must come from --app-id/--instance-id or their
+            // environment variables; nothing is derived from LISTEN_FDNAMES.
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--socket-activation",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("socket-activation mode still requires explicit IDs");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        });
+    }
+
+    #[test]
+    fn environment_variables_fill_required_arguments() {
+        with_env(
+            &[
+                ("WLSCTX_APP_ID", Some("envapp")),
+                ("WLSCTX_INSTANCE_ID", Some("envinst")),
+                ("WLSCTX_SANDBOX_ENGINE", Some("envengine")),
+                ("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1")),
+            ],
+            || {
+                let cli = Cli::try_parse_from(["wlsctx"]).expect("env vars satisfy all args");
+                assert_eq!(cli.app_id, "envapp");
+                assert_eq!(cli.instance_id, "envinst");
+                assert_eq!(cli.sandbox_engine, "envengine");
+                assert_eq!(
+                    cli.listen.as_deref(),
+                    Some(std::path::Path::new("/run/pod/wayland-1"))
+                );
+            },
+        );
+    }
+}
