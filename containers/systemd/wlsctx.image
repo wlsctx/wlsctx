@@ -1,4 +1,16 @@
 [Image]
+# This image is pulled from ghcr (Policy=missing), so it is the one part
+# of the build chain that is not built from this repo. For supply-chain
+# reproducibility it is best to pin it by digest instead of the
+# :latest tag, e.g.:
+#
+#   Image=ghcr.io/wlsctx/wlsctx@sha256:<digest>
+#
+# Get the current digest of the tag with:
+#   podman image inspect ghcr.io/wlsctx/wlsctx:latest --format '{{.Id}}'
+# (after pulling) or `docker buildx imagetools inspect ghcr.io/wlsctx/wlsctx:latest`.
+# Re-fetch the digest and bump it whenever a new wlsctx release is
+# published; until you do, :latest is resolved on every pull.
 Image=ghcr.io/wlsctx/wlsctx:latest
 Policy=missing
 
