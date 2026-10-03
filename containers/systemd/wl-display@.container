@@ -1,3 +1,13 @@
+# Deployment mode B (of two): wlsctx as an in-pod sidecar.
+#
+# Unlike the standalone wlsctx@ (mode A, systemd socket-activated with the
+# socket in the host's XDG_RUNTIME_DIR), this container runs inside each
+# app's pod and tags the socket at $POD_RUNTIME_DIR/wayland-1
+# (/run/pod/wayland-1) inside the pod, so every app in the pod gets a
+# tagged connection with no host-side path access at all. The host's
+# Wayland socket is passed in as the container's own stdin (see the
+# [Service] comment below) — no extra privileges or SELinux label needed
+# for the socket itself.
 [Unit]
 Description=Minimal Wayland security context manager
 StopWhenUnneeded=yes

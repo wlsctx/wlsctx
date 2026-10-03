@@ -1,3 +1,16 @@
+# Deployment mode A (of two): standalone, systemd socket-activated wlsctx.
+#
+# wlsctx@%i.socket owns $XDG_RUNTIME_DIR/wlsctx/%i/wayland-1 and
+# socket-activates this container; wlsctx receives the listening socket
+# via LISTEN_FDS and tags it with the explicit --app-id/--instance-id
+# (WLSCTX_APP_ID / WLSCTX_INSTANCE_ID must be set — see the [Container]
+# section). The tagged socket lives in the host's XDG_RUNTIME_DIR, so
+# whatever connects to it (pod or bare host process) needs access to that
+# path.
+#
+# Deployment mode B: the wl-display@ in-pod sidecar (see
+# wl-display@.container) — it runs inside each app's pod and tags the
+# socket at $POD_RUNTIME_DIR/wayland-1 inside the pod instead.
 [Unit]
 Description=Minimal Wayland security context manager
 BindsTo=wlsctx@%i.socket

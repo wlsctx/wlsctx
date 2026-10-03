@@ -1,3 +1,10 @@
+# Socket-activated half of wlsctx deployment mode A (see the headers of
+# wlsctx@.container and wl-display@.container for the two modes).
+#
+# The tagged Wayland socket lives in the host's XDG_RUNTIME_DIR
+# (wlsctx/%i/wayland-1). FileDescriptorName=%i is only a label; wlsctx no
+# longer derives app/instance IDs from it — set WLSCTX_APP_ID and
+# WLSCTX_INSTANCE_ID before starting wlsctx@<instance>.
 [Unit]
 Description=Wayland socket with security context attached (%i)
 PartOf=graphical-session.target
