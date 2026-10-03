@@ -32,18 +32,10 @@ use xdg;
 #[command(version, about, long_about)]
 struct Cli {
     /// Application ID in security context
-    #[arg(
-        long,
-        env = "WLSCTX_APP_ID",
-        required_unless_present = "socket_activation"
-    )]
+    #[arg(long, env = "WLSCTX_APP_ID", required = true)]
     app_id: Option<String>,
     /// Instance ID in security context
-    #[arg(
-        long,
-        env = "WLSCTX_INSTANCE_ID",
-        required_unless_present = "socket_activation"
-    )]
+    #[arg(long, env = "WLSCTX_INSTANCE_ID", required = true)]
     instance_id: Option<String>,
     /// Sandbox engine ID in security context
     #[arg(long, env = "WLSCTX_SANDBOX_ENGINE")]
@@ -92,25 +84,21 @@ fn main() {
         (true, None) => match sd_notify::listen_fds_with_names(true).map(|mut it| it.next()) {
             Ok(Some((raw_fd, name))) => {
                 info!("Received socket {name} ({raw_fd:#?}) from parent");
-                let (app_id, instance_id) = match (cli.app_id, cli.instance_id) {
-                    (Some(app_id), Some(instance_id)) => (app_id, instance_id),
-                    (app_id, instance_id) => {
-                        match name.trim_end_matches(".socket").split_once('@') {
-                            Some((sd_prefix, sd_instance)) => (
-                                app_id.unwrap_or_else(|| sd_prefix.to_string()),
-                                instance_id.unwrap_or_else(|| sd_instance.to_string()),
-                            ),
-                            _ => {
-                                panic!(
-                                    "Missing --app-id --instance-id and no LISTEN_FDNAMES= provided"
-                                )
-                            }
-                        }
-                    }
-                };
-                // SAFETY: sd_notify::listen_fds_with_names(true) unsets the LISTEN_FDS variable so we should be the
-                // only user of this fd
+                // SAFETY: sd_notify::listen_fds_with_names(true) unsets the LISTEN_FDS variable so we should be
+                // the only user of this fd
                 let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
+                // The IDs are taken from --app-id/--instance-id (or their
+                // environment variables). They used to be derived from the
+                // fd name, but that only worked for "app@instance" instance
+                // names and wlsctx@.socket sets FileDescriptorName=%i, so
+                // the name normally contains no '@' and the derivation
+                // panicked.
+                let (app_id, instance_id) = (
+                    cli.app_id.expect("clap guarantees --app-id is present"),
+                    cli
+                        .instance_id
+                        .expect("clap guarantees --instance-id is present"),
+                );
                 (app_id, instance_id, listener)
             }
             _ => {

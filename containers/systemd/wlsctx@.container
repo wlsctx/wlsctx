@@ -10,8 +10,14 @@ DefaultDependencies=false
 Image=wlsctx.image
 Exec=--socket-activation
 Environment=WLSCTX_SANDBOX_ENGINE=${WLSCTX_SANDBOX_ENGINE}
-#Environment=WLSCTX_APP_ID=${WLSCTX_APP_ID}
-#Environment=WLSCTX_INSTANCE_ID=${WLSCTX_INSTANCE_ID}
+# --socket-activation requires explicit WLSCTX_APP_ID / WLSCTX_INSTANCE_ID
+# (the binary no longer derives them from LISTEN_FDNAMES; the socket unit
+# sets FileDescriptorName=%i, which normally contains no '@'). Pass them
+# through only if set; if missing, the binary fails with a clear
+# "required argument" error instead of running with empty IDs. Set them
+# in an environment.d file or a drop-in before starting wlsctx@<instance>.
+Environment=WLSCTX_APP_ID
+Environment=WLSCTX_INSTANCE_ID
 Environment=WAYLAND_DISPLAY=wayland-1
 Environment=XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
 Environment=RUST_LOG=debug
