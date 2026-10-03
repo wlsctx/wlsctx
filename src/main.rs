@@ -9,7 +9,6 @@ use nix::sys::{
     signalfd::{SfdFlags, SigSet, SignalFd},
     wait::{WaitPidFlag, WaitStatus, waitpid},
 };
-use sd_notify;
 use std::fs;
 use std::io;
 use std::ops::Not;
@@ -24,7 +23,6 @@ use wayland_client::{
 use wayland_protocols::wp::security_context::v1::client::{
     wp_security_context_manager_v1, wp_security_context_v1,
 };
-use xdg;
 
 /// Set up a Wayland socket with an attached security context
 ///

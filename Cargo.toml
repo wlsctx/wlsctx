@@ -10,11 +10,8 @@ env_logger = "0.11.8"
 log = "0.4.28"
 nix = { version = "0.30.1", features = ["signal", "process"] }
 sd-notify = "0.4.5"
-signal = "0.7.0"
-wayland-backend = "0.3.11"
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
-wayland-scanner = "0.31.7"
 xdg = "3.0.0"
 
 [features]
