@@ -6,7 +6,7 @@ use nix::sys::{
     signal::Signal,
     signal::Signal::*,
     signalfd::{SfdFlags, SigSet, SignalFd},
-    wait::{WaitPidFlag, waitpid},
+    wait::{WaitPidFlag, WaitStatus, waitpid},
 };
 use sd_notify;
 use std::fs;
@@ -202,8 +202,16 @@ fn main() {
             }
             SIGCHLD => {
                 debug!("reap zombies");
+                // WNOHANG yields StillAlive for children that have not
+                // exited yet (and Stopped/Continued if WUNTRACED were set),
+                // so the loop must stop on those, not only on error.
                 while let Ok(status) = waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-                    debug!("status: {status:?}");
+                    match status {
+                        WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => {
+                            debug!("reaped: {status:?}")
+                        }
+                        _ => break,
+                    }
                 }
             }
             SIGTSTP | SIGTTOU | SIGTTIN => {
