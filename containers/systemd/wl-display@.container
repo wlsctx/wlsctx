@@ -9,7 +9,12 @@ Environment=WLSCTX_INSTANCE_ID=%i
 # We pass the connected Wayland socket via stdin instead of having to give the wlsctx container any extra privileges or SELinux label.
 # Unfortunately, StandardInput=/StandardOutput= do not support environment variables, so we can't use ${WAYLAND_DISPLAY} here.
 StandardInput=file:%t/wayland-1
-StandardOutput=file:%t/wayland-1
+# NOT file:%t/wayland-1: opening the host Wayland socket as an output fd
+# creates a second, untagged connection to the compositor — anything the
+# process (or a child inheriting fd 1) writes to stdout would be injected
+# into the compositor as raw Wayland protocol data, outside the security
+# context.
+StandardOutput=journal
 StandardError=journal
 
 [Container]
