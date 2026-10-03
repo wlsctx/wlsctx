@@ -1,7 +1,6 @@
 ARG JB_PRODUCTS_URL=https://data.services.jetbrains.com/products
 ARG JB_CODE
 ARG JB_RELEASE_TYPE=release
-ARG JB_KEYS_SOURCE=download
 
 FROM runtime AS base
 RUN --mount=type=cache,id=dnf5-fedora,dst=/var/cache/libdnf5 \
@@ -11,120 +10,19 @@ RUN --mount=type=cache,id=dnf5-fedora,dst=/var/cache/libdnf5 \
     jq \
     curl \
     coreutils \
+    gnupg2 \
     ;
 
-FROM scratch AS jb-keys-download
-ADD --checksum=sha256:c94dcc9ca88c506a99c6bc7c9f8d9974d69bbb5dd432bdb2d94d8e8d0653edc0 \
-  https://download.jetbrains.com/KEYS /KEYS
-
-FROM scratch AS jb-keys-inline
-COPY <<EOT /KEYS
-pub   rsa3072/0x1F7A8F87B9D8F501 2021-03-15 [C] [expires: 2026-03-15]
-      Key fingerprint = B46D C71E 03FE EB7F 89D1  F249 1F7A 8F87 B9D8 F501
-sub   rsa3072/0x7D1BE4480B61E2A7 2021-03-15 [E] [expires: 2026-03-15]
-sub   rsa3072/0xC2148900BCD3C2AF 2021-03-15 [S] [expires: 2026-03-15]
-sub   rsa3072/0xCFF46EE3C17E53E9 2021-03-15 [A] [expires: 2026-03-15]
-
------BEGIN PGP PUBLIC KEY BLOCK-----
-
-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
-m4OI
-=vAiL
------END PGP PUBLIC KEY BLOCK-----
-EOT
-
 FROM scratch AS jb-keys
-ARG JB_KEYS_SOURCE
-COPY --from=jb-keys-${JB_KEYS_SOURCE} /KEYS /KEYS
+# Checksum-pinned copy of JetBrains' KEYS file (the public keys they sign
+# release checksums with). Update this checksum (and re-verify the build)
+# when JetBrains re-publishes KEYS.
+#
+# NOTE: the older in-repo inline copy of this key expired 2026-03-15 and
+# has been removed; the downloaded, pinned file is the single source of
+# key material.
+ADD --checksum=sha256:665f0d69a36de15b60e93601f8df1ce1edf0ad4f9e0041d0d977b41fcdc6f006 \
+  https://download.jetbrains.com/KEYS /KEYS
 
 FROM scratch AS jb-product-desc
 ARG JB_PRODUCTS_URL
@@ -143,6 +41,14 @@ ARG TARGETARCH
 WORKDIR /work
 COPY --from=jb-product-desc /product-desc.json /product-desc.json
 COPY --from=jb-latest-release /release.json /release.json
+# The (checksum-pinned) JetBrains KEYS file, for verifying the .sha256.asc
+# signature of the release checksum.
+COPY --from=jb-keys /KEYS /KEYS
+# TODO: the .sha256.asc signature chain could not be exercised at the time
+# this was written (JetBrains' releases API returned empty responses from
+# the authoring environment). Run one build of this image and confirm the
+# gpg --verify step passes; if JetBrains changed their signing, refresh
+# the KEYS checksum above.
 RUN --mount=type=cache,id=download-jb,dst=/download \
   set -eufx; \
   [ "${TARGETARCH}" == "arm64" ] && \
@@ -156,17 +62,24 @@ RUN --mount=type=cache,id=download-jb,dst=/download \
   sha256filename=$(jq -j --arg plat "${plat}" \
     '.[][].downloads[$plat].checksumLink / "/" | last' /release.json) && \
   [ -n "${sha256filename}" ]; \
+  # Import KEYS into an isolated keyring. The file's content is pinned by
+  # the ADD checksum above, so a valid signature against it means the
+  # checksum file (and through it the tarball) is genuine.
+  gpg --batch --homedir /gphome --import /KEYS; \
   if [ -f "/download/${sha256filename}" ] &&  \
     [ -f "/download/${filename}" ] && \
+    [ -f "/download/${sha256filename}.asc" ] && \
+    gpg --batch --homedir /gphome --verify "/download/${sha256filename}.asc" "/download/${sha256filename}" && \
     ( cd "/download" && sha256sum -c "./${sha256filename}" ); then \
     printf 'Already downloaded: %s\n' "${filename}"; \
   else \
     jq -r --arg plat "${plat}" \
-      '.[][].downloads[$plat] | (.link, .checksumLink)' \
+      '.[][].downloads[$plat] | (.link, .checksumLink, .checksumLink + ".asc")' \
       /release.json | \
     curl --retry 5 --remove-on-error --remote-name-all -Lf --parallel --url @- && \
+    gpg --batch --homedir /gphome --verify "./${sha256filename}.asc" "./${sha256filename}" && \
     sha256sum -c "./${sha256filename}" && \
-    mv -t "/download/" "./${filename}" "./${sha256filename}"; \
+    mv -t "/download/" "./${filename}" "./${sha256filename}" "./${sha256filename}.asc"; \
   fi; \
   mkdir -p "/out/jetbrains/bin" "/out/${prod}" && \
   tar -C "/out/${prod}" --strip-components=1 -xf "/download/${filename}" && \
