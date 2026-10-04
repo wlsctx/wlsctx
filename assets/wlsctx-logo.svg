@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+<style>.ink{stroke:#17212B;fill:none}.inkf{fill:#17212B}.wave{stroke:#2FA89A;fill:none}.wavef{fill:#2FA89A}.tag{fill:#9f6c2a}@media (prefers-color-scheme:dark){.ink{stroke:#E6EDF3}.inkf{fill:#E6EDF3}}</style>
+<mask id="gap"><rect width="128" height="128" fill="#fff"/><rect x="0" y="44.5" width="26" height="20" fill="#000"/></mask>
+<g stroke-linecap="round" stroke-linejoin="round">
+<g mask="url(#gap)">
+<rect class="ink" x="10" y="10" width="108" height="108" rx="26" stroke-width="7"/>
+<rect class="ink" x="21" y="21" width="86" height="86" rx="15" stroke-width="3.5"/>
+</g>
+<path class="wave" d="M2 54.5H30.2" stroke-width="5.6"/>
+<g transform="translate(68 64) scale(.86) translate(-64 -64)">
+<path class="wave" d="M20 53C26 53 27 80 32 80C37 80 38 62 43 62C48 62 49 80 54 80C59 80 62 66 64 50C65 38 66 26 68 26C70 26 70 38 70 52C70 70 70 82 78 82" stroke-width="6.5"/>
+<circle class="tag" cx="90" cy="78" r="7"/>
+</g>
+</g>
+</svg>
