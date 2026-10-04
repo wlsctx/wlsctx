@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/wlsctx-header-tagline.svg" alt="wlsctx — Wayland security context wrapper" width="489">
+</p>
+
 # wlsctx
 
 Run GUI applications (JetBrains IDEs, Librewolf) in **unprivileged Podman
