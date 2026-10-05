@@ -87,7 +87,8 @@ What each container can reach on the **host**:
   pod or a bare host process — uses it. This mode *requires*
   `WLSCTX_APP_ID` / `WLSCTX_INSTANCE_ID` to be set (the binary no longer
   derives them from the fd name); if they are missing it fails with a
-  clear "required argument" error.
+  clear "required argument" error, and if set but empty it fails with a
+  clear "must not be empty" error.
 - **Mode B — in-pod sidecar (default for `wl-app@` pods):**
   `wl-display@.container` runs inside each pod and tags the socket at
   `$POD_RUNTIME_DIR/wayland-1` (`/run/pod/wayland-1`) that all the pod's
@@ -100,8 +101,11 @@ What each container can reach on the **host**:
 Two input modes: `--listen=<path>` (binds its own socket — mode B) or
 `--socket-activation` (systemd `LISTEN_FDS` — mode A); the two are
 mutually exclusive. In both modes `--app-id` / `--instance-id` (or the
-`WLSCTX_APP_ID` / `WLSCTX_INSTANCE_ID` env vars) are required. It runs
-its signal loop on `signalfd(2)` (catatonit-style): `SIGTERM`/`SIGINT`
+`WLSCTX_APP_ID` / `WLSCTX_INSTANCE_ID` env vars) are required and must
+not be empty — an empty ID would tag the socket with a context that
+matches no compositor policy and silently disable the sandbox, so the
+parser rejects it with a clear error. It runs its signal loop on
+`signalfd(2)` (catatonit-style): `SIGTERM`/`SIGINT`
 exit cleanly (releasing the reference pipe, which invalidates the tagged
 socket); `SIGHUP` exits with status **129** (no restart is implemented —
 in mode A, `Restart=always` brings it back; in mode B the socket dies

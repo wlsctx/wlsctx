@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use log::{Level, debug, error, info, log_enabled, warn};
 
+use clap::builder::TypedValueParser;
 use clap::Parser;
 use env_logger::Env;
 use nix::sys::{
@@ -29,14 +30,14 @@ use wayland_protocols::wp::security_context::v1::client::{
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
 struct Cli {
-    /// Application ID in security context
-    #[arg(long, env = "WLSCTX_APP_ID")]
+    /// Application ID in security context (must not be empty)
+    #[arg(long, env = "WLSCTX_APP_ID", value_parser = NonEmpty::new("app-id"))]
     app_id: String,
-    /// Instance ID in security context
-    #[arg(long, env = "WLSCTX_INSTANCE_ID")]
+    /// Instance ID in security context (must not be empty)
+    #[arg(long, env = "WLSCTX_INSTANCE_ID", value_parser = NonEmpty::new("instance-id"))]
     instance_id: String,
-    /// Sandbox engine ID in security context
-    #[arg(long, env = "WLSCTX_SANDBOX_ENGINE")]
+    /// Sandbox engine ID in security context (must not be empty)
+    #[arg(long, env = "WLSCTX_SANDBOX_ENGINE", value_parser = NonEmpty::new("sandbox-engine"))]
     sandbox_engine: String,
     /// Listen on Unix socket
     #[arg(
@@ -48,6 +49,51 @@ struct Cli {
     /// Receive socket via systemd socket activation (LISTEN_FDS)
     #[arg(long, conflicts_with = "listen")]
     socket_activation: bool,
+}
+
+/// A value parser that rejects the empty string for the security-context
+/// IDs.
+///
+/// Clap treats an *empty* environment variable as present-with-a-value
+/// (`WLSCTX_APP_ID=` in an environment.d file is a very common typo).
+/// An empty ID would tag the socket with a context that matches no
+/// compositor policy — the security labeling silently stops working while
+/// the process looks healthy. Rejecting it at parse time fails loudly
+/// instead.
+#[derive(Clone, Copy, Debug)]
+struct NonEmpty {
+    field: &'static str,
+}
+
+impl NonEmpty {
+    fn new(field: &'static str) -> Self {
+        Self { field }
+    }
+}
+
+impl TypedValueParser for NonEmpty {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let value = value.to_string_lossy();
+        if value.is_empty() {
+            let field = self.field;
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                format!(
+                    "--{field} (or its WLSCTX_* environment variable) must not be empty: \
+                     an empty ID would tag the socket with a context that matches no \
+                     compositor policy, silently disabling the sandbox; set a non-empty value"
+                ),
+            ));
+        }
+        Ok(value.into_owned())
+    }
 }
 
 struct State;
@@ -738,22 +784,63 @@ mod tests {
     }
 
     #[test]
-    fn empty_env_values_are_accepted() {
-        // An *empty* WLSCTX_* variable is a value for clap, not "unset":
-        // the argument counts as present and the empty string is used.
-        with_env(
-            &[
-                ("WLSCTX_APP_ID", Some("")),
-                ("WLSCTX_INSTANCE_ID", Some("")),
-                ("WLSCTX_SANDBOX_ENGINE", Some("podman")),
-                ("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1")),
-            ],
-            || {
-                let cli = Cli::try_parse_from(["wlsctx"]).expect("empty env vars satisfy the args");
-                assert_eq!(cli.app_id, "");
-                assert_eq!(cli.instance_id, "");
-            },
-        );
+    fn empty_env_values_are_rejected() {
+        // An *empty* WLSCTX_* variable is a value for clap, not "unset"
+        // (a common environment.d typo). It used to be accepted, which
+        // tagged the socket with an empty ID matching no compositor
+        // policy and silently disabled the sandbox: each ID is now
+        // rejected at parse time.
+        let valid: [(&str, &str); 3] = [
+            ("WLSCTX_APP_ID", "a"),
+            ("WLSCTX_INSTANCE_ID", "i"),
+            ("WLSCTX_SANDBOX_ENGINE", "podman"),
+        ];
+        for (target, field) in [
+            ("WLSCTX_APP_ID", "--app-id"),
+            ("WLSCTX_INSTANCE_ID", "--instance-id"),
+            ("WLSCTX_SANDBOX_ENGINE", "--sandbox-engine"),
+        ] {
+            let pairs: Vec<(&str, Option<&str>)> = valid
+                .iter()
+                .map(|(name, value)| (*name, Some(if *name == target { "" } else { *value })))
+                .chain(std::iter::once((
+                    "WLSCTX_SOCKET_PATH",
+                    Some("/run/pod/wayland-1"),
+                )))
+                .collect();
+            with_env(&pairs, || {
+                let err = Cli::try_parse_from(["wlsctx"])
+                    .expect_err("an empty WLSCTX_* value must be rejected at parse time");
+                assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{target}");
+                let msg = err.to_string();
+                assert!(msg.contains(field), "{target}: {msg}");
+                assert!(msg.contains("not be empty"), "{target}: {msg}");
+            });
+        }
+    }
+
+    #[test]
+    fn empty_flag_values_are_rejected() {
+        // The same guard applies to explicit flags (`--app-id ""`).
+        without_wlsctx_env(|| {
+            let fields: [(&str, &str); 3] = [
+                ("--app-id", "a"),
+                ("--instance-id", "i"),
+                ("--sandbox-engine", "podman"),
+            ];
+            for (flag, _valid) in fields {
+                let mut argv: Vec<&str> = vec!["wlsctx", "--listen", "/run/pod/wayland-1"];
+                for (f, v) in fields {
+                    argv.push(f);
+                    argv.push(if f == flag { "" } else { v });
+                }
+                let err = Cli::try_parse_from(&argv).expect_err("an empty flag value must be rejected");
+                assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{flag}");
+                let msg = err.to_string();
+                assert!(msg.contains(flag), "{msg}");
+                assert!(msg.contains("not be empty"), "{msg}");
+            }
+        });
     }
 
     #[test]
