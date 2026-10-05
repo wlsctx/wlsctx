@@ -154,17 +154,33 @@ fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
         // "app@instance" instance names and wlsctx@.socket sets
         // FileDescriptorName=%i, so the name normally contains no '@' and
         // the derivation panicked.
-        match unsafe { sd_notify::listen_fds_with_names_and_unset_env() }.map(|mut it| it.next()) {
-            Ok(Some((raw_fd, name))) => {
-                info!("Received socket {name} ({raw_fd:#?}) from parent");
-                // SAFETY: sd_notify::listen_fds_with_names_and_unset_env() unsets the LISTEN_FDS variable so we should be
-                // the only user of this fd
-                let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
-                Ok((app_id, instance_id, listener))
-            }
-            _ => bail!(
-                "no socket was received via systemd socket activation (LISTEN_FDS is not set \
-                 or empty); run wlsctx through the wlsctx@.socket unit or use --listen instead"
+        match unsafe { sd_notify::listen_fds_with_names_and_unset_env() } {
+            Ok(mut it) => match it.len() {
+                0 => bail!(
+                    "no socket was received via systemd socket activation (LISTEN_FDS is \
+                     not set or empty); run wlsctx through the wlsctx@.socket unit or \
+                     use --listen instead"
+                ),
+                1 => {
+                    let (raw_fd, name) = it
+                        .next()
+                        .expect("iterator has exactly one element (len checked above)");
+                    info!("Received socket {name} ({raw_fd:#?}) from parent");
+                    // SAFETY: sd_notify::listen_fds_with_names_and_unset_env() unsets the LISTEN_FDS variable so we should be
+                    // the only user of this fd
+                    let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
+                    Ok((app_id, instance_id, listener))
+                }
+                n => bail!(
+                    "systemd passed {n} sockets via socket activation, but wlsctx tags \
+                     exactly one; remove the extra ListenStream= line(s) from the socket \
+                     unit and try again"
+                ),
+            },
+            Err(_) => bail!(
+                "no socket was received via systemd socket activation (LISTEN_FDS is not \
+                 set or empty, or LISTEN_FDNAMES does not match LISTEN_FDS); run wlsctx \
+                 through the wlsctx@.socket unit or use --listen instead"
             ),
         }
     } else {
@@ -511,38 +527,42 @@ mod tests {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
 
-    /// Duplicate a listener onto fd 3, the first fd systemd passes for
-    /// socket activation (SD_LISTEN_FDS_START), and leave fd 3 open so
-    /// `obtain_listener` can take ownership of it. Refuses (with a
-    /// message) if fd 3 is already in use in the test process. The
-    /// listener is consumed: on success only fd 3 remains open, on
+    /// Duplicate a listener onto `target` (systemd passes socket-activated
+    /// fds starting at fd 3, SD_LISTEN_FDS_START), and leave `target` open
+    /// so `obtain_listener` can take ownership of it. Refuses (with a
+    /// message) if the fd is already in use in the test process. The
+    /// listener is consumed: on success only `target` remains open, on
     /// error the listener is dropped normally.
-    fn install_on_fd3(listener: UnixListener) -> std::io::Result<()> {
+    fn install_on_fd(target: i32, listener: UnixListener) -> std::io::Result<()> {
         // /proc/self/fd/N exists only while fd N is open: a side-effect
         // free probe (Linux only — this binary's platform).
-        match fs::symlink_metadata("/proc/self/fd/3") {
-            Ok(_) => return Err(std::io::Error::other("fd 3 is in use in the test process")),
+        match fs::symlink_metadata(format!("/proc/self/fd/{target}")) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    format!("fd {target} is in use in the test process"),
+                ))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(std::io::Error::other(format!("probing fd 3: {e}"))),
+            Err(e) => return Err(std::io::Error::other(format!("probing fd {target}: {e}"))),
         }
         let raw = listener.as_raw_fd();
-        // SAFETY: the probe established fd 3 is closed, so dup2(2)
-        // closes nothing; it returns fd 3 (or -1), which the OwnedFd
+        // SAFETY: the probe established fd `target` is closed, so dup2(2)
+        // closes nothing; it returns `target` (or -1), which the OwnedFd
         // below takes ownership of and is forgotten right away so it
-        // never closes fd 3 again.
-        let dup = unsafe { dup2(raw, 3) };
+        // never closes `target` again.
+        let dup = unsafe { dup2(raw, target) };
         if dup < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let fd3 = unsafe { OwnedFd::from_raw_fd(dup) };
+        let target_fd = unsafe { OwnedFd::from_raw_fd(dup) };
         // Close the listener's original fd, then forget both wrappers:
-        // fd 3 is the only remaining reference to the socket.
+        // fd `target` is the only remaining reference to the socket.
         // SAFETY: as in leave_stale_socket — the wrapper takes over the
         // close, `listener` (owned) is forgotten so there is no
         // double close.
         drop(unsafe { OwnedFd::from_raw_fd(raw) });
         std::mem::forget(listener);
-        std::mem::forget(fd3);
+        std::mem::forget(target_fd);
         Ok(())
     }
 
@@ -1218,7 +1238,7 @@ mod tests {
                 return;
             }
         };
-        match install_on_fd3(listener) {
+        match install_on_fd(3, listener) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("skipping: {e}");
@@ -1243,10 +1263,72 @@ mod tests {
             },
         );
         // obtain_listener bailed before taking ownership: close fd 3
-        // ourselves (its wrapper was forgotten in install_on_fd3).
-        // SAFETY: fd 3 is open here (install_on_fd3 succeeded) and no
+        // ourselves (its wrapper was forgotten in install_on_fd).
+        // SAFETY: fd 3 is open here (install_on_fd succeeded) and no
         // other code in the test process references it.
         drop(unsafe { OwnedFd::from_raw_fd(3) });
+    }
+
+    #[test]
+    fn socket_activation_rejects_multiple_fds() {
+        // wlsctx tags exactly one socket: a unit handing over more
+        // (extra ListenStream= lines) must fail loudly instead of
+        // silently adopting the first and leaking the rest.
+        let _fd_lock = LISTEN_FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TmpDir::new("socket-activation-multi");
+        let sock_a = dir.path().join("wayland-a");
+        let sock_b = dir.path().join("wayland-b");
+        let listener_a = match UnixListener::bind(&sock_a) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping (cannot bind {sock_a:?}): {e}");
+                return;
+            }
+        };
+        let listener_b = match UnixListener::bind(&sock_b) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping (cannot bind {sock_b:?}): {e}");
+                return;
+            }
+        };
+        // Both fds must be in place before either listener is consumed.
+        if install_on_fd(3, listener_a).is_err() {
+            eprintln!("skipping: fd 3 unavailable in the test process");
+            return;
+        }
+        match install_on_fd(4, listener_b) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping: fd 4 unavailable in the test process: {e}");
+                // fd 3 was installed but fd 4 could not be: release fd 3
+                // so it does not leak into later tests.
+                // SAFETY: install_on_fd(3, …) succeeded, so fd 3 is open
+                // and no other code in the test process references it.
+                drop(unsafe { OwnedFd::from_raw_fd(3) });
+                return;
+            }
+        }
+        let pid = std::process::id().to_string();
+        with_env(
+            &[
+                ("LISTEN_FDS", Some("2")),
+                ("LISTEN_PID", Some(&pid)),
+                ("LISTEN_FDNAMES", Some("a:b")),
+            ],
+            || {
+                let err = obtain_listener(&test_cli_socket_activation())
+                    .expect_err("more than one fd must be rejected");
+                let msg = format!("{err:#}");
+                assert!(msg.contains("tags exactly one"), "{msg}");
+            },
+        );
+        // obtain_listener bailed before adopting: close both fds
+        // ourselves (their wrappers were forgotten in install_on_fd).
+        // SAFETY: fd 3 and fd 4 are open here (install_on_fd succeeded)
+        // and no other code in the test process references them.
+        drop(unsafe { OwnedFd::from_raw_fd(3) });
+        drop(unsafe { OwnedFd::from_raw_fd(4) });
     }
 
     #[test]
@@ -1261,7 +1343,7 @@ mod tests {
                 return;
             }
         };
-        match install_on_fd3(listener) {
+        match install_on_fd(3, listener) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("skipping: {e}");
