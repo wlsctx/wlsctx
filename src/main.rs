@@ -14,6 +14,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path;
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
@@ -246,12 +247,21 @@ fn bind_socket(path: &path::Path) -> Result<UnixListener> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => bail!("stat {path:?} failed: {e}"),
     }
-    UnixListener::bind(path).with_context(|| {
+    let listener = UnixListener::bind(path).with_context(|| {
         format!(
             "binding {path:?} failed (a stale socket could not be removed, \
              or the path is not writable)"
         )
-    })
+    })?;
+    // bind(2) creates the socket file with umask-derived permissions
+    // (typically 0755): tighten it so only the owner can connect, even
+    // if the containing directory ends up more permissive than it
+    // should be (the socket-activation mode is covered by the unit's
+    // SocketMode=0600, this covers --listen, i.e. mode B and manual use).
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).inspect_err(|e| {
+        warn!("chmod {path:?} to 0600 failed (continuing with umask permissions): {e}")
+    });
+    Ok(listener)
 }
 
 /// Create a tagged Wayland listening socket for the given app/instance.
@@ -1023,6 +1033,26 @@ mod tests {
                 .expect("absolute path must bind");
             assert!(sock.exists());
             assert_eq!(socket_path(&listener), Some(sock));
+        });
+    }
+
+    #[test]
+    fn listen_socket_is_created_owner_only() {
+        // bind(2) leaves the socket file with umask-derived permissions
+        // (typically 0755): wlsctx must tighten it to 0600 so that only
+        // the owner can connect, even if the surrounding directory (or
+        // the umask) ends up permissive.
+        let dir = TmpDir::new("listen-perm");
+        let sock = dir.path().join("wayland-1");
+        with_env(&[("XDG_RUNTIME_DIR", None)], || {
+            let _ = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+                .expect("absolute path must bind");
+            let mode = fs::metadata(&sock)
+                .expect("socket exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the bound socket must be owner-only");
         });
     }
 
