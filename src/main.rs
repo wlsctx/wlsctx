@@ -314,15 +314,146 @@ fn run_signal_loop() -> Result<()> {
     Ok(())
 }
 
+// Unit tests. `create_security_context` and the end-to-end `main` are
+// deliberately not unit-tested: they need a live wlroots compositor
+// providing `wp_security_context_manager_v1` (see README, "Compositor
+// requirements & verify your setup") — that part is covered by running
+// the real unit (mode A) or a pod (mode B).
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     // clap reads the process environment for its `env` attributes, and
     // tests run in parallel, so environment-mutating tests must be
     // serialised against each other.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // systemd passes socket-activated fds starting at 3 (SD_LISTEN_FDS_START);
+    // only one test at a time may install a fd there.
+    static LISTEN_FD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A uniquely named directory under the system temp dir, removed on
+    /// drop. The counter makes every instance unique *within* a test
+    /// binary, so parallel tests never share (or drop) the same
+    /// directory even when they pass the same label.
+    struct TmpDir {
+        path: path::PathBuf,
+    }
+
+    static TMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("wlsctx-test-{}-{name}-{n}", std::process::id()));
+            fs::create_dir_all(&path).unwrap_or_else(|e| panic!("creating {path:?}: {e}"));
+            Self { path }
+        }
+
+        fn path(&self) -> &path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A TmpDir made usable as XDG_RUNTIME_DIR (which xdg requires to
+    /// have exactly 0700 permissions).
+    fn xdg_runtime_dir(mode: u32) -> TmpDir {
+        let dir = TmpDir::new("runtime");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|e| panic!("chmod {}: {e}", dir.path().display()));
+        dir
+    }
+
+    fn test_cli_listen(listen: &str) -> Cli {
+        Cli {
+            app_id: "rustrover".into(),
+            instance_id: "work".into(),
+            sandbox_engine: "podman".into(),
+            listen: Some(path::PathBuf::from(listen)),
+            socket_activation: false,
+        }
+    }
+
+    fn test_cli_socket_activation() -> Cli {
+        Cli {
+            app_id: "rustrover".into(),
+            instance_id: "work".into(),
+            sandbox_engine: "podman".into(),
+            listen: None,
+            socket_activation: true,
+        }
+    }
+
+    /// The bound path of a Unix listener, if it is path-based.
+    fn socket_path(listener: &UnixListener) -> Option<path::PathBuf> {
+        listener
+            .local_addr()
+            .ok()
+            .and_then(|addr| addr.as_pathname().map(path::PathBuf::from))
+    }
+
+    /// Close a listener's fd behind the wrapper's back, leaving the
+    /// socket file in place — i.e. simulate a stale socket left by a
+    /// previous wlsctx that died without unlinking it.
+    fn leave_stale_socket(listener: UnixListener) {
+        let raw = listener.as_raw_fd();
+        // SAFETY: the wrapper takes over the close of `raw`, which is
+        // still owned by `listener`; `listener` (owned) is forgotten
+        // directly below so the same fd is never closed twice.
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        std::mem::forget(listener);
+    }
+
+    // dup2(2), bound locally so the test code does not need nix's
+    // feature-gated wrappers (the production dependency stays lean).
+    unsafe extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+    }
+
+    /// Duplicate a listener onto fd 3, the first fd systemd passes for
+    /// socket activation (SD_LISTEN_FDS_START), and leave fd 3 open so
+    /// `obtain_listener` can take ownership of it. Refuses (with a
+    /// message) if fd 3 is already in use in the test process. The
+    /// listener is consumed: on success only fd 3 remains open, on
+    /// error the listener is dropped normally.
+    fn install_on_fd3(listener: UnixListener) -> std::io::Result<()> {
+        // /proc/self/fd/N exists only while fd N is open: a side-effect
+        // free probe (Linux only — this binary's platform).
+        match fs::symlink_metadata("/proc/self/fd/3") {
+            Ok(_) => return Err(std::io::Error::other("fd 3 is in use in the test process")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(std::io::Error::other(format!("probing fd 3: {e}"))),
+        }
+        let raw = listener.as_raw_fd();
+        // SAFETY: the probe established fd 3 is closed, so dup2(2)
+        // closes nothing; it returns fd 3 (or -1), which the OwnedFd
+        // below takes ownership of and is forgotten right away so it
+        // never closes fd 3 again.
+        let dup = unsafe { dup2(raw, 3) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd3 = unsafe { OwnedFd::from_raw_fd(dup) };
+        // Close the listener's original fd, then forget both wrappers:
+        // fd 3 is the only remaining reference to the socket.
+        // SAFETY: as in leave_stale_socket — the wrapper takes over the
+        // close, `listener` (owned) is forgotten so there is no
+        // double close.
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        std::mem::forget(listener);
+        std::mem::forget(fd3);
+        Ok(())
+    }
 
     /// Set (Some) or unset (None) the given environment variables for the
     /// duration of `f`, restoring whatever was there before.
@@ -587,20 +718,23 @@ mod tests {
         // present for clap's conflict check, so a stray env var (e.g. left
         // over from a mode B shell) makes mode A refuse to start instead
         // of silently ignoring the path.
-        with_env(&[("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1"))], || {
-            let err = Cli::try_parse_from([
-                "wlsctx",
-                "--socket-activation",
-                "--app-id",
-                "a",
-                "--instance-id",
-                "i",
-                "--sandbox-engine",
-                "podman",
-            ])
-            .expect_err("--socket-activation must conflict with an env-provided --listen");
-            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-        });
+        with_env(
+            &[("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1"))],
+            || {
+                let err = Cli::try_parse_from([
+                    "wlsctx",
+                    "--socket-activation",
+                    "--app-id",
+                    "a",
+                    "--instance-id",
+                    "i",
+                    "--sandbox-engine",
+                    "podman",
+                ])
+                .expect_err("--socket-activation must conflict with an env-provided --listen");
+                assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            },
+        );
     }
 
     #[test]
@@ -634,17 +768,12 @@ mod tests {
     fn signal_block_mask_blocks_every_signal_the_loop_handles() {
         let mask = signal_block_mask();
         for sig in [
-            SIGTERM,
-            SIGINT,
-            SIGHUP,
-            SIGCHLD,
-            SIGTSTP,
-            SIGTTOU,
-            SIGTTIN,
-            SIGUSR1,
-            SIGPIPE,
+            SIGTERM, SIGINT, SIGHUP, SIGCHLD, SIGTSTP, SIGTTOU, SIGTTIN, SIGUSR1, SIGPIPE,
         ] {
-            assert!(mask.contains(sig), "{sig:?} must be blocked and routed to the signalfd");
+            assert!(
+                mask.contains(sig),
+                "{sig:?} must be blocked and routed to the signalfd"
+            );
         }
     }
 
@@ -678,5 +807,300 @@ mod tests {
         for sig in [SIGUSR1, SIGUSR2, SIGPIPE, SIGCONT, SIGWINCH, SIGALRM] {
             assert_eq!(classify_signal(sig), SignalAction::Unexpected, "{sig:?}");
         }
+    }
+
+    #[test]
+    fn listen_absolute_binds_at_exact_path() {
+        // An absolute path is used as-is; no XDG involvement, so this
+        // holds even with XDG_RUNTIME_DIR unset.
+        let dir = TmpDir::new("listen-abs");
+        let sock = dir.path().join("wayland-1");
+        with_env(&[("XDG_RUNTIME_DIR", None)], || {
+            let (_, _, listener) = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+                .expect("absolute path must bind");
+            assert!(sock.exists());
+            assert_eq!(socket_path(&listener), Some(sock));
+        });
+    }
+
+    #[test]
+    fn listen_replaces_stale_socket() {
+        // A socket file left by a previous run is removed and re-bound;
+        // any other pre-existing path is an error.
+        let dir = TmpDir::new("listen-stale");
+        let sock = dir.path().join("wayland-1");
+        let stale = UnixListener::bind(&sock).expect("creating the stale socket");
+        leave_stale_socket(stale);
+        assert!(sock.exists());
+
+        let (_, _, listener) = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+            .expect("stale socket replaced");
+        // Binding over an existing path fails with EADDRINUSE, so a
+        // successful bind proves the old file was removed first.
+        assert_eq!(socket_path(&listener), Some(sock));
+    }
+
+    #[test]
+    fn listen_rejects_existing_regular_file() {
+        let dir = TmpDir::new("listen-file");
+        let sock = dir.path().join("wayland-1");
+        fs::write(&sock, "not a socket").unwrap();
+        let err = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+            .expect_err("a non-socket file must be rejected");
+        assert!(
+            format!("{err:#}").contains("not a socket"),
+            "clear error expected, got: {err:#}"
+        );
+        assert!(sock.exists(), "the file must be left alone");
+    }
+
+    #[test]
+    fn listen_rejects_existing_directory() {
+        let dir = TmpDir::new("listen-dir");
+        let sock = dir.path().join("wayland-1");
+        fs::create_dir(&sock).unwrap();
+        let err = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+            .expect_err("a directory must be rejected");
+        assert!(
+            format!("{err:#}").contains("not a socket"),
+            "clear error expected, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn listen_empty_string_fails_cleanly() {
+        // "" is a relative path that resolves to the runtime directory
+        // itself, which exists and is a directory: a clear error, not a
+        // panic or a bind on an unexpected path.
+        let runtime = xdg_runtime_dir(0o700);
+        with_env(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
+            || {
+                let err = obtain_listener(&test_cli_listen("")).expect_err("empty path must fail");
+                assert!(
+                    format!("{err:#}").contains("not a socket"),
+                    "clear error expected, got: {err:#}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn listen_relative_path_placed_in_xdg_runtime_dir() {
+        // Relative paths go into $XDG_RUNTIME_DIR; nested names (mode A
+        // uses wlsctx/<instance>/wayland-1) create their subdirectories.
+        let runtime = xdg_runtime_dir(0o700);
+        with_env(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
+            || {
+                let expected = runtime.path().join("wlsctx/work/wayland-1");
+                let (_, _, listener) = obtain_listener(&test_cli_listen("wlsctx/work/wayland-1"))
+                    .expect("relative path must land in the runtime dir");
+                assert_eq!(socket_path(&listener), Some(expected));
+                assert!(runtime.path().join("wlsctx/work").is_dir());
+            },
+        );
+    }
+
+    #[test]
+    fn listen_relative_path_without_xdg_runtime_dir_fails() {
+        with_env(&[("XDG_RUNTIME_DIR", None)], || {
+            let err = obtain_listener(&test_cli_listen("wayland-1"))
+                .expect_err("no runtime dir, no relative placement");
+            assert!(
+                format!("{err:#}").contains("XDG_RUNTIME_DIR"),
+                "actionable error expected, got: {err:#}"
+            );
+        });
+    }
+
+    #[test]
+    fn listen_relative_path_with_relative_xdg_runtime_dir_fails() {
+        // The XDG spec treats a relative XDG_RUNTIME_DIR as unset; the
+        // xdg crate does, and so does the error.
+        with_env(&[("XDG_RUNTIME_DIR", Some("relative-run-dir"))], || {
+            let err = obtain_listener(&test_cli_listen("wayland-1"))
+                .expect_err("a relative runtime dir is not a runtime dir");
+            assert!(
+                format!("{err:#}").contains("XDG_RUNTIME_DIR"),
+                "actionable error expected, got: {err:#}"
+            );
+        });
+    }
+
+    #[test]
+    fn listen_relative_path_with_insecure_xdg_runtime_dir_fails() {
+        // xdg requires 0700 exactly; a world-accessible runtime dir is
+        // rejected and the cause is visible in the error chain.
+        let runtime = xdg_runtime_dir(0o755);
+        with_env(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
+            || {
+                let err = obtain_listener(&test_cli_listen("wayland-1"))
+                    .expect_err("0755 is not a secure runtime dir");
+                assert!(
+                    format!("{err:#}").contains("0o700"),
+                    "permission cause expected, got: {err:#}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn listen_oversized_path_fails_to_bind() {
+        // AF_UNIX sun_path is 108 bytes; longer names fail at bind(2),
+        // and the error must say binding failed rather than crash.
+        let runtime = xdg_runtime_dir(0o700);
+        let long_name = format!("{}wayland-1", "a".repeat(112));
+        assert!(long_name.len() > 108);
+        with_env(
+            &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
+            || {
+                let err = obtain_listener(&test_cli_listen(&long_name))
+                    .expect_err("overlong path must fail at bind");
+                assert!(
+                    format!("{err:#}").contains("binding"),
+                    "bind context expected, got: {err:#}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn socket_activation_without_listen_fds_fails() {
+        // No LISTEN_PID/LISTEN_FDS at all (running wlsctx by hand, not
+        // through the socket unit): a clear error pointing at the two
+        // ways to fix it.
+        with_env(
+            &[
+                ("LISTEN_FDS", None),
+                ("LISTEN_PID", None),
+                ("LISTEN_FDNAMES", None),
+            ],
+            || {
+                let err = obtain_listener(&test_cli_socket_activation())
+                    .expect_err("nothing was passed, nothing to tag");
+                assert!(
+                    format!("{err:#}")
+                        .contains("no socket was received via systemd socket activation"),
+                    "actionable error expected, got: {err:#}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn socket_activation_with_stale_listen_pid_fails() {
+        // sd-notify silently yields an empty fd list when LISTEN_PID
+        // does not match the current process (a stale value inherited
+        // from a parent shell or service); the failure must look like
+        // the no-fds case, not like a random crash on a foreign fd.
+        with_env(
+            &[
+                ("LISTEN_FDS", Some("1")),
+                ("LISTEN_PID", Some("99999999")),
+                ("LISTEN_FDNAMES", None),
+            ],
+            || {
+                let err = obtain_listener(&test_cli_socket_activation())
+                    .expect_err("a pid mismatch must not adopt a foreign fd");
+                assert!(
+                    format!("{err:#}")
+                        .contains("no socket was received via systemd socket activation"),
+                    "actionable error expected, got: {err:#}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn socket_activation_rejects_fdname_count_mismatch() {
+        let _fd_lock = LISTEN_FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TmpDir::new("socket-activation-mismatch");
+        let sock = dir.path().join("wayland-1");
+        let listener = match UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping (cannot bind {sock:?}): {e}");
+                return;
+            }
+        };
+        match install_on_fd3(listener) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        }
+        let pid = std::process::id().to_string();
+        with_env(
+            &[
+                ("LISTEN_FDS", Some("1")),
+                ("LISTEN_PID", Some(&pid)),
+                ("LISTEN_FDNAMES", Some("a:b")), // 2 names, 1 fd
+            ],
+            || {
+                let err = obtain_listener(&test_cli_socket_activation())
+                    .expect_err("fdname count mismatch must fail before any fd is adopted");
+                assert!(
+                    format!("{err:#}")
+                        .contains("no socket was received via systemd socket activation"),
+                    "actionable error expected, got: {err:#}"
+                );
+            },
+        );
+        // obtain_listener bailed before taking ownership: close fd 3
+        // ourselves (its wrapper was forgotten in install_on_fd3).
+        // SAFETY: fd 3 is open here (install_on_fd3 succeeded) and no
+        // other code in the test process references it.
+        drop(unsafe { OwnedFd::from_raw_fd(3) });
+    }
+
+    #[test]
+    fn socket_activation_adopts_fd_from_systemd() {
+        let _fd_lock = LISTEN_FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TmpDir::new("socket-activation");
+        let sock = dir.path().join("wayland-1");
+        let listener = match UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping (cannot bind {sock:?}): {e}");
+                return;
+            }
+        };
+        match install_on_fd3(listener) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        }
+        let pid = std::process::id().to_string();
+        with_env(
+            &[
+                ("LISTEN_FDS", Some("1")),
+                ("LISTEN_PID", Some(&pid)),
+                ("LISTEN_FDNAMES", Some("rustrover-work")), // FileDescriptorName=%i
+            ],
+            || {
+                let (app_id, instance_id, listener) =
+                    obtain_listener(&test_cli_socket_activation())
+                        .expect("the passed fd must be adopted");
+                assert_eq!(app_id, "rustrover");
+                assert_eq!(instance_id, "work");
+                assert_eq!(socket_path(&listener), Some(sock));
+                // the unset_env variant scrubs the variables so no
+                // child process can mistake them for its own activation
+                for var in ["LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"] {
+                    assert!(
+                        std::env::var(var).is_err(),
+                        "{var} must be unset after adoption"
+                    );
+                }
+            },
+        );
+        // The adopted listener returned by obtain_listener is dropped at
+        // the end of the closure, closing fd 3; `dir` is then dropped
+        // and removes the socket file.
     }
 }
