@@ -598,30 +598,58 @@ mod tests {
     }
 
     /// Set (Some) or unset (None) the given environment variables for the
-    /// duration of `f`, restoring whatever was there before.
+    /// duration of `f`, restoring whatever was there before — on unwind
+    /// too, so a panicking test does not leak its environment into other
+    /// tests.
     fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<(&str, Option<String>)> = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok()))
-            .collect();
-        // SAFETY: ENV_LOCK guarantees no other test or code path reads or
-        // writes these variables while they are held.
-        unsafe {
-            for (name, value) in vars {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
+        let _lock_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = EnvGuard::new(vars);
+        f();
+    }
+
+    /// RAII half of [`with_env`]: records the current value of each
+    /// variable, applies the requested values, and restores the recorded
+    /// ones in `Drop` (which also runs when the protected closure
+    /// panics). Must only be used while holding `ENV_LOCK`.
+    struct EnvGuard<'a> {
+        /// (name, previous value) pairs to restore on drop, in the
+        /// original order.
+        restore: Vec<(&'a str, Option<String>)>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(vars: &[(&'a str, Option<&'a str>)]) -> Self {
+            let restore = vars
+                .iter()
+                .map(|(name, _)| (*name, std::env::var(name).ok()))
+                .collect();
+            // SAFETY: ENV_LOCK guarantees no other test or code path
+            // reads or writes these variables while they are held.
+            unsafe {
+                for (name, value) in vars {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
+            Self { restore }
         }
-        f();
-        // SAFETY: as above.
-        unsafe {
-            for (name, value) in saved {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            // Runs on every exit path of the protected closure,
+            // including panic.
+            // SAFETY: as in EnvGuard::new — ENV_LOCK is held by the
+            // with_env that created this guard and outlives it (the
+            // lock guard is declared first, so it drops last).
+            unsafe {
+                for (name, value) in &self.restore {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -1297,6 +1325,15 @@ mod tests {
             }
         }
         let pid = std::process::id().to_string();
+        // obtain_listener bails before adopting the fd (that is the
+        // behaviour under test), so we hold it in an OwnedFd from here
+        // until the end of the test: it is closed on every exit path,
+        // including a panic inside the closure, so a failing test cannot
+        // leak fd 3 and make later socket-activation tests silently skip.
+        // SAFETY: fd 3 is open (install_on_fd succeeded) and no other
+        // code in the test process references it; this wrapper is the
+        // sole owner and is dropped exactly once.
+        let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
         with_env(
             &[
                 ("LISTEN_FDS", Some("1")),
@@ -1313,11 +1350,7 @@ mod tests {
                 );
             },
         );
-        // obtain_listener bailed before taking ownership: close fd 3
-        // ourselves (its wrapper was forgotten in install_on_fd).
-        // SAFETY: fd 3 is open here (install_on_fd succeeded) and no
-        // other code in the test process references it.
-        drop(unsafe { OwnedFd::from_raw_fd(3) });
+        drop(fd3);
     }
 
     #[test]
@@ -1348,18 +1381,19 @@ mod tests {
             eprintln!("skipping: fd 3 unavailable in the test process");
             return;
         }
+        // SAFETY: as in the fdname-mismatch test — fd 3 is open
+        // (install_on_fd succeeded) and exclusively ours; the wrapper
+        // keeps it closed-on-every-exit-path from here on.
+        let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
         match install_on_fd(4, listener_b) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("skipping: fd 4 unavailable in the test process: {e}");
-                // fd 3 was installed but fd 4 could not be: release fd 3
-                // so it does not leak into later tests.
-                // SAFETY: install_on_fd(3, …) succeeded, so fd 3 is open
-                // and no other code in the test process references it.
-                drop(unsafe { OwnedFd::from_raw_fd(3) });
-                return;
+                return; // fd3 is closed by its drop
             }
         }
+        // SAFETY: same, for fd 4.
+        let fd4 = unsafe { OwnedFd::from_raw_fd(4) };
         let pid = std::process::id().to_string();
         with_env(
             &[
@@ -1374,12 +1408,9 @@ mod tests {
                 assert!(msg.contains("tags exactly one"), "{msg}");
             },
         );
-        // obtain_listener bailed before adopting: close both fds
-        // ourselves (their wrappers were forgotten in install_on_fd).
-        // SAFETY: fd 3 and fd 4 are open here (install_on_fd succeeded)
-        // and no other code in the test process references them.
-        drop(unsafe { OwnedFd::from_raw_fd(3) });
-        drop(unsafe { OwnedFd::from_raw_fd(4) });
+        // Both fds are closed by their drops (and on unwind, if the
+        // closure above panicked).
+        drop((fd3, fd4));
     }
 
     #[test]
