@@ -88,7 +88,8 @@ fn main() -> Result<()> {
 
     let close_fd = create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
-    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+    // SAFETY: called from main() before any threads are spawned
+    let _ = unsafe { sd_notify::notify_and_unset_env(&[sd_notify::NotifyState::Ready]) };
 
     run_signal_loop()?;
     info!("Shutting down.");
@@ -108,10 +109,10 @@ fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
         // "app@instance" instance names and wlsctx@.socket sets
         // FileDescriptorName=%i, so the name normally contains no '@' and
         // the derivation panicked.
-        match sd_notify::listen_fds_with_names(true).map(|mut it| it.next()) {
+        match unsafe { sd_notify::listen_fds_with_names_and_unset_env() }.map(|mut it| it.next()) {
             Ok(Some((raw_fd, name))) => {
                 info!("Received socket {name} ({raw_fd:#?}) from parent");
-                // SAFETY: sd_notify::listen_fds_with_names(true) unsets the LISTEN_FDS variable so we should be
+                // SAFETY: sd_notify::listen_fds_with_names_and_unset_env() unsets the LISTEN_FDS variable so we should be
                 // the only user of this fd
                 let listener = unsafe { UnixListener::from_raw_fd(raw_fd) };
                 Ok((app_id, instance_id, listener))
