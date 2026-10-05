@@ -132,6 +132,11 @@ fn main() -> Result<()> {
         info!("Listening on {local_addr:?}")
     }
 
+    // Keep BOTH the reference pipe (close_fd) and our copy of the tagged
+    // listener (listener) open until process exit: the compositor holds
+    // its own copies, so nothing is double-closed, but releasing either
+    // here would make the socket's lifecycle diverge from ours. See the
+    // ownership note on create_security_context.
     let close_fd = create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     // SAFETY: called from main() before any threads are spawned
@@ -270,6 +275,15 @@ fn bind_socket(path: &path::Path) -> Result<UnixListener> {
 /// as long as the reference pipe (the protocol "close" fd) is open, so this
 /// function hands the write end of that pipe back to the caller, which must
 /// keep it open for as long as the socket should stay tagged.
+///
+/// Ownership note: per the protocol, `create_listener` transfers ownership
+/// of the listener fd to the compositor (which holds its own dup). wlsctx
+/// nevertheless keeps *its* copy of the fd open for the process lifetime
+/// (see `main`) and drops it only on exit, together with the reference
+/// pipe: that keeps "wlsctx is alive" equivalent to "the tagged socket is
+/// valid", and makes the tagged socket's fate visible in this process's fd
+/// table (lsof). Dropping our copy early would not unbind the socket — the
+/// compositor's copy keeps it alive — but do not "clean it up".
 fn create_security_context(
     listener: &UnixListener,
     sandbox_engine: &str,
