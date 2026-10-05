@@ -260,17 +260,30 @@ fn create_security_context(
 
 /// The set of signals blocked in the signalfd(2) loop.
 ///
-/// Everything is blocked and routed through the signalfd, except the
-/// signals the kernel generates for fatal faults in our own code (SIGFPE,
-/// SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS): those must stay
-/// unblocked so the process still dies with the faulting signal (core
-/// dump, correct journal entry) instead of parking in the loop.
+/// Everything is blocked and routed through the signalfd, *including the
+/// Linux real-time range (34-64)*. The set therefore starts from
+/// `SigSet::all()` (sigfillset) and only removes exceptions — building it
+/// by iterating `Signal` values would silently drop the real-time bits,
+/// because nix's `Signal` enum only names 1-31, leaving the real-time
+/// signals at their default-terminate disposition (a same-uid process —
+/// in mode B, the sandboxed app itself — could kill wlsctx with
+/// `kill -34`, bypassing the clean-shutdown path).
+///
+/// The only signals left unblocked are those the kernel generates for
+/// fatal faults in our own code (SIGFPE, SIGILL, SIGSEGV, SIGBUS,
+/// SIGABRT, SIGTRAP, SIGSYS): they must stay unblocked so the process
+/// still dies with the faulting signal (core dump, correct journal
+/// entry) instead of parking in the loop.
+///
+/// SIGKILL/SIGSTOP are in the set but cannot be blocked by POSIX; they
+/// act regardless of the mask (inherent limitation, not a bug).
 fn signal_block_mask() -> SigSet {
     let kernel_faults = [SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS];
-    SigSet::all()
-        .iter()
-        .filter(|sig| !kernel_faults.contains(sig))
-        .collect()
+    let mut mask = SigSet::all();
+    for sig in kernel_faults {
+        mask.remove(sig);
+    }
+    mask
 }
 
 /// What the signalfd loop does for a delivered signal.
@@ -322,8 +335,20 @@ fn run_signal_loop() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("reading from signalfd failed: {e}"))?
     {
         debug!("Signal: {siginfo:?}");
-        let signal = Signal::try_from(siginfo.ssi_signo as i32)
-            .map_err(|e| anyhow::anyhow!("unknown signal number {}: {e}", siginfo.ssi_signo))?;
+        let signal = match Signal::try_from(siginfo.ssi_signo as i32) {
+            Ok(signal) => signal,
+            // The real-time range (34-64 on Linux) is blocked and
+            // delivered here, but nix's Signal enum cannot name it:
+            // treat it like any other unhandled signal, warn, and keep
+            // waiting.
+            Err(_) => {
+                warn!(
+                    "Unexpected signal {} ignored (unnameable signal number, e.g. real-time range)",
+                    siginfo.ssi_signo
+                );
+                continue;
+            }
+        };
         match classify_signal(signal) {
             SignalAction::Stop => {
                 debug!("Stopping");
@@ -861,6 +886,50 @@ mod tests {
                 mask.contains(sig),
                 "{sig:?} must be blocked and routed to the signalfd"
             );
+        }
+    }
+
+    // The real-time range can only be checked on the raw bits: nix's
+    // Signal enum stops at 31, so a mask built by iterating Signal values
+    // would silently drop these bits, leaving the default-terminate
+    // disposition in place.
+    #[cfg(target_os = "linux")]
+    fn raw_mask(mask: SigSet) -> libc::sigset_t {
+        // SAFETY: SigSet is #[repr(transparent)] over libc::sigset_t, so
+        // the transmute is a bit-for-bit read of the same words.
+        unsafe { std::mem::transmute::<SigSet, libc::sigset_t>(mask) }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn signal_block_mask_blocks_the_realtime_range() {
+        let raw = raw_mask(signal_block_mask());
+        for signo in 34..=64 {
+            assert_ne!(
+                unsafe { libc::sigismember(&raw, signo) },
+                0,
+                "signal {signo} (real-time range) must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn signal_block_mask_raw_bits_cover_the_standard_range_exactly() {
+        // The full sigfillset minus exactly the seven fatal faults:
+        // every other standard signal (1-31) must be blocked.
+        let raw = raw_mask(signal_block_mask());
+        let fatal = [SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS]
+            .iter()
+            .map(|s| *s as i32)
+            .collect::<Vec<_>>();
+        for signo in 1..=31 {
+            let blocked = unsafe { libc::sigismember(&raw, signo) } != 0;
+            if fatal.contains(&signo) {
+                assert!(!blocked, "signal {signo} must stay unblocked");
+            } else {
+                assert!(blocked, "signal {signo} must be blocked");
+            }
         }
     }
 

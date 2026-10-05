@@ -584,6 +584,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "nix",
  "sd-notify",
