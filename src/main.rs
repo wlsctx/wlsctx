@@ -13,7 +13,7 @@ use nix::sys::{
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::os::unix::{fs::FileTypeExt, net::{UnixListener, UnixStream}};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path;
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
@@ -134,7 +134,14 @@ fn main() -> Result<()> {
     let close_fd = create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     // SAFETY: called from main() before any threads are spawned
-    let _ = unsafe { sd_notify::notify_and_unset_env(&[sd_notify::NotifyState::Ready]) };
+    if let Err(e) =
+        unsafe { sd_notify::notify_and_unset_env(&[sd_notify::NotifyState::Ready]) }
+    {
+        // With Notify=true (both deployment units) a failed READY means
+        // systemd will time the service out; say so, since the failure
+        // would otherwise be invisible in our own log.
+        warn!("notifying the service manager (READY) failed: {e}");
+    }
 
     run_signal_loop()?;
     info!("Shutting down.");
