@@ -504,6 +504,125 @@ mod tests {
     }
 
     #[test]
+    fn explicit_arguments_take_precedence_over_env() {
+        // Deployment mode B relies on exactly this: the quadlet passes
+        // --listen on the command line while the IDs come from the
+        // WLSCTX_* environment, and the two sources may disagree.
+        with_env(
+            &[
+                ("WLSCTX_APP_ID", Some("envapp")),
+                ("WLSCTX_INSTANCE_ID", Some("envinst")),
+                ("WLSCTX_SANDBOX_ENGINE", Some("envengine")),
+                ("WLSCTX_SOCKET_PATH", Some("/env/socket")),
+            ],
+            || {
+                let cli = Cli::try_parse_from([
+                    "wlsctx",
+                    "--listen",
+                    "/run/pod/wayland-1",
+                    "--app-id",
+                    "flagapp",
+                ])
+                .expect("flag + env mix must parse");
+                // CLI wins for the flag that was given explicitly…
+                assert_eq!(
+                    cli.listen.as_deref(),
+                    Some(std::path::Path::new("/run/pod/wayland-1"))
+                );
+                assert_eq!(cli.app_id, "flagapp");
+                // …and env still fills the arguments that were not given.
+                assert_eq!(cli.instance_id, "envinst");
+                assert_eq!(cli.sandbox_engine, "envengine");
+                assert!(!cli.socket_activation);
+            },
+        );
+    }
+
+    #[test]
+    fn requires_sandbox_engine() {
+        without_wlsctx_env(|| {
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+            ])
+            .expect_err("sandbox_engine is always required (no default)");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            assert!(err.to_string().contains("--sandbox-engine"));
+        });
+    }
+
+    #[test]
+    fn listen_given_twice_is_rejected() {
+        // clap models a repeated single-value flag as the argument
+        // conflicting with itself (ArgAction::Set does not override
+        // itself unless `args_override_self` is set): the second --listen
+        // is an error, it never silently wins.
+        without_wlsctx_env(|| {
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--listen",
+                "/other/socket",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("--listen must not be repeatable");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        });
+    }
+
+    #[test]
+    fn socket_activation_conflicts_with_socket_path_env() {
+        // WLSCTX_SOCKET_PATH in the environment counts as --listen being
+        // present for clap's conflict check, so a stray env var (e.g. left
+        // over from a mode B shell) makes mode A refuse to start instead
+        // of silently ignoring the path.
+        with_env(&[("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1"))], || {
+            let err = Cli::try_parse_from([
+                "wlsctx",
+                "--socket-activation",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("--socket-activation must conflict with an env-provided --listen");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        });
+    }
+
+    #[test]
+    fn empty_env_values_are_accepted() {
+        // An *empty* WLSCTX_* variable is a value for clap, not "unset":
+        // the argument counts as present and the empty string is used.
+        with_env(
+            &[
+                ("WLSCTX_APP_ID", Some("")),
+                ("WLSCTX_INSTANCE_ID", Some("")),
+                ("WLSCTX_SANDBOX_ENGINE", Some("podman")),
+                ("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1")),
+            ],
+            || {
+                let cli = Cli::try_parse_from(["wlsctx"]).expect("empty env vars satisfy the args");
+                assert_eq!(cli.app_id, "");
+                assert_eq!(cli.instance_id, "");
+            },
+        );
+    }
+
+    #[test]
     fn signal_block_mask_keeps_fatal_kernel_faults_unblocked() {
         let mask = signal_block_mask();
         for sig in [SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS] {
