@@ -13,7 +13,7 @@ use nix::sys::{
 use std::fs;
 use std::io;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::os::unix::{fs::FileTypeExt, net::UnixListener};
+use std::os::unix::{fs::FileTypeExt, net::{UnixListener, UnixStream}};
 use std::path;
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
@@ -142,8 +142,8 @@ fn main() -> Result<()> {
 }
 
 /// Get the Unix listener to tag, either from a systemd socket activation
-/// or by binding the socket ourselves. Returns (app_id, instance_id,
-/// listener).
+/// or by binding the socket ourselves (refusing to steal a socket that a
+/// live process still serves). Returns (app_id, instance_id, listener).
 fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
     let app_id = cli.app_id.clone();
     let instance_id = cli.instance_id.clone();
@@ -185,30 +185,50 @@ fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
                     )
                 })?,
         };
-        // A stale socket left by a previous run is removed; any other
-        // pre-existing path is an error, since binding would fail.
-        match fs::metadata(&socket_abspath) {
-            Ok(meta) if meta.file_type().is_socket() => {
-                info!("Removing old socket {socket_abspath:?}");
-                let _ = fs::remove_file(&socket_abspath).inspect_err(|e| {
-                    error!("Failed to remove stale socket {socket_abspath:?}: {e}")
+        bind_socket(&socket_abspath).map(|listener| (app_id, instance_id, listener))
+    }
+}
+
+/// Bind a listening socket at `path`, refusing to steal a socket that a
+/// live process still serves and only replacing genuinely stale ones.
+///
+/// A socket file is *stale* only if no process holds its listener open
+/// (connect(2) then fails with ECONNREFUSED). A successful connect means
+/// the path is actively served — including a previous hung wlsctx that
+/// is still alive, or a `--listen` typo pointing at a socket owned by
+/// some other service (e.g. the compositor's own wayland-1): unlinking
+/// that would break it, so we bail instead. The probe itself creates one
+/// pending connection on a live listener, which we close immediately.
+fn bind_socket(path: &path::Path) -> Result<UnixListener> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => match UnixStream::connect(path) {
+            Ok(_) => bail!(
+                "{path:?} is served by a live process (connect succeeded); \
+                 stop that process first (a previous wlsctx still hanging? or a \
+                 --listen typo pointing at a socket owned by another service, e.g. \
+                 the compositor's own)"
+            ),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                info!("Removing stale socket {path:?}");
+                let _ = fs::remove_file(path).inspect_err(|e| {
+                    error!("Failed to remove stale socket {path:?}: {e}")
                 });
             }
-            Ok(_) => bail!(
-                "{socket_abspath:?} already exists and is not a socket; \
-                 move or delete it before starting wlsctx"
-            ),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => bail!("stat {socket_abspath:?} failed: {e}"),
-        }
-        let listener = UnixListener::bind(&socket_abspath).with_context(|| {
-            format!(
-                "binding {socket_abspath:?} failed (a stale socket could not be removed, \
-                 or the path is not writable)"
-            )
-        })?;
-        Ok((app_id, instance_id, listener))
+            Err(e) => bail!("probing {path:?} failed: {e}"),
+        },
+        Ok(_) => bail!(
+            "{path:?} already exists and is not a socket; \
+             move or delete it before starting wlsctx"
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => bail!("stat {path:?} failed: {e}"),
     }
+    UnixListener::bind(path).with_context(|| {
+        format!(
+            "binding {path:?} failed (a stale socket could not be removed, \
+             or the path is not writable)"
+        )
+    })
 }
 
 /// Create a tagged Wayland listening socket for the given app/instance.
@@ -994,6 +1014,23 @@ mod tests {
         // Binding over an existing path fails with EADDRINUSE, so a
         // successful bind proves the old file was removed first.
         assert_eq!(socket_path(&listener), Some(sock));
+    }
+
+    #[test]
+    fn listen_rejects_socket_with_live_listener() {
+        // A socket whose listener fd is still open — a previous wlsctx
+        // that is hung but not yet dead, or a --listen typo over a
+        // foreign service's socket (e.g. the compositor's own) — must
+        // not be unlinked: connect(2) succeeds, so the error must name
+        // it, and the file must be left in place.
+        let dir = TmpDir::new("listen-live");
+        let sock = dir.path().join("wayland-1");
+        let _live = UnixListener::bind(&sock).expect("creating the live socket");
+        let err = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+            .expect_err("a live listener must be left alone");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("live process"), "{msg}");
+        assert!(sock.exists(), "the live socket file must be left in place");
     }
 
     #[test]
