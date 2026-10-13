@@ -32,6 +32,13 @@
 //! empty, the compositor never sees the request); under
 //! `ClipboardPolicy::Allow` both reads reach the compositor and
 //! both memfds are filled.
+//!
+//! The broker tests wire the deny gate to a broker (the Phase 4
+//! prompt broker): an auto-allow daemon makes the foreign read flow
+//! end to end, a counting stand-in that answers `deny` proves the
+//! gate consulted the broker before dropping, and a stand-in that
+//! answers after the proxy's deadline proves every failure path
+//! fails closed (read dropped, session intact, empty clipboard).
 
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
@@ -1326,6 +1333,209 @@ fn clipboard_allow_is_a_passthrough() {
 #[test]
 fn clipboard_deny_allows_own_readback_and_drops_foreign() {
     run_clipboard_session(wlsctx::proxy::ClipboardPolicy::Deny);
+}
+
+/// Phase 4: the same three-party clipboard session, but with the
+/// proxy wired to a broker for the reads the gate drops. The gate
+/// is `Deny` in every case below, so the outcome differs from the
+/// Phase 3 deny test only through what the broker answers:
+///
+/// * `AutoAllow`: the *real* broker daemon's per-connection path
+///   (`wlsctx::broker::handle_connection` with `AutoDecide::Allow`)
+///   on its own socket. The foreign read must flow end to end: the
+///   gate drops it, the proxy asks, the allow opens the intent
+///   window, the read is forwarded, the compositor serves it, and
+///   the app's memfd gets the host data. Only an allow could do
+///   that under a deny gate.
+/// * `AutoDeny`: a stand-in broker that counts the proxy's asks and
+///   answers `deny`. The session must come out exactly like the
+///   Phase 3 deny test — and the counter proves the gate *asked*
+///   the broker rather than merely dropping in silence.
+/// * `Timeout`: a stand-in that answers only after the proxy's own
+///   (short) deadline. Fail-closed: the read is dropped, the
+///   session completes, and the app sees an empty clipboard.
+#[derive(Clone, Copy)]
+enum BrokerOutcome {
+    AutoAllow,
+    AutoDeny,
+    Timeout,
+}
+
+fn run_broker_session(outcome: BrokerOutcome) {
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+    let broker_path = dir.path().join("broker.sock");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let broker_queries: Arc<AtomicUsize> = Arc::default();
+
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let broker_for_proxy = broker_path.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            // The relay's ask to the broker: short a deadline for
+            // the fail-closed test, comfortable otherwise.
+            let broker_cfg = wlsctx::proxy::BrokerConfig {
+                socket: broker_for_proxy,
+                app: "testapp".into(),
+                instance: "inst".into(),
+                timeout: match outcome {
+                    BrokerOutcome::Timeout => Duration::from_millis(400),
+                    _ => Duration::from_secs(10),
+                },
+                window: Duration::from_millis(1500),
+            };
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                wlsctx::proxy::ClipboardPolicy::Deny,
+                Some(broker_cfg),
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
+    let stop_comp = stop.clone();
+    let comp = thread::Builder::new()
+        .name("fake-compositor".into())
+        .spawn(move || {
+            run_fake_data_device_compositor(
+                tagged_path,
+                ready_c,
+                stop_comp,
+                live_c,
+                recv_c,
+            )
+        })
+        .unwrap();
+
+    let (queries_c, broker_c) = (broker_queries.clone(), broker_path.clone());
+    let broker = thread::Builder::new()
+        .name("broker".into())
+        .spawn(move || {
+            let listener = wlsctx::broker::bind_listener(&broker_c).unwrap();
+            // One request per session: accept it, serve it, exit.
+            let (mut stream, _) = listener.accept().unwrap();
+            queries_c.fetch_add(1, Ordering::SeqCst);
+            match outcome {
+                BrokerOutcome::AutoAllow => {
+                    // The daemon's real per-connection path, minus
+                    // its accept loop: decode the request, auto-
+                    // decide, answer. (The interactive announce and
+                    // decision socket are not on this path.)
+                    let args = wlsctx::broker::BrokerArgs {
+                        runtime_dir: std::env::temp_dir().join("wlsctx-broker-test"),
+                        auto_decide: Some(wlsctx::broker::AutoDecide::Allow),
+                        timeout: Duration::from_secs(5),
+                    };
+                    wlsctx::broker::handle_connection(stream, &args);
+                }
+                BrokerOutcome::AutoDeny => {
+                    let line = wlsctx::broker::encode_decision(&wlsctx::broker::Decision::Deny {
+                        reason: "auto".into(),
+                    })
+                    .unwrap();
+                    let _ = stream.write_all(line.as_bytes());
+                }
+                BrokerOutcome::Timeout => {
+                    // The proxy's 400 ms read deadline expires long
+                    // before this answer; writing it afterwards is
+                    // moot (the decision is gone over there) but
+                    // proves the stand-in behaved like a slow user.
+                    thread::sleep(Duration::from_secs(2));
+                    let line =
+                        wlsctx::broker::encode_decision(&wlsctx::broker::Decision::Allow {
+                            window_ms: wlsctx::broker::INTENT_WINDOW_MS,
+                        })
+                        .unwrap();
+                    let _ = stream.write_all(line.as_bytes());
+                }
+            }
+        })
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    let (own, foreign) =
+        one_clipboard_session(&public_path).expect("clipboard session with the broker failed");
+
+    // The app disconnected before the shutdown, so the compositor's
+    // view must settle to zero live clients before it exits.
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = broker.join();
+    let _ = proxy.join();
+
+    // The own read-back always goes through: the gate is exempt
+    // for the app's own selections, and therefore for the broker.
+    assert_eq!(own, OWN_DATA.as_bytes(), "own read-back payload");
+    assert_eq!(
+        broker_queries.load(Ordering::SeqCst),
+        1,
+        "the gate must have asked the broker exactly once about the foreign read"
+    );
+    match outcome {
+        BrokerOutcome::AutoAllow => {
+            // The gate is deny by default; only the broker's allow
+            // (and its intent window) could move host data into the
+            // app's memfd.
+            assert_eq!(
+                foreign,
+                FOREIGN_DATA.as_bytes(),
+                "broker-allowed foreign payload"
+            );
+            assert_eq!(
+                *received.lock().unwrap(),
+                vec![
+                    ("own".to_string(), "text/plain".to_string()),
+                    ("foreign".to_string(), "text/plain".to_string()),
+                ],
+                "the allow let the compositor serve the foreign read"
+            );
+        }
+        BrokerOutcome::AutoDeny | BrokerOutcome::Timeout => {
+            assert!(
+                foreign.is_empty(),
+                "denied/timed-out foreign read must stay empty"
+            );
+            assert_eq!(
+                *received.lock().unwrap(),
+                vec![("own".to_string(), "text/plain".to_string())],
+                "only the own read reached the compositor"
+            );
+        }
+    }
+
+    drop(dir);
+}
+
+#[test]
+fn broker_auto_allow_opens_the_intent_window() {
+    run_broker_session(BrokerOutcome::AutoAllow);
+}
+
+#[test]
+fn broker_auto_deny_stays_dropped_and_is_consulted() {
+    run_broker_session(BrokerOutcome::AutoDeny);
+}
+
+#[test]
+fn broker_timeout_fails_closed() {
+    run_broker_session(BrokerOutcome::Timeout);
 }
 
 fn wait_until(pred: impl Fn() -> bool, secs: u64) {
