@@ -1,8 +1,9 @@
-//! End-to-end test of the transparent proxy: a fake compositor
+//! End-to-end tests of the transparent proxy: a fake compositor
 //! (`wayland-server`) behind the tagged socket, a real `wayland-client`
 //! in front of the public socket, with the wlsctx relay between them.
 //!
-//! Each app session verifies, in order, that the relay passes through:
+//! The pass-through test verifies, in order, that the relay passes
+//! through:
 //! 1. the registry handshake (server -> client `wl_registry.global`),
 //! 2. bound globals (client -> server `wl_registry.bind`),
 //! 3. a request whose reply is an event (client `wl_display.sync` ->
@@ -11,6 +12,14 @@
 //!    server, written back through by the fake compositor),
 //! 5. a second app session after the first one has gone (per-
 //!    connection isolation).
+//!
+//! The allowlist test runs the proxy with an active global allowlist
+//! (`wl_compositor` only) and verifies:
+//! 1. only the allowlisted globals are announced to the client,
+//! 2. the allowlisted path still works end to end (bind, sync),
+//! 3. a `global_remove` of a hidden global never reaches the client,
+//! 4. a `bind` of a hidden global name is rejected with a fatal
+//!    `wl_display.error` (`invalid_object`) that tears the relay down.
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
@@ -173,9 +182,25 @@ impl ServerDispatch<srv_wl_surface::WlSurface, ()> for Srv {
     }
 }
 
+/// Optional on-demand removal of the fake compositor's `wl_shm`
+/// global (used by the allowlist test to exercise `global_remove` of a
+/// hidden global).
+#[derive(Default)]
+struct RemoveTrigger {
+    /// The test sets this to request the removal.
+    requested: Arc<AtomicBool>,
+    /// The compositor sets this once the global is disabled and the
+    /// `global_remove` event has been sent to all connected clients.
+    done: Arc<AtomicBool>,
+}
+
 /// A minimal compositor: listens on the tagged socket, advertises
 /// `wl_compositor` and `wl_shm`, creates whatever the client asks for,
 /// and writes a probe byte through the fd of every `create_pool`.
+///
+/// With a [`RemoveTrigger`], it additionally disables (and thereby
+/// removes, from every client's point of view) the `wl_shm` global
+/// once the trigger is requested.
 ///
 /// Exits when `stop` is set and no clients are live any more.
 fn run_fake_compositor(
@@ -184,14 +209,16 @@ fn run_fake_compositor(
     stop: Arc<AtomicBool>,
     live: Arc<AtomicUsize>,
     received: Arc<Mutex<Option<OwnedFd>>>,
+    remove: Option<RemoveTrigger>,
 ) -> std::io::Result<()> {
     let tagged = ListeningSocket::bind_absolute(tagged_path)
         .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
     let mut display = Display::<Srv>::new()
         .map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
     let mut handle = display.handle();
-    let _ = handle.create_global::<Srv, srv_wl_compositor::WlCompositor, ()>(4, ());
-    let _ = handle.create_global::<Srv, srv_wl_shm::WlShm, ()>(2, ());
+    let _comp_global =
+        handle.create_global::<Srv, srv_wl_compositor::WlCompositor, ()>(4, ());
+    let shm_global = handle.create_global::<Srv, srv_wl_shm::WlShm, ()>(2, ());
     let mut state = Srv { received };
     ready.store(true, Ordering::SeqCst);
 
@@ -199,6 +226,15 @@ fn run_fake_compositor(
         while let Ok(Some(stream)) = tagged.accept() {
             let data = Arc::new(ClientDataImpl { live: live.clone() });
             handle.insert_client(stream, data)?;
+        }
+        // On-demand removal: `disable_global` posts `global_remove` to
+        // every connected registry (and hides the global from new
+        // clients) before this iteration's dispatch/flush run.
+        if let Some(trigger) = &remove
+            && trigger.requested.load(Ordering::SeqCst)
+            && !trigger.done.swap(true, Ordering::SeqCst)
+        {
+            handle.disable_global::<Srv>(shm_global.clone());
         }
         display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
@@ -251,10 +287,10 @@ impl Dispatch<wl_callback::WlCallback, ()> for App {
 }
 
 /// No-op dispatch for bound interfaces that carry no events this test
-/// cares about (required for `registry.bind::<I, (), App>` to typecheck).
+/// cares about (required for `registry.bind::<I, (), T>` to typecheck).
 macro_rules! no_events {
-    ($iface:ty, $event:ty) => {
-        impl Dispatch<$iface, ()> for App {
+    ($t:ty, $iface:ty, $event:ty) => {
+        impl Dispatch<$iface, ()> for $t {
             fn event(
                 _state: &mut Self,
                 _resource: &$iface,
@@ -267,11 +303,203 @@ macro_rules! no_events {
     };
 }
 
-no_events!(wl_compositor::WlCompositor, wl_compositor::Event);
-no_events!(wl_shm::WlShm, wl_shm::Event);
-no_events!(wl_shm_pool::WlShmPool, wl_shm_pool::Event);
-no_events!(wl_buffer::WlBuffer, wl_buffer::Event);
-no_events!(wl_surface::WlSurface, wl_surface::Event);
+no_events!(App, wl_compositor::WlCompositor, wl_compositor::Event);
+no_events!(App, wl_shm::WlShm, wl_shm::Event);
+no_events!(App, wl_shm_pool::WlShmPool, wl_shm_pool::Event);
+no_events!(App, wl_buffer::WlBuffer, wl_buffer::Event);
+no_events!(App, wl_surface::WlSurface, wl_surface::Event);
+
+/// The allowlist test's app: like [`App`], but also records the
+/// `global_remove` events it is given (there should be none for the
+/// hidden global) and keeps the bound objects alive for the session.
+struct AllowlistApp {
+    /// `(global name, interface, version)` from `wl_registry.global`.
+    globals: Vec<(u32, String, u32)>,
+    /// Names from `wl_registry.global_remove`.
+    removes: Vec<u32>,
+    /// Set when the `wl_callback.done` of the test `sync` arrives.
+    sync_done: Arc<AtomicBool>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for AllowlistApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global { name, interface, version } => {
+                state.globals.push((name, interface, version));
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                state.removes.push(name);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for AllowlistApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.sync_done.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+no_events!(AllowlistApp, wl_compositor::WlCompositor, wl_compositor::Event);
+no_events!(AllowlistApp, wl_shm::WlShm, wl_shm::Event);
+no_events!(AllowlistApp, wl_surface::WlSurface, wl_surface::Event);
+
+/// A throwaway client that connects *directly* to the tagged socket
+/// (bypassing the proxy, so nothing is filtered) to learn the global
+/// names the compositor announces — including the hidden one the
+/// sandboxed client must never see.
+struct Snooper {
+    /// `(global name, interface, version)` from `wl_registry.global`.
+    globals: Vec<(u32, String, u32)>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for Snooper {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            state.globals.push((name, interface, version));
+        }
+    }
+}
+
+/// The `(wl_compositor name, wl_shm name)` pair as seen on the tagged
+/// socket.
+fn snooper_names(tagged_path: &Path) -> Result<(u32, u32), Box<dyn std::error::Error + Send + Sync>> {
+    let stream = UnixStream::connect(tagged_path)?;
+    let conn = Connection::from_socket(stream)?;
+    let mut snooper = Snooper {
+        globals: Vec::new(),
+    };
+    let mut eq = conn.new_event_queue::<Snooper>();
+    let qh = eq.handle();
+    let display = conn.display();
+    let _registry = display.get_registry(&qh, ());
+    eq.roundtrip(&mut snooper)?;
+
+    let comp = snooper
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_compositor")
+        .ok_or("no wl_compositor global on the tagged socket")?
+        .0;
+    let shm = snooper
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_shm")
+        .ok_or("no wl_shm global on the tagged socket")?
+        .0;
+    assert_ne!(comp, shm, "global names must be distinct");
+    Ok((comp, shm))
+}
+
+/// One sandboxed app session through a proxy with an active allowlist
+/// (only `wl_compositor` is shown).
+fn one_allowlist_session(
+    public_path: &Path,
+    comp_name: u32,
+    shm_name: u32,
+    remove_shm: Arc<AtomicBool>,
+    shm_removed: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sync_done = Arc::new(AtomicBool::new(false));
+    let stream = UnixStream::connect(public_path)?;
+    let conn = Connection::from_socket(stream)?;
+    let mut app = AllowlistApp {
+        globals: Vec::new(),
+        removes: Vec::new(),
+        sync_done: sync_done.clone(),
+    };
+    let mut eq = conn.new_event_queue::<AllowlistApp>();
+    let qh = eq.handle();
+    let display = conn.display();
+    let registry = display.get_registry(&qh, ());
+    eq.roundtrip(&mut app)?;
+
+    // (a) Only the allowlisted global is announced, under the
+    // compositor's real name.
+    assert_eq!(
+        app.globals.len(),
+        1,
+        "expected exactly one announced global, got: {:?}",
+        app.globals
+    );
+    assert_eq!(app.globals[0].1, "wl_compositor");
+    assert_eq!(
+        app.globals[0].0,
+        comp_name,
+        "the announced name must be the compositor's real name"
+    );
+
+    // (b) The allowlisted path still works end to end: the bound
+    // object is usable, and `sync` gets its `done`.
+    let compositor = registry.bind::<wl_compositor::WlCompositor, (), AllowlistApp>(
+        comp_name, 4, &qh, (),
+    );
+    let surface = compositor.create_surface(&qh, ());
+    let _callback = display.sync(&qh, ());
+    eq.roundtrip(&mut app)?;
+    assert!(
+        sync_done.load(Ordering::SeqCst),
+        "wl_callback.done never arrived"
+    );
+    surface.destroy();
+    eq.roundtrip(&mut app)?;
+
+    // (c) The compositor removes the hidden global; the matching
+    // `global_remove` must never reach the client.
+    remove_shm.store(true, Ordering::SeqCst);
+    wait_until(|| shm_removed.load(Ordering::SeqCst), 10);
+    eq.roundtrip(&mut app)?;
+    assert!(
+        app.removes.is_empty(),
+        "a global_remove leaked to the client: {:?} (hidden global was {shm_name})",
+        app.removes
+    );
+
+    // (d) Binding the hidden global by name must be rejected with a
+    // fatal `invalid_object` error — the only way a client could
+    // reach an object it was never shown.
+    let _shm = registry.bind::<wl_shm::WlShm, (), AllowlistApp>(shm_name, 2, &qh, ());
+    // The injected error makes this roundtrip fail; that is the point.
+    let _ = eq.roundtrip(&mut app);
+    let err = conn
+        .protocol_error()
+        .ok_or("no protocol error after the blocked bind")?;
+    assert_eq!(
+        err.code, 0,
+        "expected invalid_object (0), got {}",
+        err.code
+    );
+    assert!(
+        err.message.contains("allowlist"),
+        "unexpected error message: {}",
+        err.message
+    );
+    Ok(())
+}
 
 /// One full app session through the proxy.
 fn one_app_session(public_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -397,7 +625,7 @@ fn relay_passes_messages_and_fds() {
     let comp = thread::Builder::new()
         .name("fake-compositor".into())
         .spawn(move || {
-            run_fake_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c)
+            run_fake_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c, None)
         })
         .unwrap();
 
@@ -421,6 +649,94 @@ fn relay_passes_messages_and_fds() {
         received.lock().unwrap().is_some(),
         "the compositor never received the fd"
     );
+
+    drop(dir);
+}
+
+#[test]
+fn allowlist_hides_globals_and_rejects_their_binds() {
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+    let received: Arc<Mutex<Option<OwnedFd>>> = Arc::default();
+    let remove_shm = Arc::new(AtomicBool::new(false));
+    let shm_removed = Arc::new(AtomicBool::new(false));
+
+    // The proxy, with an allowlist that shows only `wl_compositor`.
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::from_csv("wl_compositor"),
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    // The fake compositor on the tagged socket, with the on-demand
+    // removal of its `wl_shm` global.
+    let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
+    let (req_c, done_c) = (remove_shm.clone(), shm_removed.clone());
+    let stop_comp = stop.clone();
+    let tagged_for_comp = tagged_path.clone();
+    let comp = thread::Builder::new()
+        .name("fake-compositor".into())
+        .spawn(move || {
+            run_fake_compositor(
+                tagged_for_comp,
+                ready_c,
+                stop_comp,
+                live_c,
+                recv_c,
+                Some(RemoveTrigger {
+                    requested: req_c,
+                    done: done_c,
+                }),
+            )
+        })
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    // Learn the real global names on the tagged socket (the proxy
+    // filters them out for the sandboxed client, so it cannot know
+    // them itself).
+    let (comp_name, shm_name) = snooper_names(&tagged_path).expect("snooper failed");
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+
+    // The sandboxed session: hidden global never announced, allowlisted
+    // path works, hidden global_remove never delivered, bind of the
+    // hidden name fatal.
+    one_allowlist_session(
+        &public_path,
+        comp_name,
+        shm_name,
+        remove_shm,
+        shm_removed,
+    )
+    .expect("allowlist session failed");
+
+    // The relay was torn down after the fatal error: the compositor must
+    // see its (upstream) connection go away.
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+
+    // Shut down the fake compositor, then the proxy.
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = proxy.join();
 
     drop(dir);
 }
