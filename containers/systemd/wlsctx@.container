@@ -1,16 +1,37 @@
-# Deployment mode A (of two): standalone, systemd socket-activated wlsctx.
+# Deployment mode A (of two): standalone, systemd socket-activated wlsctx,
+# running the transparent relay by default.
 #
-# wlsctx@%i.socket owns $XDG_RUNTIME_DIR/wlsctx/%i/wayland-1 and
-# socket-activates this container; wlsctx receives the listening socket
-# via LISTEN_FDS and tags it with the explicit --app-id/--instance-id
-# (WLSCTX_APP_ID / WLSCTX_INSTANCE_ID must be set — see the [Container]
-# section). The tagged socket lives in the host's XDG_RUNTIME_DIR, so
-# whatever connects to it (pod or bare host process) needs access to that
-# path.
+# wlsctx@%i.socket owns $XDG_RUNTIME_DIR/wlsctx/%i/wayland-1 (now the
+# relay's PUBLIC socket) and socket-activates this container; wlsctx
+# receives it via LISTEN_FDS and relays every connection over the
+# tagged socket it binds ITSELF at %t/wlsctx-tagged — inside this
+# container's private runtime dir (the container's XDG_RUNTIME_DIR is
+# the host's value, but its /run is its own filesystem, so the tagged
+# socket is unreachable from anything that connects to the public
+# one). The relay applies the same optional policies as mode B:
+# WLSCTX_ALLOW_GLOBALS (allowlist) and WLSCTX_CLIPBOARD_POLICY=deny
+# (the clipboard/primary-selection receive-gate); set them in a
+# drop-in with Environment= lines in both [Service] and [Container].
+# WLSCTX_APP_ID / WLSCTX_INSTANCE_ID must be set (see the [Container]
+# section).
+#
+# To run the original tag-and-park behaviour instead (the socket
+# itself is the tagged one, no relay, no interception): remove
+# --proxy --tagged-socket=... from Exec.
+#
+# Optional prompt broker: as in mode B, bind the host's
+# wlsctx-broker socket into this container's private /run and point
+# the relay at it (a missing or slow broker fails closed — the read
+# is dropped):
+#   [Service]
+#   Environment=WLSCTX_BROKER_SOCKET=/run/broker.sock
+#   [Container]
+#   Mount=type=bind,source=%t/wlsctx-broker,destination=/run/broker.sock
 #
 # Deployment mode B: the wl-display@ in-pod sidecar (see
-# wl-display@.container) — it runs inside each app's pod and tags the
-# socket at $POD_RUNTIME_DIR/wayland-1 inside the pod instead.
+# wl-display@.container) — it runs inside each app's pod and serves
+# the relay's public socket at $POD_RUNTIME_DIR/wayland-1 inside the
+# pod instead.
 [Unit]
 Description=Minimal Wayland security context manager
 BindsTo=wlsctx@%i.socket
@@ -21,7 +42,7 @@ DefaultDependencies=false
 
 [Container]
 Image=wlsctx.image
-Exec=--socket-activation
+Exec=--socket-activation --proxy --tagged-socket=%t/wlsctx-tagged
 Environment=WLSCTX_SANDBOX_ENGINE=${WLSCTX_SANDBOX_ENGINE}
 # --socket-activation requires explicit WLSCTX_APP_ID / WLSCTX_INSTANCE_ID
 # (the binary no longer derives them from LISTEN_FDNAMES; the socket unit
