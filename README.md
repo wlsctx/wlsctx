@@ -39,9 +39,12 @@ that the app sees as an ordinary Wayland compositor, and the relay
 copies the stream byte-for-byte over the tagged connection — the
 compositor still sees one plain client per app with its own `render`
 fd and direct GPU access, and still enforces per-context policy from
-the security context. (Mode A and the mode B fallback run the
-original tag-and-park behaviour only: the app connects to the tagged
-socket directly.) The relay is a protocol *interpreter*, not a
+the security context. Mode A does the same standalone: the
+socket-activated socket in the host's `XDG_RUNTIME_DIR` is the relay's
+public socket, and the tagged socket is bound inside the container.
+(Both modes can fall back to the original tag-and-park behaviour: the
+client connects to the tagged socket directly and nothing is
+intercepted.) The relay is a protocol *interpreter*, not a
 re-implementation: it re-parses the messages it relays (the interface
 tables are generated from the protocol XML) and applies two optional
 policies on the way in from the app — a **global allowlist**
@@ -59,7 +62,7 @@ is layered:
 | Volume layout | XDG home dirs are **pod named volumes**, not the real homedir; `~/Downloads` is a separate `noexec` volume; everything else read-only |
 | Pod network namespace | one private podman network per instance; the app has outbound connectivity but no direct LAN presence |
 | Compositor policy (security context) | privileged globals/operations for sandboxed clients (see [verify your setup](#verify-your-setup)) |
-| Wayland relay (`--proxy`, mode B) | the selection receive-gate: clipboard *and* primary-selection (middle-click paste) reads of data the app did not itself copy are dropped, optionally after a host-side consent prompt (see [threat model](#threat-model)) |
+| Wayland relay (`--proxy`, default in both modes) | the selection receive-gate: clipboard *and* primary-selection (middle-click paste) reads of data the app did not itself copy are dropped, optionally after a host-side consent prompt (see [threat model](#threat-model)) |
 
 ## Architecture
 
@@ -85,7 +88,7 @@ What each container can reach on the **host**:
 | Container | Image | Host resources reachable |
 |---|---|---|
 | `wl-display@` (mode B) | `ghcr.io/wlsctx/wlsctx` | the host's Wayland socket only — passed in via `StandardInput=file:` (`WAYLAND_SOCKET=0`), so no network (`Network=none`), no D-Bus, no home access |
-| `wlsctx@` (mode A) | `ghcr.io/wlsctx/wlsctx` | same: the host's Wayland socket bind-mounted read-only; the tagged socket itself lives in the *host's* `$XDG_RUNTIME_DIR/wlsctx/%i/` |
+| `wlsctx@` (mode A) | `ghcr.io/wlsctx/wlsctx` | same: the host's Wayland socket bind-mounted read-only; the public socket lives in the *host's* `$XDG_RUNTIME_DIR/wlsctx/%i/`, the tagged one inside the container |
 | `wl-dbus@` | `localhost/xdg-dbus-proxy` | the host session bus (bind-mounted to `/run/host/session-bus`) and the at-spi bus; `Network=none` |
 | `wl-xwayland@` | `localhost/xwayland-satellite` | GPU render nodes only (`AddDevice=-/dev/dri/renderD128…131`, the `-` prefix makes them optional); the pod network for nothing but X traffic |
 | app container | `wayland-runtime` / `librewolf` (+ the app itself as a read-only **image mount**, `Mount=type=image,source=ext-%j`) | GPU render nodes; the pod network (outbound OK); pod volumes including the *shared* `downloads` volume at `~/Downloads` (see [threat model](#what-is-not-protected)) |
@@ -95,12 +98,14 @@ What each container can reach on the **host**:
 
 - **Mode A — standalone, socket-activated:** the user unit
   `systemd/user/wlsctx@.socket` owns `$XDG_RUNTIME_DIR/wlsctx/%i/wayland-1`
-  and socket-activates the quadlet `wlsctx@.container`. The tagged socket
-  lives in the host's `XDG_RUNTIME_DIR`, so whatever connects to it — a
-  pod or a bare host process — uses it. This mode *requires*
-  `WLSCTX_APP_ID` / `WLSCTX_INSTANCE_ID` to be set (the binary no longer
-  derives them from the fd name); if they are missing it fails with a
-  clear "required argument" error.
+  (the relay's public socket) and socket-activates the quadlet
+  `wlsctx@.container`; the relay binds the tagged socket itself,
+  inside the container's private runtime dir. Whatever connects to
+  the public socket — a pod or a bare host process — is relayed (and
+  subject to the allowlist and gate). This mode *requires*
+  `WLSCTX_APP_ID` / `WLSCTX_INSTANCE_ID` to be set (the binary no
+  longer derives them from the fd name); if they are missing it
+  fails with a clear "required argument" error.
 - **Mode B — in-pod sidecar (default for `wl-app@` pods):**
   `wl-display@.container` runs inside each pod. It creates the tagged
   socket at `$POD_RUNTIME_DIR/wlsctx-tagged` (`/run/pod/wlsctx-tagged`,
@@ -118,13 +123,14 @@ What each container can reach on the **host**:
 The binary has four operating modes (the relay logic lives in
 `src/proxy/`, the broker in `src/broker.rs`):
 
-1. **Tag-and-park** (default, mode A and the mode B fallback):
-   `--listen=<path>` (binds its own socket) or `--socket-activation`
-   (systemd `LISTEN_FDS`); the two are mutually exclusive. Requires
-   `--app-id` / `--instance-id` / `--sandbox-engine` (or the matching
-   `WLSCTX_*` env vars). Tags the listen socket with the security
-   context, sd-notifies, and parks on a `signalfd(2)` loop.
-2. **Transparent relay** (mode B default): `--proxy
+1. **Tag-and-park** (the fallback in both modes — remove `--proxy`
+   from the unit): `--listen=<path>` (binds its own socket) or
+   `--socket-activation` (systemd `LISTEN_FDS`); the two are
+   mutually exclusive. Requires `--app-id` / `--instance-id` /
+   `--sandbox-engine` (or the matching `WLSCTX_*` env vars). Tags the
+   listen socket with the security context, sd-notifies, and parks on
+   a `signalfd(2)` loop.
+2. **Transparent relay** (default in both modes): `--proxy
    --tagged-socket=<path>`: keeps the same tag-and-park lifecycle on
    the *tagged* listener (bound locally, stamped by the compositor
    during the handshake) and relays every connection on the listen
@@ -273,8 +279,8 @@ checklist, and file upstream if the set is wider than you expected.
 volumes), the host session D-Bus bus (filtered proxy only), privileged
 Wayland globals (compositor policy), capabilities and privilege
 escalation, the app's own code integrity at *build* time (GPG-verified
-JetBrains release, pinned keys/checksums), and — through the mode B
-relay's selection receive-gate — **the host desktop's clipboard and
+JetBrains release, pinned keys/checksums), and — through the relay's
+selection receive-gate — **the host desktop's clipboard and
 primary selection from sandboxed reads**: an app can only read
 selections it put on itself, and every read of data copied on the host
 is dropped (the app sees an empty clipboard) or, when the prompt
@@ -347,11 +353,10 @@ system can reach it.
 
 ## Known gaps / WIP
 
-- The receive-gate and the consent broker exist only in the mode B
-  relay. Mode A (standalone, socket-activated) is still plain
-  tag-and-park: no relay, no allowlist, no gate — the security-context
-  policy of the compositor is the only thing a mode A client is
-  subject to.
+- The consent broker is wired by default in neither mode: it is
+  opt-in in both (a drop-in that bind-mounts the host's
+  `wlsctx-broker` socket into the relay container and sets
+  `WLSCTX_BROKER_SOCKET` — see the unit headers).
 - The at-spi proxy is **intentionally** in allow-nothing mode: its
   `--call`/`--broadcast` rules are commented out in `wl-dbus@.container`
   (marked there) and the `--sloppy-names` filter lets nothing through by
