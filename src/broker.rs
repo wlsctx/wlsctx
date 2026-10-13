@@ -77,6 +77,17 @@ pub struct ClipboardRead {
     pub instance: String,
     /// The mime type the app asked to read.
     pub mime: String,
+    /// Which selection the app was reading: `"clipboard"` (the
+    /// stable selection) or `"primary"` (the X-style primary
+    /// selection, the `wp_primary_selection_unstable_v1` protocol,
+    /// Phase 5). Optional on the wire: a peer without the field
+    /// (an older build) reads as `"clipboard"`.
+    #[serde(default = "default_selection")]
+    pub selection: String,
+}
+
+fn default_selection() -> String {
+    "clipboard".into()
 }
 
 /// The broker's answer to the proxy: allow the read (opening an
@@ -305,8 +316,8 @@ pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs) {
         }
     };
     info!(
-        "clipboard consent request: app {}/{} wants to read `{}` (its own reads were never asked about)",
-        req.app, req.instance, req.mime
+        "consent request: app {}/{} wants to read the {} (`{}`; its own reads were never asked about)",
+        req.app, req.instance, selection_name(&req.selection), req.mime
     );
 
     let decision = match args.auto_decide {
@@ -458,15 +469,30 @@ fn bind_decision_socket(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// The human-facing name of the selection a request is about
+/// (`"primary"` is the X-style primary selection; anything else —
+/// including an unknown value from a future protocol — reads as the
+/// plain clipboard).
+fn selection_name(s: &str) -> &'static str {
+    if s == "primary" {
+        "primary selection (middle-click paste)"
+    } else {
+        "clipboard"
+    }
+}
+
 /// Tell the desktop about the pending request. Fire-and-forget: if
 /// `notify-send` is missing or the session bus is unreachable the
 /// user can still answer on the decision socket (the path is logged).
 fn announce(req: &ClipboardRead, decision_path: &Path) {
     let summary = "wlsctx: clipboard consent";
     let body = format!(
-        "The sandboxed app {}/{} wants to read your clipboard (`{}`).\n\
+        "The sandboxed app {}/{} wants to read your {} (`{}`).\n\
          Reply: wlsctx --decide --decision=allow   (or =deny)",
-        req.app, req.instance, req.mime
+        req.app,
+        req.instance,
+        selection_name(&req.selection),
+        req.mime
     );
     info!("waiting for the user's decision on {decision_path:?}");
     match process::Command::new("notify-send")
@@ -491,6 +517,7 @@ mod tests {
             app: "jetbrains".into(),
             instance: "rustrover".into(),
             mime: "text/plain".into(),
+            selection: "primary".into(),
         }
     }
 
@@ -500,6 +527,15 @@ mod tests {
         let line = encode_request(&r).unwrap();
         assert!(line.ends_with('\n'));
         assert_eq!(decode_request(&line).unwrap(), r);
+    }
+
+    #[test]
+    fn request_without_selection_field_defaults_to_clipboard() {
+        // An older peer (pre-Phase-5) does not send the field: the
+        // decode must still succeed and read as the plain clipboard.
+        let line = r#"{"v":1,"kind":"clipboard-read","app":"a","instance":"i","mime":"text/plain"}"#;
+        let r = decode_request(line).unwrap();
+        assert_eq!(r.selection, "clipboard");
     }
 
     #[test]

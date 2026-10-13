@@ -69,12 +69,13 @@ impl Default for BrokerConfig {
 }
 
 impl BrokerConfig {
-    /// Ask the broker whether the dropped read of `mime` should be
-    /// allowed. `Ok(true)`: the user allowed it (the relay opens the
-    /// intent window and forwards); `Ok(false)`: the broker (or the
-    /// user) denied it; `Err`: the ask failed (broker missing,
-    /// timeout, malformed answer) — the caller must fail closed.
-    pub fn ask(&self, mime: &str) -> Result<bool, String> {
+    /// Ask the broker whether the dropped read of `mime` from
+    /// `selection` (`"clipboard"` or `"primary"`) should be allowed.
+    /// `Ok(true)`: the user allowed it (the relay opens the intent
+    /// window and forwards); `Ok(false)`: the broker (or the user)
+    /// denied it; `Err`: the ask failed (broker missing, timeout,
+    /// malformed answer) — the caller must fail closed.
+    pub fn ask(&self, selection: &str, mime: &str) -> Result<bool, String> {
         let mut stream = UnixStream::connect(&self.socket)
             .map_err(|e| format!("connecting to the broker socket {:?}: {e}", self.socket))?;
         let _ = stream.set_read_timeout(Some(self.timeout));
@@ -86,6 +87,7 @@ impl BrokerConfig {
             app: self.app.clone(),
             instance: self.instance.clone(),
             mime: mime.to_string(),
+            selection: selection.to_string(),
         };
         stream
             .write_all(encode_request(&req).map_err(|e| e.to_string())?.as_bytes())
@@ -106,7 +108,7 @@ impl BrokerConfig {
         match decision {
             Decision::Allow { .. } => Ok(true),
             Decision::Deny { reason } => {
-                warn!("broker denied the clipboard read ({reason})");
+                warn!("broker denied the {selection} read ({reason})");
                 Ok(false)
             }
         }

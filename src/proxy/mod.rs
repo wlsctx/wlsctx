@@ -42,21 +42,29 @@
 //! object. With the default (inactive) policy the proxy is a pure
 //! pass-through.
 //!
-//! ## Clipboard gate (Phase 3)
+//! ## Selection gate (Phase 3, extended in Phase 5)
 //!
-//! With an active [`clipboard::ClipboardGate`] (the `deny` policy), the
-//! proxy gates the one request that moves clipboard data into a
-//! sandboxed app: `wl_data_offer.receive` hands the app's own fd to the
-//! compositor, which makes the current selection owner write into it —
-//! and the owner may be the host desktop. The gate relays a `receive`
-//! only when the data it reads is provably the app's own (a read-back
-//! of the selection the app itself set); every other read is dropped
-//! silently (the app sees an empty clipboard instead of crashing). In
-//! both policies a `receive` whose fd is not an in-memory channel
-//! (memfd/pipe/socket) is a fatal protocol error: compositors do not
-//! inspect the fd they are handed, so without the check a sandboxed app
-//! could direct clipboard data into a path in its mount space (the
-//! shared `downloads` volume) instead of keeping it in memory.
+//! With an active [`clipboard::ClipboardGate`] (the `deny` policy),
+//! the proxy gates the one request shape that moves selection data
+//! into a sandboxed app — on *either* of the two protocols that
+//! carry selections: `wl_data_offer.receive` (the stable
+//! clipboard) and `zwp_primary_selection_offer_v1.receive` (the
+//! X-style primary selection, the `wp_primary_selection_unstable_v1`
+//! protocol wlroots/sway implements; Phase 5 closed it as a second
+//! instance of the same gate, because the stable protocol alone
+//! left middle-click paste wide open). Each hands the app's own fd
+//! to the compositor, which makes the current selection owner write
+//! into it — and the owner may be the host desktop. The gate relays
+//! a `receive` only when the data it reads is provably the app's own
+//! (a read-back of the selection the app itself set *on that
+//! protocol*; the two echo sequences are tracked separately); every
+//! other read is dropped silently (the app sees an empty selection
+//! instead of crashing). In both policies a `receive` whose fd is
+//! not an in-memory channel (memfd/pipe/socket) is a fatal protocol
+//! error: compositors do not inspect the fd they are handed, so
+//! without the check a sandboxed app could direct selection data
+//! into a path in its mount space (the shared `downloads` volume)
+//! instead of keeping it in memory.
 //!
 //! ## The prompt broker (Phase 4)
 //!
@@ -451,8 +459,10 @@ impl Relay {
         // `receive` request below.
         clipboard.observe(dir, sender, desc, &msg);
 
-        // ---- Phase 2 + 3: the interceptors. ----
-        // Only `wl_registry` and `wl_data_offer.receive` traffic is
+        // ---- Phase 2 + 3 (+ 5): the interceptors. ----
+        // Only `wl_registry` and the `receive` requests of the two
+        // selection protocols (`wl_data_offer`, and
+        // `zwp_primary_selection_offer_v1` since Phase 5) are
         // decided on; everything else is a straight pass-through.
         //
         // Phase 2, the global allowlist: a hidden global is never
@@ -474,9 +484,16 @@ impl Relay {
         // in-memory channel, in either policy) fails the connection
         // closed.
         let action = if dir == Dir::ClientToServer
-            && sender.name == "wl_data_offer"
             && desc.name == "receive"
+            && matches!(
+                sender.name,
+                "wl_data_offer" | "zwp_primary_selection_offer_v1"
+            )
         {
+            // Which selection the read is about (for the broker
+            // prompt; both protocols read identically from here).
+            let selection =
+                if sender.name == "zwp_primary_selection_offer_v1" { "primary" } else { "clipboard" };
             match clipboard.on_receive(&msg).map_err(RelayEnd::Protocol)? {
                 ForwardAction::Forward => ForwardAction::Forward,
                 // The gate dropped a read of a foreign selection (the
@@ -500,11 +517,11 @@ impl Relay {
                                 }
                             })
                             .unwrap_or_default();
-                        match broker.ask(&mime) {
+                        match broker.ask(selection, &mime) {
                             Ok(true) => {
                                 clipboard.unlock(Instant::now() + broker.window);
                                 info!(
-                                    "clipboard gate: the user approved the read; \
+                                    "{selection} gate: the user approved the read; \
                                      the intent window ({} ms) opens foreign reads",
                                     broker.window.as_millis()
                                 );
@@ -512,7 +529,7 @@ impl Relay {
                             }
                             Ok(false) => ForwardAction::Drop,
                             Err(e) => {
-                                warn!("clipboard gate: the broker is unreachable ({e}); dropping the read");
+                                warn!("{selection} gate: the broker is unreachable ({e}); dropping the read");
                                 ForwardAction::Drop
                             }
                         }

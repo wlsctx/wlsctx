@@ -1,14 +1,22 @@
-//! The clipboard receive-gate (Phase 3).
+//! The selection receive-gate (Phase 3; extended in Phase 5).
 //!
 //! ## What it protects
 //!
-//! A `wl_data_offer.receive` request hands an fd — created by the
-//! *app* — to the compositor, and the compositor makes the
+//! A `wl_data_offer.receive` request (stable protocol) — or its
+//! primary-selection twin, `zwp_primary_selection_offer_v1.receive`
+//! (`wp_primary_selection_unstable_v1`, the protocol wlroots/sway
+//! implements for X-style primary selection) — hands an fd created
+//! by the *app* to the compositor, and the compositor makes the
 //! **current selection owner** write the selection data into that
 //! fd. The owner may be the host desktop or another sandboxed app,
 //! and what they write may include host secrets (passwords, tokens)
-//! — exactly the data the sandbox must not reach. The gate inspects
-//! every `receive`:
+//! — exactly the data the sandbox must not reach. Both protocols
+//! have the same shape (a `*device_manager` that creates `*source`
+//! objects, a per-seat `*device` whose `set_selection` is echoed by
+//! a `data_offer` + `selection` pair, and an `*offer` whose
+//! `receive(mime, fd)` is the only request that hands an app-created
+//! fd to the selection owner), so the gate inspects every
+//! `receive` of both:
 //!
 //! * [`ClipboardPolicy::Allow`] (the default): pass-through — the
 //!   request is relayed unchanged (subject to the fd sanity check
@@ -25,36 +33,47 @@
 //!
 //! ## Proving the origin
 //!
-//! The protocol has no "who owns this selection" field: the
-//! `wl_data_device.selection` event carries an *offer* object —
-//! which the compositor creates separately on *every* client
-//! connection — not the `wl_data_source` behind it. The proof is
-//! temporal, and it is sound under the threat model (the attacker is
-//! the *sandboxed* app; the other clients on the desktop are the
-//! user's own, trusted applications):
+//! Neither protocol has a "who owns this selection" field: the
+//! `selection` event carries an *offer* object — which the
+//! compositor creates separately on *every* client connection — not
+//! the source behind it. The proof is temporal, and it is sound
+//! under the threat model (the attacker is the *sandboxed* app; the
+//! other clients on the desktop are the user's own, trusted
+//! applications):
 //!
-//! * The gate tracks every `wl_data_source` this client created
-//!   (`wl_data_device_manager.create_data_source`) — such an object
-//!   can only ever serve the client's own data.
-//! * When the client sends `wl_data_device.set_selection` (or
-//!   `start_drag`) with one of its own sources, the gate marks the
-//!   *next* offer the compositor announces (`wl_data_device.
-//!   data_offer`) as **own**; the compositor echoes selection
-//!   changes in the order they happened, so that next
-//!   `data_offer` + `selection` pair is precisely the app's own
-//!   change.
+//! * The gate tracks every source this client created —
+//!   `wl_data_device_manager.create_data_source` (stable) and
+//!   `zwp_primary_selection_device_manager_v1.create_source`
+//!   (primary) — such an object can only ever serve the client's
+//!   own data.
+//! * When the client sends its own source as the new selection
+//!   (`wl_data_device.set_selection`/`start_drag`, or
+//!   `zwp_primary_selection_device_v1.set_selection`), the gate
+//!   marks the *next* offer that protocol announces (`data_offer`)
+//!   as **own**; the compositor echoes selection changes in the
+//!   order they happened, so that next `data_offer` + `selection`
+//!   pair is precisely the app's own change. The two protocols
+//!   echo independently, so their pendings never cross: a stable
+//!   `set_selection` cannot attribute a primary `data_offer`, and
+//!   vice versa.
 //! * Every other offer is **foreign**, including drag-and-drop
-//!   offers (announced before a `wl_data_device.enter`), so a
-//!   foreign drag cannot feed the sandbox either.
+//!   offers (announced before a `wl_data_device.enter` — the
+//!   primary-selection protocol has no drag), so a foreign drag
+//!   cannot feed the sandbox either.
 //!
 //! A compromised app cannot forge the proof: it can only create its
 //! own sources and observe compositor events, and an offer is marked
 //! own only if the compositor actually echoed *that app's*
-//! `set_selection`/`start_drag` as the new selection. (The one
-//! inescapable race — a hostile *other* client winning a
-//! selection-change race in the microseconds between the app's
-//! request and the compositor processing it — inverts at most one
-//! attribution, and such a client is outside the threat model.)
+//! `set_selection`/`start_drag` as the new selection of that
+//! protocol. (The one inescapable race — a hostile *other* client
+//! winning a selection-change race in the microseconds between the
+//! app's request and the compositor processing it — inverts at most
+//! one attribution, and such a client is outside the threat model.
+//! For the primary selection the compositor sends the confirming
+//! `selection` only to the keyboard-focused client; if the app is
+//! not focused when it sets its own source the echo goes elsewhere,
+//! the app simply cannot read it back — which is no worse than the
+//! protocol itself providing.)
 //!
 //! ## The fd sanity check (always on, both policies)
 //!
@@ -74,12 +93,15 @@
 //! sandboxes can read it, instead of keeping it in memory where it
 //! dies with the app.
 //!
-//! ## The consent window (Phase 4 hook)
+//! ## The consent window (Phase 4)
 //!
-//! [`ClipboardGate::unlock`] opens the gate for foreign reads until
-//! a given instant. Phase 4's prompt broker will call it with the
-//! 1500 ms "intent window" when the user approves one clipboard read
-//! by the sandboxed app; until then the hook is inert.
+//! [`ClipboardGate::unlock`] opens the gate for foreign reads —
+//! of *either* protocol — until a given instant. The prompt broker
+//! (Phase 4) calls it with the 1500 ms "intent window" when the
+//! user approves one read by the sandboxed app; the window is
+//! selection-wide on purpose, so an approved paste covers the burst
+//! of follow-on reads (one `receive` per mime type, or retries)
+//! without re-prompting for each of them.
 
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -156,16 +178,29 @@ pub struct ClipboardGate {
     /// the compositor's echo.
     pending: Option<PendingKind>,
     /// The origin of the current clipboard selection (the last
-    /// `selection` event). Informational for now; the Phase 4 broker
-    /// prompt reports it to the user.
+    /// `selection` event). Informational; the Phase 4 broker prompt
+    /// reports it to the user.
     selection: Option<Origin>,
-    /// The offers the gate has attributed to this client (recorded
-    /// when a `data_offer` event follows one of the client's own
-    /// `set_selection`/`start_drag` requests, removed when the
-    /// client destroys the offer).
+    /// Primary-selection sources this client created
+    /// (`zwp_primary_selection_device_manager_v1.create_source`).
+    /// Phase 5: the `wp_primary_selection_unstable_v1` twin of
+    /// `own_sources` (its pendings never cross, see the module docs).
+    own_psel_sources: HashSet<u32>,
+    /// The client's last own `zwp_primary_selection_device_v1.
+    /// set_selection`, awaiting the compositor's echo.
+    pending_psel: bool,
+    /// The origin of the current primary selection (the last zwp
+    /// `selection` event). Informational, like `selection`.
+    primary_selection: Option<Origin>,
+    /// The offers the gate has attributed to this client — of
+    /// *either* protocol (recorded when a `data_offer` event
+    /// follows one of the client's own selection-setting requests,
+    /// removed when the client destroys the offer; object IDs are
+    /// unique per connection, so one set serves both protocols).
     own_offers: HashSet<u32>,
     /// Phase 4 hook: while set and in the future, even foreign reads
-    /// are allowed (the user's approved intent window).
+    /// (either protocol) are allowed (the user's approved intent
+    /// window).
     unlocked_until: Option<Instant>,
 }
 
@@ -176,6 +211,9 @@ impl ClipboardGate {
             own_sources: HashSet::new(),
             pending: None,
             selection: None,
+            own_psel_sources: HashSet::new(),
+            pending_psel: false,
+            primary_selection: None,
             own_offers: HashSet::new(),
             unlocked_until: None,
         }
@@ -183,11 +221,18 @@ impl ClipboardGate {
 
     /// The origin of the current clipboard selection, if any.
     ///
-    /// Phase 4 hook: the prompt broker will report it to the user
-    /// when asking for consent to a foreign read. Inert for now.
+    /// Phase 4 hook: the prompt broker reports it to the user when
+    /// asking for consent to a foreign read.
     #[allow(dead_code)]
     pub(crate) fn selection_origin(&self) -> Option<Origin> {
         self.selection
+    }
+
+    /// The origin of the current primary selection, if any (Phase
+    /// 5). Same use as [`Self::selection_origin`].
+    #[allow(dead_code)]
+    pub(crate) fn primary_selection_origin(&self) -> Option<Origin> {
+        self.primary_selection
     }
 
     /// The Phase 4 hook: allow all reads — including foreign ones —
@@ -284,18 +329,83 @@ impl ClipboardGate {
             (Dir::ClientToServer, "wl_data_offer", "destroy") => {
                 self.own_offers.remove(&msg.sender_id);
             }
+            // ---- Phase 5: the primary-selection protocol
+            // (wp_primary_selection_unstable_v1, the zwp_* family).
+            // Structurally the same origin proof, on its own
+            // echo sequence.
+            (Dir::ClientToServer, "zwp_primary_selection_device_manager_v1", "create_source") => {
+                if let Some(Argument::NewId(id)) = msg.args.first()
+                    && *id != 0
+                {
+                    self.own_psel_sources.insert(*id);
+                }
+            }
+            (Dir::ClientToServer, "zwp_primary_selection_source_v1", "destroy") => {
+                self.own_psel_sources.remove(&msg.sender_id);
+            }
+            (Dir::ClientToServer, "zwp_primary_selection_device_v1", "set_selection") => {
+                // The source is the first argument (`allow-null`): a
+                // NULL source (a clear) or one the client does not
+                // own cannot be attributed to it.
+                self.pending_psel = matches!(
+                    msg.args.first(),
+                    Some(Argument::Object(id)) if self.own_psel_sources.contains(id)
+                );
+            }
+            (Dir::ServerToClient, "zwp_primary_selection_device_v1", "data_offer") => {
+                if let Some(Argument::NewId(id)) = msg.args.first()
+                    && *id != 0
+                    && self.pending_psel
+                {
+                    self.own_offers.insert(*id);
+                }
+            }
+            (Dir::ServerToClient, "zwp_primary_selection_device_v1", "selection") => {
+                // A new primary selection (or a NULL: cleared, or
+                // the app lost keyboard focus — the protocol sends
+                // the confirming event only to the focused client):
+                // the pending attribution is consumed by this echo.
+                let offer = match msg.args.first() {
+                    None | Some(Argument::Object(0)) => {
+                        self.primary_selection = None;
+                        self.pending_psel = false;
+                        return;
+                    }
+                    Some(Argument::Object(id)) => *id,
+                    _ => {
+                        self.primary_selection = None;
+                        self.pending_psel = false;
+                        return;
+                    }
+                };
+                self.primary_selection = Some(if self.own_offers.contains(&offer) {
+                    Origin::Own
+                } else {
+                    Origin::Foreign
+                });
+                self.pending_psel = false;
+            }
+            (Dir::ClientToServer, "zwp_primary_selection_offer_v1", "destroy") => {
+                self.own_offers.remove(&msg.sender_id);
+            }
             _ => {}
         }
     }
 
-    /// Gate one `wl_data_offer.receive` request.
+    /// Gate one `receive` request — `wl_data_offer.receive` (stable
+    /// clipboard) or `zwp_primary_selection_offer_v1.receive`
+    /// (primary selection, Phase 5). Both have the same shape (a
+    /// mime string and an fd argument), the same drop semantics, and
+    /// the same attribution state (`own_offers` is shared, object
+    /// IDs are unique per connection), so one implementation serves
+    /// both.
     ///
     /// Returns the action for the relay: [`ForwardAction::Forward`]
     /// (relay the request as-is) or [`ForwardAction::Drop`] (consume
-    /// it silently — the app's fd stays empty and the read comes back
-    /// empty). An error is a protocol violation (the fd is not an
-    /// in-memory channel, or the message is malformed): the caller
-    /// must fail the connection closed.
+    /// it silently — the app's fd stays empty and the read comes
+    /// back empty). An error is a protocol violation (the fd is not
+    /// an in-memory channel, or the message is malformed): the
+    /// caller must fail the connection closed.
     pub(crate) fn on_receive(
         &mut self,
         msg: &Message<u32, OwnedFd>,
@@ -325,8 +435,8 @@ impl ClipboardGate {
                     Ok(ForwardAction::Forward)
                 } else {
                     info!(
-                        "clipboard gate (deny): dropping a read of a foreign selection \
-                         (the app will see an empty clipboard)"
+                        "selection gate (deny): dropping a read of a foreign selection \
+                         (clipboard or primary; the app will see an empty read)"
                     );
                     Ok(ForwardAction::Drop)
                 }
@@ -372,6 +482,10 @@ mod tests {
     use wayland_client::protocol::__interfaces::{
         WL_DATA_DEVICE_INTERFACE, WL_DATA_DEVICE_MANAGER_INTERFACE, WL_DATA_OFFER_INTERFACE,
     };
+    use wayland_protocols::wp::primary_selection::zv1::client::__interfaces::{
+        ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
+        ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE,
+    };
 
     /// The 0-based opcode a request/event of `name` has in `table`
     /// (the on-wire convention this proxy enforces).
@@ -407,6 +521,123 @@ mod tests {
     const OFFER_FOREIGN: u32 = 0xFF00_0100;
     const OFFER_OWN: u32 = 0xFF00_0101;
     const OFFER_DRAG: u32 = 0xFF00_0102;
+
+    // Phase 5: the primary-selection protocol objects.
+    const PS_MGR: u32 = 0xFF00_0200;
+    const PS_DEVICE: u32 = 0xFF00_0201;
+    const PS_SRC: u32 = 50;
+    const PS_OFFER_FOREIGN: u32 = 0xFF00_0300;
+    const PS_OFFER_OWN: u32 = 0xFF00_0301;
+
+    fn ps_event(name: &str) -> (u16, &'static MessageDesc) {
+        let d = &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE
+            .events
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        (opcode(&ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, "ev", name), d)
+    }
+
+    fn ps_device_request(name: &str) -> (u16, &'static MessageDesc) {
+        let d = &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE
+            .requests
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        (opcode(&ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, "req", name), d)
+    }
+
+    fn ps_mgr_request(name: &str) -> (u16, &'static MessageDesc) {
+        let d = &ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE
+            .requests
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        (opcode(&ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE, "req", name), d)
+    }
+
+    /// The app created a zwp primary-selection source.
+    fn app_creates_psel_source(g: &mut ClipboardGate) {
+        let (op, d) = ps_mgr_request("create_source");
+        g.observe(
+            Dir::ClientToServer,
+            &ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
+            d,
+            &msg(PS_MGR, op, vec![Argument::NewId(PS_SRC)]),
+        );
+    }
+
+    /// The app sets its own primary selection; the compositor
+    /// echoes it (a new offer, then the selection event).
+    fn app_sets_own_psel(g: &mut ClipboardGate) {
+        let (op, d) = ps_device_request("set_selection");
+        g.observe(
+            Dir::ClientToServer,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC), Argument::Uint(0)]),
+        );
+        let (op, d) = ps_event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::NewId(PS_OFFER_OWN)]),
+        );
+        let (op, d) = ps_event("selection");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(PS_OFFER_OWN)]),
+        );
+    }
+
+    /// The compositor announces a *foreign* primary selection (an
+    /// offer the compositor created for a source another client
+    /// owns).
+    fn foreign_psel(g: &mut ClipboardGate, offer: u32) {
+        let (op, d) = ps_event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::NewId(offer)]),
+        );
+        let (op, d) = ps_event("selection");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(offer)]),
+        );
+    }
+
+    /// One `zwp_primary_selection_offer_v1.receive` on `offer`.
+    fn ps_receive(g: &mut ClipboardGate, offer: u32) -> Result<ForwardAction, String> {
+        let (op, d) = (
+            opcode(&ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, "req", "receive"),
+            &ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE
+                .requests
+                .iter()
+                .find(|d| d.name == "receive")
+                .unwrap(),
+        );
+        let mk = || {
+            msg(
+                offer,
+                op,
+                vec![
+                    Argument::Str(Some(Box::new(
+                        std::ffi::CString::new("text/plain").unwrap(),
+                    ))),
+                    Argument::Fd(memfd()),
+                ],
+            )
+        };
+        g.observe(Dir::ClientToServer, &ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, d, &mk());
+        g.on_receive(&mk())
+    }
 
     fn event(name: &str) -> (u16, &'static MessageDesc) {
         let d = &WL_DATA_DEVICE_INTERFACE
@@ -819,5 +1050,270 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.contains("without an fd"), "{err}");
+    }
+
+    // ---- Phase 5: the primary-selection protocol. ----
+
+    #[test]
+    fn primary_deny_blocks_foreign_and_allows_own_readback() {
+        let mut g = ClipboardGate::new(ClipboardPolicy::Deny);
+
+        // A host app owns the primary selection: dropped silently.
+        foreign_psel(&mut g, PS_OFFER_FOREIGN);
+        assert_eq!(g.primary_selection_origin(), Some(Origin::Foreign));
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_FOREIGN).unwrap(),
+            ForwardAction::Drop
+        );
+
+        // The app selects text (sets its own primary source); the
+        // read-back of its own offer is forwarded.
+        app_creates_psel_source(&mut g);
+        app_sets_own_psel(&mut g);
+        assert_eq!(g.primary_selection_origin(), Some(Origin::Own));
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_OWN).unwrap(),
+            ForwardAction::Forward
+        );
+    }
+
+    #[test]
+    fn primary_allow_passes_everything() {
+        let mut g = ClipboardGate::new(ClipboardPolicy::Allow);
+        foreign_psel(&mut g, PS_OFFER_FOREIGN);
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_FOREIGN).unwrap(),
+            ForwardAction::Forward
+        );
+    }
+
+    #[test]
+    fn primary_unlock_opens_foreign_reads_too() {
+        // The consent window (Phase 4) is selection-wide: one allow
+        // covers both protocols' foreign reads.
+        let mut g = ClipboardGate::new(ClipboardPolicy::Deny);
+        own_source_then_foreign_selection(&mut g);
+        foreign_psel(&mut g, PS_OFFER_FOREIGN);
+
+        g.unlock(Instant::now() + std::time::Duration::from_secs(5));
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_FOREIGN).unwrap(),
+            ForwardAction::Forward
+        );
+        assert_eq!(
+            receive(&mut g, OFFER_FOREIGN).unwrap(),
+            ForwardAction::Forward
+        );
+    }
+
+    #[test]
+    fn stable_and_primary_pendings_never_cross() {
+        let mut g = ClipboardGate::new(ClipboardPolicy::Deny);
+
+        // The app's stable set_selection is pending (the source is
+        // one the app created, so the request is attributable).
+        let (op, d) = (
+            opcode(&WL_DATA_DEVICE_MANAGER_INTERFACE, "req", "create_data_source"),
+            &WL_DATA_DEVICE_MANAGER_INTERFACE
+                .requests
+                .iter()
+                .find(|d| d.name == "create_data_source")
+                .unwrap(),
+        );
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_MANAGER_INTERFACE,
+            d,
+            &msg(MGR, op, vec![Argument::NewId(SRC)]),
+        );
+        let (op, d) = request("set_selection");
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(
+                DEVICE,
+                op,
+                vec![Argument::Object(SRC), Argument::Uint(0)],
+            ),
+        );
+        // …but the *next* zwp data_offer must not be attributed to
+        // it: different protocol, different echo sequence.
+        let (op, d) = ps_event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::NewId(PS_OFFER_OWN)]),
+        );
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_OWN).unwrap(),
+            ForwardAction::Drop,
+            "a stable pending must not attribute a primary offer"
+        );
+
+        // The stable echo arrives and is consumed by the stable
+        // selection event.
+        let (op, d) = event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(DEVICE, op, vec![Argument::NewId(OFFER_OWN)]),
+        );
+        let (op, d) = event("selection");
+        g.observe(
+            Dir::ServerToClient,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(DEVICE, op, vec![Argument::Object(OFFER_OWN)]),
+        );
+        assert_eq!(
+            receive(&mut g, OFFER_OWN).unwrap(),
+            ForwardAction::Forward,
+            "the stable echo still attributes the stable offer"
+        );
+
+        // And the reverse direction: the app's primary
+        // set_selection pending must not attribute a stable
+        // data_offer.
+        app_creates_psel_source(&mut g);
+        let (op, d) = ps_device_request("set_selection");
+        g.observe(
+            Dir::ClientToServer,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC), Argument::Uint(0)]),
+        );
+        let (op, d) = event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(
+                DEVICE,
+                op,
+                vec![Argument::NewId(0xFF00_0104)],
+            ),
+        );
+        assert_eq!(
+            receive(&mut g, 0xFF00_0104).unwrap(),
+            ForwardAction::Drop,
+            "a primary pending must not attribute a stable offer"
+        );
+        // The primary echo attributes the primary offer instead.
+        let (op, d) = ps_event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::NewId(PS_OFFER_OWN)]),
+        );
+        let (op, d) = ps_event("selection");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(PS_OFFER_OWN)]),
+        );
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_OWN).unwrap(),
+            ForwardAction::Forward
+        );
+    }
+
+    #[test]
+    fn primary_null_selection_clears_origin_and_pending() {
+        let mut g = ClipboardGate::new(ClipboardPolicy::Deny);
+        app_creates_psel_source(&mut g);
+        app_sets_own_psel(&mut g);
+        assert_eq!(g.primary_selection_origin(), Some(Origin::Own));
+
+        // A NULL selection (cleared, or the app lost keyboard focus
+        // — the protocol sends the confirming event only to the
+        // focused client) clears the origin and any live pending.
+        let (op, d) = ps_event("selection");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, Vec::new()),
+        );
+        assert_eq!(g.primary_selection_origin(), None);
+
+        // The (not yet destroyed) own offer stays attributable: the
+        // data behind it is still the app's.
+        assert_eq!(
+            ps_receive(&mut g, PS_OFFER_OWN).unwrap(),
+            ForwardAction::Forward
+        );
+    }
+
+    #[test]
+    fn primary_source_destroy_stops_attribution() {
+        let mut g = ClipboardGate::new(ClipboardPolicy::Deny);
+        app_creates_psel_source(&mut g);
+        app_sets_own_psel(&mut g);
+
+        // The client destroys the source (the protocol says to,
+        // once it is no longer the selection owner); the gate must
+        // stop attributing future echoes to it.
+        let op = opcode(&ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE, "req", "destroy");
+        let d = &ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE
+            .requests
+            .iter()
+            .find(|d| d.name == "destroy")
+            .unwrap();
+        g.observe(Dir::ClientToServer, &ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE, d, &msg(PS_SRC, op, Vec::new()));
+        let (op, d) = ps_device_request("set_selection");
+        g.observe(
+            Dir::ClientToServer,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC), Argument::Uint(0)]),
+        );
+        let (op, d) = ps_event("data_offer");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::NewId(0xFF00_0302)]),
+        );
+        let (op, d) = ps_event("selection");
+        g.observe(
+            Dir::ServerToClient,
+            &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+            d,
+            &msg(PS_DEVICE, op, vec![Argument::Object(0xFF00_0302)]),
+        );
+        assert_eq!(
+            ps_receive(&mut g, 0xFF00_0302).unwrap(),
+            ForwardAction::Drop,
+            "a destroyed source cannot be attributed to the app"
+        );
+    }
+
+    #[test]
+    fn primary_receive_with_a_path_fd_fails() {
+        // The fd sanity check applies to the primary protocol
+        // exactly like the stable one: a regular file (here, this
+        // source file) is not an in-memory channel.
+        let mut g = ClipboardGate::new(ClipboardPolicy::Allow);
+        let op = opcode(&ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, "req", "receive");
+        let file = std::fs::File::open("Cargo.toml").expect("open Cargo.toml");
+        let fd = std::os::fd::OwnedFd::from(file);
+        let err = g
+            .on_receive(&msg(
+                PS_OFFER_FOREIGN,
+                op,
+                vec![
+                    Argument::Str(Some(Box::new(
+                        std::ffi::CString::new("text/plain").unwrap(),
+                    ))),
+                    Argument::Fd(fd),
+                ],
+            ))
+            .unwrap_err();
+        assert!(err.contains("not an in-memory channel"), "{err}");
     }
 }
