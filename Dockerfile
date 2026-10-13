@@ -8,6 +8,10 @@ RUN apk add --no-cache musl-dev
 WORKDIR /work
 COPY Cargo.toml Cargo.lock /work/
 COPY src/ /work/src/
+# The wlroots protocol XMLs vendored for the proxy's signature table
+# (src/proxy/wlr_tables.rs reads them at compile time, relative to the
+# manifest dir).
+COPY protocols/ /work/protocols/
 # The deploy stage is FROM scratch, so the binary must be fully static:
 # build explicitly for the musl target of the architecture being built
 # (Docker's TARGETARCH is mapped to Rust's target triple; on non-buildkit

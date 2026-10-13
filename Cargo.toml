@@ -9,7 +9,31 @@ clap = { version = "4.5.48", features = ["derive", "env"] }
 env_logger = "0.11.8"
 log = "0.4.28"
 nix = { version = "0.30.1", features = ["signal", "process"] }
+# Socket I/O (send/recv with SCM_RIGHTS fd passing) + poll(2) for the
+# transparent proxy relay. Uses the same crate (and feature set) that
+# wayland-backend's `rs/socket.rs` uses, so the proxy mirrors the upstream
+# implementation exactly; `nix` is kept for signalfd/SigSet/waitpid only.
+rustix = { version = "1", features = ["event", "fs", "net"] }
 sd-notify = "0.4.5"
+# Public `protocol` module only (Interface / MessageDesc / ArgumentType):
+# the runtime signature table for the proxy's wire codec.
+wayland-backend = "0.3"
 wayland-client = "0.31.11"
-wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
+# Both `staging` and `unstable` are enabled so the proxy can parse every
+# global sway/wlroots exposes (xdg-output, relative-pointer, pointer-gestures,
+# keyboard-shortcuts-inhibit, input-timestamps, idle-inhibit,
+# linux-explicit-synchronization are `unstable`-gated) and therefore gate or
+# relay them fail-closed.
+wayland-protocols = { version = "0.32.9", features = ["client", "staging", "unstable"] }
+# generate_interfaces! for the vendored wlroots protocol XMLs
+# (protocols/ — sway's wlr family; see src/proxy/wlr_tables.rs).
+wayland-scanner = "0.31"
 xdg = "3.0.0"
+
+[dev-dependencies]
+# Test-only: a fake compositor (tests/common) and the `tempfile` scratch
+# dirs. Dev deps are unified into `cargo test` builds only; the static
+# release binary is built from [dependencies] alone.
+tempfile = "3"
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32.9", features = ["client", "staging", "server"] }

@@ -1,0 +1,16 @@
+# Vendored wlroots protocol definitions
+
+These XML files are copied from the wlroots 0.20.2 source tree
+(https://gitlab.freedesktop.org/wlroots/wlroots, `protocol/` directory),
+which is the wlroots release that sway on this system (Fedora 43/44)
+implements. They are used to generate `&'static Interface` tables
+(see src/proxy/wlr_tables.rs) that the Wayland proxy needs to parse
+messages on the wlr protocol family.
+
+`wayland-protocols-wlr` 0.3.9 (the published crate) predates this
+wlroots release and is missing `input-method-unstable-v2` and
+`virtual-keyboard-unstable-v1` entirely, so this family is generated
+from the wlroots tree directly.
+
+License: all files are MIT-licensed (see the <copyright> element in
+each file; upstream wlr-protocols/wlroots are MIT).
