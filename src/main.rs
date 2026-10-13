@@ -64,6 +64,23 @@ struct Cli {
         value_name = "INTERFACE"
     )]
     allow_globals: Vec<String>,
+    /// (Proxy mode only) clipboard policy for the sandboxed apps:
+    /// `allow` (the default) relays `wl_data_offer.receive` requests
+    /// unchanged; `deny` relays a receive only when it reads data the
+    /// app itself put on the clipboard — every other read is dropped
+    /// silently (the app sees an empty clipboard; its own copy-and-
+    /// paste keeps working). In both policies a receive whose fd is
+    /// not an in-memory channel (memfd/pipe/socket) is a fatal
+    /// protocol error: compositors do not inspect the fd they are
+    /// handed, so the check is what stops an app from directing
+    /// clipboard data into a file
+    #[arg(
+        long,
+        env = "WLSCTX_CLIPBOARD_POLICY",
+        default_value = "allow",
+        value_name = "POLICY"
+    )]
+    clipboard_policy: String,
 }
 
 /// Validate the argument combinations clap cannot express
@@ -82,6 +99,15 @@ fn validate(cli: &Cli) -> Result<()> {
         bail!(
             "--allow-globals is only valid together with --proxy; \
              the tag-and-park mode has no relay to filter"
+        );
+    }
+    let clipboard = wlsctx::proxy::ClipboardPolicy::parse(&cli.clipboard_policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !cli.proxy && clipboard != wlsctx::proxy::ClipboardPolicy::Allow {
+        bail!(
+            "--clipboard-policy {} is only valid together with --proxy; \
+             the tag-and-park mode has no relay to filter",
+            cli.clipboard_policy
         );
     }
     Ok(())
@@ -165,7 +191,15 @@ fn run_proxy(cli: &Cli) -> Result<()> {
     } else {
         info!("No global allowlist: pass-through (all globals shown)");
     }
-    wlsctx::proxy::event_loop(&public, &tagged_path, &policy, None)?;
+    let clipboard = wlsctx::proxy::ClipboardPolicy::parse(&cli.clipboard_policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if clipboard.is_active() {
+        info!("Clipboard gate active (deny): sandboxed reads of foreign selections come back empty");
+    } else {
+        info!("Clipboard gate: pass-through (allow)");
+    }
+    info!("Clipboard fd sanity check is on in both policies (receive fds must be in-memory channels)");
+    wlsctx::proxy::event_loop(&public, &tagged_path, &policy, clipboard, None)?;
     info!("Shutting down.");
     Ok(())
 }
@@ -295,6 +329,8 @@ mod tests {
                 ("WLSCTX_INSTANCE_ID", None),
                 ("WLSCTX_SANDBOX_ENGINE", None),
                 ("WLSCTX_SOCKET_PATH", None),
+                ("WLSCTX_ALLOW_GLOBALS", None),
+                ("WLSCTX_CLIPBOARD_POLICY", None),
             ],
             f,
         );
@@ -485,6 +521,87 @@ mod tests {
                 Some(std::path::Path::new("/run/user/1000/wlsctx-tagged"))
             );
             assert!(validate(&cli).is_ok());
+        });
+    }
+
+    #[test]
+    fn clipboard_policy_defaults_to_allow_and_accepts_deny() {
+        without_wlsctx_env(|| {
+            let base = [
+                "wlsctx",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ];
+            // Default.
+            let cli = Cli::try_parse_from(base.iter().copied()).unwrap();
+            assert_eq!(cli.clipboard_policy, "allow");
+            assert!(validate(&cli).is_ok());
+            // Explicit deny in proxy mode is fine.
+            let cli = Cli::try_parse_from(
+                std::iter::once("wlsctx")
+                    .chain(base.iter().skip(1).copied())
+                    .chain(["--clipboard-policy", "deny"]),
+            )
+            .unwrap();
+            assert_eq!(cli.clipboard_policy, "deny");
+            assert!(validate(&cli).is_ok());
+        });
+    }
+
+    #[test]
+    fn clipboard_policy_deny_requires_proxy() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--clipboard-policy",
+                "deny",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .unwrap();
+            let err = validate(&cli)
+                .expect_err("--clipboard-policy deny without --proxy must be rejected");
+            assert!(err.to_string().contains("--proxy"), "{err}");
+        });
+    }
+
+    #[test]
+    fn invalid_clipboard_policy_is_rejected() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--clipboard-policy",
+                "sometimes",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .unwrap();
+            let err = validate(&cli).expect_err("an unknown policy value must be rejected");
+            assert!(err.to_string().contains("sometimes"), "{err}");
         });
     }
 

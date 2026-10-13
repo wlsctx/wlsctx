@@ -42,6 +42,24 @@
 //! object. With the default (inactive) policy the proxy is a pure
 //! pass-through.
 //!
+//! ## Clipboard gate (Phase 3)
+//!
+//! With an active [`clipboard::ClipboardGate`] (the `deny` policy), the
+//! proxy gates the one request that moves clipboard data into a
+//! sandboxed app: `wl_data_offer.receive` hands the app's own fd to the
+//! compositor, which makes the current selection owner write into it —
+//! and the owner may be the host desktop. The gate relays a `receive`
+//! only when the data it reads is provably the app's own (a read-back
+//! of the selection the app itself set); every other read is dropped
+//! silently (the app sees an empty clipboard instead of crashing). In
+//! both policies a `receive` whose fd is not an in-memory channel
+//! (memfd/pipe/socket) is a fatal protocol error: compositors do not
+//! inspect the fd they are handed, so without the check a sandboxed app
+//! could direct clipboard data into a path in its mount space (the
+//! shared `downloads` volume) instead of keeping it in memory. The
+//! [`clipboard::ClipboardGate::unlock`] hook opens the gate for a
+//! bounded intent window (Phase 4's prompt broker).
+//!
 //! ## Fail-closed
 //!
 //! Every error path drops both ends of the affected connection (the
@@ -55,6 +73,7 @@
 //! One OS thread per app connection; the main thread runs the accept
 //! loop on a signalfd (production) or a stop flag (tests).
 
+pub mod clipboard;
 pub mod interfaces;
 pub mod objects;
 pub mod policy;
@@ -93,6 +112,7 @@ use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message, Mess
 use wayland_client::protocol::__interfaces::WL_DISPLAY_INTERFACE;
 
 use self::objects::{BookkeepingError, Dir, ObjectTables};
+pub use self::clipboard::{ClipboardGate, ClipboardPolicy};
 pub use self::policy::Policy;
 
 /// Max number of fds accepted in a single `recvmsg` (a Wayland message
@@ -191,9 +211,10 @@ pub enum RelayEnd {
     Protocol(String),
 }
 
-/// What the global-allowlist interceptor does with one parsed message.
+/// What the interceptors (global allowlist, clipboard gate) do with
+/// one parsed message.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ForwardAction {
+pub(crate) enum ForwardAction {
     /// Relay the original bytes to the peer (the default).
     Forward,
     /// Consume the message silently (a hidden global, or the matching
@@ -234,10 +255,19 @@ struct Relay {
     up_fds: VecDeque<OwnedFd>,
     tables: ObjectTables,
     g: GlobalInterceptor,
+    /// The clipboard receive-gate (Phase 3): origin state the proxy
+    /// infers from the protocol traffic, deciding `wl_data_offer.
+    /// receive` requests.
+    clipboard: ClipboardGate,
 }
 
 impl Relay {
-    fn new(down: UnixStream, up: UnixStream, policy: Arc<Policy>) -> Self {
+    fn new(
+        down: UnixStream,
+        up: UnixStream,
+        policy: Arc<Policy>,
+        clipboard: ClipboardPolicy,
+    ) -> Self {
         Self {
             down: ProxySocket::new(down),
             up: ProxySocket::new(up),
@@ -251,6 +281,7 @@ impl Relay {
                 shown: HashSet::new(),
                 hidden: HashSet::new(),
             },
+            clipboard: ClipboardGate::new(clipboard),
         }
     }
 
@@ -313,7 +344,16 @@ impl Relay {
                 None => return Ok(()),
             };
             let raw = &reassembled[..len];
-            Self::forward(&mut self.tables, &mut self.g, dir, raw, fds, &self.down, &self.up)?;
+            Self::forward(
+                &mut self.tables,
+                &mut self.g,
+                &mut self.clipboard,
+                dir,
+                raw,
+                fds,
+                &self.down,
+                &self.up,
+            )?;
             reassembled.drain(..len);
         }
     }
@@ -326,9 +366,14 @@ impl Relay {
     /// ordinary destination is whichever end the message is headed for,
     /// but the `wl_registry` interceptor may instead drop the message or
     /// inject a synthetic `wl_display.error` back to the app.
+    // These are the per-message relay's natural parameters; bundling
+    // them into a struct would add indirection for no clarity (a
+    // RelayCtx holding tables/g/clipboard is possible but churny).
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         tables: &mut ObjectTables,
         g: &mut GlobalInterceptor,
+        clipboard: &mut ClipboardGate,
         dir: Dir,
         raw: &[u8],
         src_fds: &mut VecDeque<OwnedFd>,
@@ -374,16 +419,41 @@ impl Relay {
             .apply(dir, &msg, desc, sender)
             .map_err(|e| RelayEnd::Protocol(e.to_string()))?;
 
-        // ---- Phase 2: the global-allowlist interceptor. ----
-        // Only `wl_registry` traffic is inspected; everything else is a
-        // straight pass-through. A hidden global is never announced to
-        // the client, so the only way it could be reached is a `bind`
-        // of a name the client was never shown — the proxy rejects that
-        // with a fatal `invalid_object` error instead of letting the
-        // compositor create the object by name.
-        let action = if sender.name != "wl_registry" {
-            ForwardAction::Forward
-        } else {
+        // The clipboard gate observes every relayed message so its
+        // origin state tracks the data_device/offer traffic as a whole
+        // (it only reacts to that; everything else is a no-op). It
+        // never hides events — the single decision point is the
+        // `receive` request below.
+        clipboard.observe(dir, sender, desc, &msg);
+
+        // ---- Phase 2 + 3: the interceptors. ----
+        // Only `wl_registry` and `wl_data_offer.receive` traffic is
+        // decided on; everything else is a straight pass-through.
+        //
+        // Phase 2, the global allowlist: a hidden global is never
+        // announced to the client, so the only way it could be
+        // reached is a `bind` of a name the client was never shown —
+        // the proxy rejects that with a fatal `invalid_object` error
+        // instead of letting the compositor create the object by name.
+        //
+        // Phase 3, the clipboard receive-gate: a `receive` (client →
+        // server) is the only request that hands a client-created fd
+        // to the selection owner for the owner to write into. Under
+        // `deny` the request is forwarded only when the data it reads
+        // is provably the app's own (a read-back of the selection or
+        // drag the app itself set); otherwise it is consumed silently
+        // — the compositor never serves it, the app's fd (an
+        // in-memory channel, see the fd sanity check) stays empty,
+        // and the app sees an empty clipboard read instead of
+        // crashing. An error here (a `receive` fd that is not an
+        // in-memory channel, in either policy) fails the connection
+        // closed.
+        let action = if dir == Dir::ClientToServer
+            && sender.name == "wl_data_offer"
+            && desc.name == "receive"
+        {
+            clipboard.on_receive(&msg).map_err(RelayEnd::Protocol)?
+        } else if sender.name == "wl_registry" {
             match (dir, desc.name) {
                 (Dir::ServerToClient, "global") => {
                     let (name, iface) = match (&msg.args[0], &msg.args[1]) {
@@ -458,6 +528,8 @@ impl Relay {
                 }
                 _ => ForwardAction::Forward,
             }
+        } else {
+            ForwardAction::Forward
         };
 
         if matches!(action, ForwardAction::Drop) {
@@ -579,7 +651,12 @@ pub fn bind_listener(path: &Path) -> io::Result<UnixListener> {
 /// The tagged connection is the one the compositor stamps with the
 /// security context; the app's own connection (on the public socket)
 /// carries none.
-fn spawn_relay(app: UnixStream, tagged_path: &Path, policy: Arc<Policy>) -> io::Result<()> {
+fn spawn_relay(
+    app: UnixStream,
+    tagged_path: &Path,
+    policy: Arc<Policy>,
+    clipboard: ClipboardPolicy,
+) -> io::Result<()> {
     let up = UnixStream::connect(tagged_path).map_err(|e| {
         io::Error::other(format!(
             "connecting to the tagged socket {tagged_path:?} failed: {e}"
@@ -591,7 +668,7 @@ fn spawn_relay(app: UnixStream, tagged_path: &Path, policy: Arc<Policy>) -> io::
             // Block the signalfd-bound mask so SIGTERM/SIGINT/SIGHUP
             // reach the main thread's signalfd, not this thread.
             let _ = proxy_signal_mask().thread_block();
-            let mut relay = Relay::new(app, up, policy);
+            let mut relay = Relay::new(app, up, policy, clipboard);
             let end = relay.run();
             match &end {
                 RelayEnd::Eof => debug!("relay closed: peer disconnected"),
@@ -617,6 +694,7 @@ pub fn event_loop(
     public: &UnixListener,
     tagged_path: &Path,
     policy: &Policy,
+    clipboard: ClipboardPolicy,
     stop: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
     let policy = Arc::new(policy.clone());
@@ -655,7 +733,7 @@ pub fn event_loop(
             } else {
                 match public.accept() {
                     Ok((stream, _)) => {
-                        if let Err(e) = spawn_relay(stream, tagged_path, policy.clone()) {
+                        if let Err(e) = spawn_relay(stream, tagged_path, policy.clone(), clipboard) {
                             warn!("dropping app connection: {e}");
                         }
                     }
