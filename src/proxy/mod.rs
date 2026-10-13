@@ -23,6 +23,12 @@
 //! so it can parse every message — the foundation for the interception
 //! phases (global allowlist, clipboard gating, …).
 //!
+//! The relay is convention-agnostic: it does not assume which object-ID
+//! convention the peers use (C libwayland: display at ID 0; Rust
+//! wayland-backend: ID 1). Each connection's first message is always
+//! addressed to the display, which pins the convention for that
+//! connection; two ends that disagree fail closed (see [`objects`]).
+//!
 //! ## Fail-closed
 //!
 //! Every error path drops both ends of the affected connection (the
@@ -326,16 +332,17 @@ impl Relay {
 }
 
 /// Resolve the request/event descriptor an opcode names on `sender`,
-/// given the direction of travel: requests are addressed by their
-/// request index, events by `requests.len() + event index` (the way
-/// wayland-scanner encodes the opcode on the wire).
+/// given the direction of travel. Requests and events live in separate
+/// opcode spaces per direction: the on-wire opcode is the raw index
+/// into the interface's `requests` array (client → server) or `events`
+/// array (server → client) — the convention both C libwayland and Rust
+/// wayland-backend use (verified against the scanner codegen and the
+/// backend's `send_delete_id`, which writes event index 1 for
+/// `wl_display.delete_id`).
 fn match_desc(dir: Dir, sender: &Interface, opcode: u16) -> Result<&'static MessageDesc, RelayEnd> {
-    let n_req = sender.requests.len();
     let desc = match dir {
         Dir::ClientToServer => sender.requests.get(opcode as usize),
-        Dir::ServerToClient => (opcode as usize >= n_req)
-            .then(|| sender.events.get(opcode as usize - n_req))
-            .flatten(),
+        Dir::ServerToClient => sender.events.get(opcode as usize),
     };
     let what = if dir == Dir::ClientToServer { "request" } else { "event" };
     desc.ok_or_else(|| {
