@@ -10,5 +10,6 @@
 //!   compositor through security-context connections (the "proxy" mode,
 //!   `--proxy`).
 
+pub mod broker;
 pub mod proxy;
 pub mod security_context;

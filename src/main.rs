@@ -1,6 +1,8 @@
-//! The wlsctx binary: tag-and-park (the default) or transparent
-//! Wayland proxy (`--proxy`).
+//! The wlsctx binary: tag-and-park (the default), transparent Wayland
+//! proxy (`--proxy`), the clipboard prompt broker (`--broker`), or
+//! sending a decision to a pending broker prompt (`--decide`).
 
+use std::io::Write as _;
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
 use std::path;
@@ -19,15 +21,18 @@ use wayland_client::Connection;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
 struct Cli {
-    /// Application ID in security context
+    /// Application ID in security context (required except in
+    /// --broker/--decide mode)
     #[arg(long, env = "WLSCTX_APP_ID")]
-    app_id: String,
-    /// Instance ID in security context
+    app_id: Option<String>,
+    /// Instance ID in security context (required except in
+    /// --broker/--decide mode)
     #[arg(long, env = "WLSCTX_INSTANCE_ID")]
-    instance_id: String,
-    /// Sandbox engine ID in security context
+    instance_id: Option<String>,
+    /// Sandbox engine ID in security context (required except in
+    /// --broker/--decide mode)
     #[arg(long, env = "WLSCTX_SANDBOX_ENGINE")]
-    sandbox_engine: String,
+    sandbox_engine: Option<String>,
     /// Listen on Unix socket
     #[arg(
         long,
@@ -81,12 +86,84 @@ struct Cli {
         value_name = "POLICY"
     )]
     clipboard_policy: String,
+    /// (Proxy mode only) path of the prompt broker's socket: when the
+    /// clipboard gate drops a foreign read, the proxy asks the broker
+    /// (which prompts the user on the host); an approved read opens
+    /// the gate's intent window (1500 ms) and goes through. When the
+    /// broker is missing or times out, the read is dropped anyway
+    #[arg(long, env = "WLSCTX_BROKER_SOCKET")]
+    broker_socket: Option<path::PathBuf>,
+    /// Run as the clipboard prompt broker (a host user service,
+    /// outside the sandbox): each denied foreign clipboard read
+    /// arrives as a JSON request on the listen socket, is announced
+    /// with a desktop notification, and is allowed or denied by the
+    /// user on a private decision socket (see src/broker.rs)
+    #[arg(long, conflicts_with = "proxy", conflicts_with = "decide")]
+    broker: bool,
+    /// (Broker mode) decide every request automatically without
+    /// prompting — a test hook
+    #[arg(long, requires = "broker", value_name = "DECISION")]
+    auto_decide: Option<String>,
+    /// (Broker mode) how long to wait for the user's decision, in
+    /// milliseconds (a timeout is a deny)
+    #[arg(long, requires = "broker", default_value_t = 30_000, value_name = "MS")]
+    broker_timeout_millis: u64,
+    /// Send a decision to the pending broker prompt (the most recent
+    /// one, via the `latest` pointer in the runtime directory) —
+    /// normally invoked by a keybinding or a notification action
+    #[arg(long, conflicts_with = "proxy", conflicts_with = "broker")]
+    decide: bool,
+    /// (Decide mode) the decision to send: allow or deny
+    #[arg(long, requires = "decide", value_name = "DECISION")]
+    decision: Option<String>,
 }
 
 /// Validate the argument combinations clap cannot express
 /// (`--tagged-socket` and `--allow-globals` are meaningless outside
-/// `--proxy` mode).
+/// `--proxy` mode; the security-context IDs are required outside
+/// broker/decide mode).
 fn validate(cli: &Cli) -> Result<()> {
+    if cli.broker || cli.decide {
+        // The broker learns app/instance per request from the proxy;
+        // the decider is a one-shot CLI. The security-context IDs
+        // apply to neither.
+    } else if let Some(missing) = [
+        (cli.app_id.is_none(), "--app-id"),
+        (cli.instance_id.is_none(), "--instance-id"),
+        (cli.sandbox_engine.is_none(), "--sandbox-engine"),
+    ]
+    .iter()
+    .find(|(is_missing, _)| *is_missing)
+    {
+        bail!(
+            "{0} is required (or set the matching WLSCTX_* environment variable) \
+             unless running --broker or --decide",
+            missing.1
+        );
+    }
+    if cli.broker && cli.auto_decide.is_some()
+        && let Err(e) = wlsctx::broker::parse_decision(cli.auto_decide.as_deref().unwrap())
+    {
+        bail!("{e}");
+    }
+    if cli.decide
+        && let Err(e) = wlsctx::broker::parse_decision(
+            cli.decision
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--decide needs --decision (allow or deny)"))?,
+        )
+    {
+        bail!("{e}");
+    }
+    if !cli.proxy
+        && let Some(p) = &cli.broker_socket
+    {
+        bail!(
+            "--broker-socket ({p:?}) is only valid together with --proxy; \
+             the broker socket is only used to ask about dropped reads, \
+             which only the relay can have"
+        );
+    }
     if !cli.proxy
         && let Some(p) = &cli.tagged_socket
     {
@@ -119,11 +196,91 @@ fn main() -> Result<()> {
     env_logger::init_from_env(env);
     let cli = Cli::parse();
     validate(&cli)?;
-    if cli.proxy {
+    if cli.broker {
+        run_broker(&cli)
+    } else if cli.decide {
+        run_decide(&cli)
+    } else if cli.proxy {
         run_proxy(&cli)
     } else {
         run_tag_and_park(&cli)
     }
+}
+
+/// Broker mode: sit on the broker socket (systemd-activated or bound
+/// here), prompt the user for each denied foreign clipboard read, and
+/// answer the proxy.
+fn run_broker(cli: &Cli) -> Result<()> {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").context(
+        "XDG_RUNTIME_DIR must be set: the broker keeps its decision \
+         sockets and the `latest` pointer in $XDG_RUNTIME_DIR/wlsctx",
+    )?;
+    let listener = if cli.socket_activation {
+        wlsctx::broker::take_activated_socket().with_context(|| {
+            "no socket was received via systemd socket activation (LISTEN_FDS is not set \
+             or empty); run wlsctx through the wlsctx-broker.socket unit or use --listen"
+        })?
+    } else {
+        let socket_path = cli.listen.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--listen is required when --socket-activation is not set")
+        })?;
+        let socket_abspath = resolve_listener_path(socket_path)?;
+        wlsctx::broker::bind_listener(&socket_abspath)
+            .with_context(|| format!("binding {socket_abspath:?} failed"))?
+    };
+    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+    let args = wlsctx::broker::BrokerArgs {
+        runtime_dir: path::PathBuf::from(xdg).join("wlsctx"),
+        auto_decide: cli.auto_decide.as_deref().map(|s| {
+            wlsctx::broker::parse_decision(s)
+                .ok()
+                .map(|d| match d {
+                    wlsctx::broker::UserDecision::Allow => wlsctx::broker::AutoDecide::Allow,
+                    wlsctx::broker::UserDecision::Deny => wlsctx::broker::AutoDecide::Deny,
+                })
+                .unwrap_or_else(|| {
+                    // validate() already rejected a bad value.
+                    unreachable!()
+                })
+        }),
+        timeout: std::time::Duration::from_millis(cli.broker_timeout_millis),
+    };
+    wlsctx::broker::run(&args, listener).context("the broker event loop ended")?;
+    info!("Shutting down.");
+    Ok(())
+}
+
+/// Decide mode: send the user's decision to the most recent pending
+/// broker prompt (the one whose decision socket the `latest` pointer
+/// names).
+fn run_decide(cli: &Cli) -> Result<()> {
+    let decision = wlsctx::broker::parse_decision(
+        cli.decision
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--decide needs --decision (allow or deny)"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let xdg = std::env::var("XDG_RUNTIME_DIR").context(
+        "XDG_RUNTIME_DIR must be set: the broker's `latest` pointer \
+         lives in $XDG_RUNTIME_DIR/wlsctx",
+    )?;
+    let latest = path::PathBuf::from(xdg).join("wlsctx").join("latest");
+    let target = std::fs::read_to_string(&latest)
+        .with_context(|| {
+            format!(
+                "no pending broker prompt ({latest:?} is missing); is a sandboxed app \
+                 waiting for consent right now?"
+            )
+        })?
+        .trim()
+        .to_string();
+    let mut stream = std::os::unix::net::UnixStream::connect(&target)
+        .with_context(|| format!("connecting to the broker decision socket {target:?} failed"))?;
+    stream
+        .write_all(wlsctx::broker::encode_user_decision(&decision)?.as_bytes())
+        .context("writing the decision to the broker failed")?;
+    info!("sent {decision:?} to the broker prompt at {target:?}");
+    Ok(())
 }
 
 /// Tag-and-park (the current/default behaviour): tag the listen socket
@@ -142,7 +299,7 @@ fn run_tag_and_park(cli: &Cli) -> Result<()> {
     let close_fd = wlsctx::security_context::create_security_context(
         conn,
         &listener,
-        &cli.sandbox_engine,
+        cli.sandbox_engine.as_deref().context("--sandbox-engine is required")?,
         &app_id,
         &instance_id,
     )?;
@@ -173,7 +330,7 @@ fn run_proxy(cli: &Cli) -> Result<()> {
     let close_fd = wlsctx::security_context::create_security_context(
         conn,
         &tagged,
-        &cli.sandbox_engine,
+        cli.sandbox_engine.as_deref().context("--sandbox-engine is required")?,
         &app_id,
         &instance_id,
     )?;
@@ -199,7 +356,26 @@ fn run_proxy(cli: &Cli) -> Result<()> {
         info!("Clipboard gate: pass-through (allow)");
     }
     info!("Clipboard fd sanity check is on in both policies (receive fds must be in-memory channels)");
-    wlsctx::proxy::event_loop(&public, &tagged_path, &policy, clipboard, None)?;
+    // The optional prompt broker: when a denied read lands, the
+    // relay asks here (a fresh connection per ask) before dropping.
+    let broker = match &cli.broker_socket {
+        Some(p) => {
+            let p = resolve_listener_path(p)?;
+            info!(
+                "Prompt broker: {} (denied reads are asked before dropping; a missing or \
+                 slow broker fails closed)",
+                p.display()
+            );
+            Some(wlsctx::proxy::BrokerConfig {
+                socket: p,
+                app: app_id,
+                instance: instance_id,
+                ..Default::default()
+            })
+        }
+        None => None,
+    };
+    wlsctx::proxy::event_loop(&public, &tagged_path, &policy, clipboard, broker, None)?;
     info!("Shutting down.");
     Ok(())
 }
@@ -222,8 +398,16 @@ fn connect_to_compositor() -> Result<Connection> {
 /// activation or by binding the socket ourselves. Returns
 /// (app_id, instance_id, listener).
 fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
-    let app_id = cli.app_id.clone();
-    let instance_id = cli.instance_id.clone();
+    // validate() already required these in every mode this is used in
+    // (tag-and-park and proxy).
+    let app_id = cli
+        .app_id
+        .clone()
+        .context("--app-id is required (or set WLSCTX_APP_ID)")?;
+    let instance_id = cli
+        .instance_id
+        .clone()
+        .context("--instance-id is required (or set WLSCTX_INSTANCE_ID)")?;
     if cli.socket_activation {
         // The IDs come from --app-id/--instance-id (or the
         // WLSCTX_APP_ID / WLSCTX_INSTANCE_ID environment variables). They
@@ -355,9 +539,9 @@ mod tests {
                 cli.listen.as_deref(),
                 Some(std::path::Path::new("/run/pod/wayland-1"))
             );
-            assert_eq!(cli.app_id, "rustrover");
-            assert_eq!(cli.instance_id, "work");
-            assert_eq!(cli.sandbox_engine, "podman");
+            assert_eq!(cli.app_id.as_deref(), Some("rustrover"));
+            assert_eq!(cli.instance_id.as_deref(), Some("work"));
+            assert_eq!(cli.sandbox_engine.as_deref(), Some("podman"));
             assert!(!cli.proxy);
             assert!(cli.tagged_socket.is_none());
             assert!(validate(&cli).is_ok());
@@ -384,17 +568,20 @@ mod tests {
     #[test]
     fn requires_app_id_and_instance_id() {
         without_wlsctx_env(|| {
-            let err = Cli::try_parse_from([
+            // The IDs are optional at parse time so that --broker and
+            // --decide modes (which need no security-context IDs) can
+            // parse; validate() rejects their absence in every other
+            // mode. Nothing is derived from fd names.
+            let cli = Cli::try_parse_from([
                 "wlsctx",
                 "--listen",
                 "/run/pod/wayland-1",
                 "--sandbox-engine",
                 "podman",
             ])
-            .expect_err("app_id/instance_id are always required (no fd-name fallback)");
-            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-            assert!(err.to_string().contains("--app-id"));
-            assert!(err.to_string().contains("--instance-id"));
+            .expect("IDs are optional at parse time");
+            let err = validate(&cli).unwrap_err();
+            assert!(err.to_string().contains("--app-id"), "{err}");
         });
     }
 
@@ -443,14 +630,16 @@ mod tests {
         without_wlsctx_env(|| {
             // The IDs must come from --app-id/--instance-id or their
             // environment variables; nothing is derived from LISTEN_FDNAMES.
-            let err = Cli::try_parse_from([
+            // They parse as absent and are rejected by validate().
+            let cli = Cli::try_parse_from([
                 "wlsctx",
                 "--socket-activation",
                 "--sandbox-engine",
                 "podman",
             ])
-            .expect_err("socket-activation mode still requires explicit IDs");
-            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            .expect("IDs are optional at parse time");
+            let err = validate(&cli).unwrap_err();
+            assert!(err.to_string().contains("--app-id"), "{err}");
         });
     }
 
@@ -465,9 +654,9 @@ mod tests {
             ],
             || {
                 let cli = Cli::try_parse_from(["wlsctx"]).expect("env vars satisfy all args");
-                assert_eq!(cli.app_id, "envapp");
-                assert_eq!(cli.instance_id, "envinst");
-                assert_eq!(cli.sandbox_engine, "envengine");
+                assert_eq!(cli.app_id.as_deref(), Some("envapp"));
+                assert_eq!(cli.instance_id.as_deref(), Some("envinst"));
+                assert_eq!(cli.sandbox_engine.as_deref(), Some("envengine"));
                 assert_eq!(
                     cli.listen.as_deref(),
                     Some(std::path::Path::new("/run/pod/wayland-1"))

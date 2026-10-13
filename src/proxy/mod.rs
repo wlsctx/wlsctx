@@ -56,9 +56,23 @@
 //! (memfd/pipe/socket) is a fatal protocol error: compositors do not
 //! inspect the fd they are handed, so without the check a sandboxed app
 //! could direct clipboard data into a path in its mount space (the
-//! shared `downloads` volume) instead of keeping it in memory. The
-//! [`clipboard::ClipboardGate::unlock`] hook opens the gate for a
-//! bounded intent window (Phase 4's prompt broker).
+//! shared `downloads` volume) instead of keeping it in memory.
+//!
+//! ## The prompt broker (Phase 4)
+//!
+//! The `deny` policy is a safe default, not a wall: the user may
+//! legitimately want to paste host data into the sandbox once in a
+//! while. When the relay is configured with a [`broker::BrokerConfig`]
+//! (the `--broker-socket` flag), a read the gate would drop is first
+//! *asked*: the relay opens a fresh connection to the host broker
+//! (which announces the request to the desktop and waits for the
+//! user's decision — see [`crate::broker`]) and, if the user allows
+//! it, calls [`clipboard::ClipboardGate::unlock`] with the intent
+//! window from the answer (1500 ms by default) and forwards the read.
+//! The window covers the burst an approved paste usually comes in
+//! (one `receive` per mime type, retries); after it, the gate is
+//! closed again. A missing broker, a timeout, or a malformed answer
+//! keeps the drop — the broker is optional and fails closed.
 //!
 //! ## Fail-closed
 //!
@@ -73,6 +87,7 @@
 //! One OS thread per app connection; the main thread runs the accept
 //! loop on a signalfd (production) or a stop flag (tests).
 
+pub mod broker;
 pub mod clipboard;
 pub mod interfaces;
 pub mod objects;
@@ -107,11 +122,13 @@ use rustix::net::{
 };
 use std::collections::HashSet;
 use std::ffi::CString;
+use std::time::Instant;
 
 use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message, MessageDesc};
 use wayland_client::protocol::__interfaces::WL_DISPLAY_INTERFACE;
 
 use self::objects::{BookkeepingError, Dir, ObjectTables};
+pub use self::broker::BrokerConfig;
 pub use self::clipboard::{ClipboardGate, ClipboardPolicy};
 pub use self::policy::Policy;
 
@@ -259,6 +276,10 @@ struct Relay {
     /// infers from the protocol traffic, deciding `wl_data_offer.
     /// receive` requests.
     clipboard: ClipboardGate,
+    /// The optional prompt broker (Phase 4): consulted before a
+    /// dropped foreign read is consumed; an approved answer unlocks
+    /// the gate for its intent window.
+    broker: Option<BrokerConfig>,
 }
 
 impl Relay {
@@ -267,6 +288,7 @@ impl Relay {
         up: UnixStream,
         policy: Arc<Policy>,
         clipboard: ClipboardPolicy,
+        broker: Option<BrokerConfig>,
     ) -> Self {
         Self {
             down: ProxySocket::new(down),
@@ -282,6 +304,7 @@ impl Relay {
                 hidden: HashSet::new(),
             },
             clipboard: ClipboardGate::new(clipboard),
+            broker,
         }
     }
 
@@ -348,6 +371,7 @@ impl Relay {
                 &mut self.tables,
                 &mut self.g,
                 &mut self.clipboard,
+                self.broker.as_ref(),
                 dir,
                 raw,
                 fds,
@@ -374,6 +398,7 @@ impl Relay {
         tables: &mut ObjectTables,
         g: &mut GlobalInterceptor,
         clipboard: &mut ClipboardGate,
+        broker: Option<&BrokerConfig>,
         dir: Dir,
         raw: &[u8],
         src_fds: &mut VecDeque<OwnedFd>,
@@ -452,7 +477,49 @@ impl Relay {
             && sender.name == "wl_data_offer"
             && desc.name == "receive"
         {
-            clipboard.on_receive(&msg).map_err(RelayEnd::Protocol)?
+            match clipboard.on_receive(&msg).map_err(RelayEnd::Protocol)? {
+                ForwardAction::Forward => ForwardAction::Forward,
+                // The gate dropped a read of a foreign selection (the
+                // `deny` policy with no active consent window). If a
+                // prompt broker is configured, ask the user before
+                // consuming the fd: an allow opens the gate's intent
+                // window (this read, and the burst that comes with
+                // it, go through) and the read is forwarded; a deny,
+                // a timeout, or an unreachable broker keeps the drop
+                // (fail closed).
+                ForwardAction::Drop => match broker {
+                    Some(broker) => {
+                        let mime = msg
+                            .args
+                            .first()
+                            .and_then(|a| {
+                                if let Argument::Str(Some(s)) = a {
+                                    Some(s.to_string_lossy().into_owned())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        match broker.ask(&mime) {
+                            Ok(true) => {
+                                clipboard.unlock(Instant::now() + broker.window);
+                                info!(
+                                    "clipboard gate: the user approved the read; \
+                                     the intent window ({} ms) opens foreign reads",
+                                    broker.window.as_millis()
+                                );
+                                ForwardAction::Forward
+                            }
+                            Ok(false) => ForwardAction::Drop,
+                            Err(e) => {
+                                warn!("clipboard gate: the broker is unreachable ({e}); dropping the read");
+                                ForwardAction::Drop
+                            }
+                        }
+                    }
+                    None => ForwardAction::Drop,
+                },
+            }
         } else if sender.name == "wl_registry" {
             match (dir, desc.name) {
                 (Dir::ServerToClient, "global") => {
@@ -656,6 +723,7 @@ fn spawn_relay(
     tagged_path: &Path,
     policy: Arc<Policy>,
     clipboard: ClipboardPolicy,
+    broker: Option<BrokerConfig>,
 ) -> io::Result<()> {
     let up = UnixStream::connect(tagged_path).map_err(|e| {
         io::Error::other(format!(
@@ -668,7 +736,7 @@ fn spawn_relay(
             // Block the signalfd-bound mask so SIGTERM/SIGINT/SIGHUP
             // reach the main thread's signalfd, not this thread.
             let _ = proxy_signal_mask().thread_block();
-            let mut relay = Relay::new(app, up, policy, clipboard);
+            let mut relay = Relay::new(app, up, policy, clipboard, broker);
             let end = relay.run();
             match &end {
                 RelayEnd::Eof => debug!("relay closed: peer disconnected"),
@@ -695,6 +763,7 @@ pub fn event_loop(
     tagged_path: &Path,
     policy: &Policy,
     clipboard: ClipboardPolicy,
+    broker: Option<BrokerConfig>,
     stop: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
     let policy = Arc::new(policy.clone());
@@ -733,7 +802,10 @@ pub fn event_loop(
             } else {
                 match public.accept() {
                     Ok((stream, _)) => {
-                        if let Err(e) = spawn_relay(stream, tagged_path, policy.clone(), clipboard) {
+                        if let Err(
+                            e,
+                        ) = spawn_relay(stream, tagged_path, policy.clone(), clipboard, broker.clone())
+                        {
                             warn!("dropping app connection: {e}");
                         }
                     }

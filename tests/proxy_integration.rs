@@ -633,6 +633,7 @@ fn relay_passes_messages_and_fds() {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 wlsctx::proxy::ClipboardPolicy::Allow,
+                None,
                 Some(stop_proxy),
             );
         })
@@ -701,6 +702,7 @@ fn allowlist_hides_globals_and_rejects_their_binds() {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::from_csv("wl_compositor"),
                 wlsctx::proxy::ClipboardPolicy::Allow,
+                None,
                 Some(stop_proxy),
             );
         })
@@ -1251,6 +1253,7 @@ fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 policy,
+                None,
                 Some(stop_proxy),
             );
         })
