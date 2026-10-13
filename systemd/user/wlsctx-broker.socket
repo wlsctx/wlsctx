@@ -1,0 +1,38 @@
+# Socket-activated half of the prompt broker (Phase 4).
+#
+# Owns $XDG_RUNTIME_DIR/wlsctx-broker, the Unix stream socket a wlsctx
+# PROXY connects to (one connection, one request line, one answer
+# line) when its clipboard receive-gate drops a foreign read and wants
+# the user's consent. The activated service runs the broker itself
+# (see wlsctx-broker.service).
+#
+# The broker is a host-side, in-session service on purpose: it must
+# reach the session bus (notify-send) and must outlive any one
+# sandbox. It is *not* socket-activated into a container — the
+# scratch wlsctx image has no bus and no notify-send, so the prompt
+# could never actually reach the user.
+#
+# The decision socket the broker binds while it waits for the user
+# (and the `latest` pointer naming it) live in $XDG_RUNTIME_DIR/wlsctx,
+# the same user-private directory the mode-A socket unit owns. A
+# keybinding / notification action / any program answers with:
+#   wlsctx --decide --decision allow
+#   wlsctx --decide --decision deny
+# A timeout (default 30 s) is a deny. Every failure path fails closed.
+[Unit]
+Description=wlsctx prompt broker socket
+PartOf=graphical-session.target
+After=graphical-session.target
+Conflicts=wayland-session-shutdown.target
+Before=wayland-session-shutdown.target
+PropagatesStopTo=%N.service
+
+[Socket]
+# The socket file itself. (The *decision* sockets and the `latest`
+# pointer the broker creates while waiting go under wlsctx/, which the
+# broker process creates and chmods 0700 itself — see wlsctx::broker.)
+ListenStream=%t/wlsctx-broker
+SocketMode=0600
+
+[Install]
+WantedBy=graphical-session.target

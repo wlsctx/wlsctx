@@ -1,0 +1,53 @@
+# Prompt broker (Phase 4): the host-side consent service for the
+# clipboard receive-gate.
+#
+# Runs in the user's desktop session (NOT in a container): it must
+# reach the session bus for notify-send and it must be the thing that
+# waits for *the user*, so it is a plain user service, not a quadlet.
+# The binary is expected at /usr/local/bin/wlsctx (build it with
+# `cargo build --release`, or extract it from the
+# ghcr.io/wlsctx/wlsctx image — it is a static binary); override
+# ExecStart in a drop-in if yours lives elsewhere.
+#
+# Socket-activated by wlsctx-broker.socket: systemd passes the
+# listening socket via LISTEN_FDS and this service consumes it with
+# --socket-activation. The first dropped foreign read from any proxy
+# wakes it; when no proxy has asked for a while it stays dormant.
+#
+# The binary path is deliberately plain (systemd does not expand
+# `${VAR:-default}` in ExecStart): move /wlsctx to /usr/local/bin
+# (or override ExecStart in a drop-in) if yours lives elsewhere.
+#
+# What one request does: the broker decodes the proxy's JSON request
+# line (app, instance, mime), announces it with notify-send, binds a
+# one-shot decision socket under $XDG_RUNTIME_DIR/wlsctx (recording it
+# in the `latest` pointer), and waits for the user —
+#
+#   wlsctx --decide --decision allow    # one-shot sender for a
+#   wlsctx --decide --decision deny     # keybinding / notification action
+#
+# or any writer that reaches the decision socket with one JSON line.
+# Allow answers the proxy with a 1500 ms intent window (the proxy
+# opens the gate for that burst); deny and every failure (missing
+# binary, lost bus, unreadable answer, timeout) answer a deny or are
+# dropped — the read never flows without a real, in-window allow.
+#
+# WLSCTX_BROKER_TIMEOUT_MILLIS (default 30000) bounds the wait; the
+# same variable can be set here for a session-wide default.
+[Unit]
+Description=wlsctx prompt broker
+PartOf=graphical-session.target
+After=graphical-session.target
+BindsTo=wlsctx-broker.socket
+After=wlsctx-broker.socket
+
+[Service]
+ExecStart=/usr/local/bin/wlsctx --broker --socket-activation
+NotifyAccess=main
+# The broker talks to (a) the proxies' connections on its own socket
+# and (b) the user's one-shot decision writers — both Unix sockets.
+# It must not hold any other capability.
+NoNewPrivileges=true
+# Keep the session environment (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_
+# ADDRESS) intact: the broker uses both. Nothing else is overridden.
+Restart=on-failure

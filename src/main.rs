@@ -106,7 +106,7 @@ struct Cli {
     auto_decide: Option<String>,
     /// (Broker mode) how long to wait for the user's decision, in
     /// milliseconds (a timeout is a deny)
-    #[arg(long, requires = "broker", default_value_t = 30_000, value_name = "MS")]
+    #[arg(long, env = "WLSCTX_BROKER_TIMEOUT_MILLIS", requires = "broker", default_value_t = 30_000, value_name = "MS")]
     broker_timeout_millis: u64,
     /// Send a decision to the pending broker prompt (the most recent
     /// one, via the `latest` pointer in the runtime directory) —

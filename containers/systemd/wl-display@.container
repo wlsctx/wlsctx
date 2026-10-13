@@ -35,6 +35,23 @@
 # wlsctx process through the container environment, so a drop-in
 # that sets it should add Environment= lines to both [Service] and
 # [Container].
+#
+# Optional prompt broker (phase 4): with the gate in deny, dropped
+# foreign reads can be *asked about* instead of silently lost — the
+# sidecar's proxy connects to the host-side broker (the
+# wlsctx-broker.socket / wlsctx-broker.service units, which notify
+# the user and wait for `wlsctx --decide`) and, on an allow, opens
+# the gate's 1500 ms intent window. Wire it with a drop-in that
+# bind-mounts the broker's host socket into THIS container's private
+# /run (not into the shared /run/pod volume, so no app in the pod
+# can reach it) and points the proxy at it:
+#   [Service]
+#   Environment=WLSCTX_BROKER_SOCKET=/run/broker.sock
+#   [Container]
+#   Mount=type=bind,source=%t/wlsctx-broker,destination=/run/broker.sock
+# The mount is only visible to this sidecar (each container gets its
+# own private %t tmpfs); the proxy's asks still fail closed if the
+# broker is stopped, so this is strictly opt-in.
 [Unit]
 Description=Minimal Wayland security context manager
 StopWhenUnneeded=yes
