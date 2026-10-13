@@ -17,6 +17,14 @@
 # clipboard gating, …). To fall back to plain tag-and-park (apps talk
 # to the compositor directly, no relay), remove the --proxy and
 # --tagged-socket arguments from Exec below.
+#
+# Optional global allowlist: set WLSCTX_ALLOW_GLOBALS (comma-separated
+# interface names, e.g. "wl_compositor,wl_shm") to hide every other
+# global from the sandboxed apps; binds of hidden globals are rejected
+# with a fatal wl_display.error. Not set by default: hiding
+# wl_data_device_manager would break the clipboard outright, and the
+# intended clipboard protection is the finer-grained receive-gate,
+# which still allows binding.
 [Unit]
 Description=Minimal Wayland security context manager
 StopWhenUnneeded=yes
