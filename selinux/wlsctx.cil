@@ -3,5 +3,15 @@
     (allow process user_tmp_t ( dir ( getattr ioctl lock open read search )))
     (allow process user_tmp_t ( file ( getattr ioctl lock open read )))
     (allow process user_tmp_t ( sock_file ( getattr open read write )))
+    # The proxy's upstream connection: connect() to the tagged socket
+    # it bound itself at $POD_RUNTIME_DIR/wlsctx-tagged (inside the
+    # pod's /run/pod volume). A bound unix socket keeps the SELinux
+    # type (incl. its MCS label) of the process that created it, while
+    # the on-disk path is a separate user_tmp_t sock_file (covered by
+    # the rule above) — the same split wl_dbus_proxy relies on, where
+    # (allow container_t wl_dbus_proxy.process (unix_stream_socket
+    # (connectto))) reaches the proxy socket, not user_tmp_t. So the
+    # connect target here is `process` (wlsctx.process) itself.
+    (allow process process (unix_stream_socket (connectto)))
     (allow process unconfined_t (unix_stream_socket (connectto)))
 )

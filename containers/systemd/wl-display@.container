@@ -2,12 +2,21 @@
 #
 # Unlike the standalone wlsctx@ (mode A, systemd socket-activated with the
 # socket in the host's XDG_RUNTIME_DIR), this container runs inside each
-# app's pod and tags the socket at $POD_RUNTIME_DIR/wayland-1
-# (/run/pod/wayland-1) inside the pod, so every app in the pod gets a
-# tagged connection with no host-side path access at all. The host's
-# Wayland socket is passed in as the container's own stdin (see the
-# [Service] comment below) — no extra privileges or SELinux label needed
-# for the socket itself.
+# app's pod and serves $POD_RUNTIME_DIR/wayland-1 (/run/pod/wayland-1)
+# inside the pod, so every app in the pod gets a tagged connection with
+# no host-side path access at all. The host's Wayland socket is passed
+# in as the container's own stdin (see the [Service] comment below) —
+# no extra privileges or SELinux label needed for the socket itself.
+#
+# The sidecar runs the transparent Wayland PROXY (--proxy): apps talk to
+# the public socket above, and the proxy relays to the compositor over
+# the tagged socket at $POD_RUNTIME_DIR/wlsctx-tagged (bound here,
+# stamped by the compositor during the security-context handshake, and
+# connected to by the proxy only). The relay enforces the protocol
+# bookkeeping the interception phases build on (global allowlist,
+# clipboard gating, …). To fall back to plain tag-and-park (apps talk
+# to the compositor directly, no relay), remove the --proxy and
+# --tagged-socket arguments from Exec below.
 [Unit]
 Description=Minimal Wayland security context manager
 StopWhenUnneeded=yes
@@ -30,7 +39,7 @@ StandardError=journal
 [Container]
 LogDriver=passthrough
 Environment=WAYLAND_SOCKET=0
-Exec=--listen=${POD_RUNTIME_DIR}/${WAYLAND_DISPLAY}
+Exec=--listen=${POD_RUNTIME_DIR}/${WAYLAND_DISPLAY} --proxy --tagged-socket=${POD_RUNTIME_DIR}/wlsctx-tagged
 Image=wlsctx.image
 Pull=never
 Environment=WLSCTX_SANDBOX_ENGINE=${WLSCTX_SANDBOX_ENGINE}
