@@ -50,10 +50,25 @@ struct Cli {
     /// sandboxed app (e.g. the sidecar's private runtime dir)
     #[arg(long, required_if_eq("proxy", "true"))]
     tagged_socket: Option<path::PathBuf>,
+    /// (Proxy mode only) comma-separated list of Wayland interface
+    /// names the sandboxed app may bind. When set, the proxy hides
+    /// every other global from the registry and rejects a bind of any
+    /// name the app was never shown (a `wl_display.error`
+    /// `invalid_object`); when unset the proxy is a pass-through and
+    /// shows all globals (the Phase 1 behaviour)
+    #[arg(
+        long,
+        env = "WLSCTX_ALLOW_GLOBALS",
+        value_delimiter = ',',
+        num_args = 1..,
+        value_name = "INTERFACE"
+    )]
+    allow_globals: Vec<String>,
 }
 
 /// Validate the argument combinations clap cannot express
-/// (`--tagged-socket` is meaningless outside `--proxy` mode).
+/// (`--tagged-socket` and `--allow-globals` are meaningless outside
+/// `--proxy` mode).
 fn validate(cli: &Cli) -> Result<()> {
     if !cli.proxy
         && let Some(p) = &cli.tagged_socket
@@ -61,6 +76,12 @@ fn validate(cli: &Cli) -> Result<()> {
         bail!(
             "--tagged-socket ({p:?}) is only valid together with --proxy; \
              in tag-and-park mode the --listen socket itself is the tagged one"
+        );
+    }
+    if !cli.proxy && !cli.allow_globals.is_empty() {
+        bail!(
+            "--allow-globals is only valid together with --proxy; \
+             the tag-and-park mode has no relay to filter"
         );
     }
     Ok(())
@@ -138,7 +159,13 @@ fn run_proxy(cli: &Cli) -> Result<()> {
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
 
-    wlsctx::proxy::event_loop(&public, &tagged_path, None)?;
+    let policy = wlsctx::proxy::Policy::from_names(cli.allow_globals.clone());
+    if policy.is_active() {
+        info!("Global allowlist active: showing {} interface(s) to sandboxed clients", policy.allow_count());
+    } else {
+        info!("No global allowlist: pass-through (all globals shown)");
+    }
+    wlsctx::proxy::event_loop(&public, &tagged_path, &policy, None)?;
     info!("Shutting down.");
     Ok(())
 }

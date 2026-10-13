@@ -29,6 +29,19 @@
 //! addressed to the display, which pins the convention for that
 //! connection; two ends that disagree fail closed (see [`objects`]).
 //!
+//! ## Global allowlist (Phase 2)
+//!
+//! With an active [`policy::Policy`], the proxy filters the
+//! `wl_registry` traffic of each connection: `global` events for
+//! interfaces outside the allowlist are dropped (and so is the matching
+//! `global_remove`), and any `bind` of a name the client was never
+//! shown is answered with a synthetic `wl_display.error`
+//! (`invalid_object`) and the connection is torn down. This matters
+//! because a client can `bind` a global by name even if it never saw
+//! the announcement, so hiding the registry alone would not hide the
+//! object. With the default (inactive) policy the proxy is a pure
+//! pass-through.
+//!
 //! ## Fail-closed
 //!
 //! Every error path drops both ends of the affected connection (the
@@ -44,6 +57,7 @@
 
 pub mod interfaces;
 pub mod objects;
+pub mod policy;
 pub mod wire;
 
 /// `wayland-scanner` tables for the vendored wlroots protocol XMLs
@@ -72,9 +86,14 @@ use rustix::net::{
     recvmsg, send, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
 };
-use wayland_backend::protocol::{Argument, ArgumentType, Interface, MessageDesc};
+use std::collections::HashSet;
+use std::ffi::CString;
+
+use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message, MessageDesc};
+use wayland_client::protocol::__interfaces::WL_DISPLAY_INTERFACE;
 
 use self::objects::{BookkeepingError, Dir, ObjectTables};
+pub use self::policy::Policy;
 
 /// Max number of fds accepted in a single `recvmsg` (a Wayland message
 /// carries a handful; 28 matches wayland-backend's socket).
@@ -172,6 +191,32 @@ pub enum RelayEnd {
     Protocol(String),
 }
 
+/// What the global-allowlist interceptor does with one parsed message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ForwardAction {
+    /// Relay the original bytes to the peer (the default).
+    Forward,
+    /// Consume the message silently (a hidden global, or the matching
+    /// `global_remove` of one); the client never sees it.
+    Drop,
+}
+
+/// The per-connection global-allowlist interceptor state: the shared
+/// policy plus the set of globals the proxy has shown vs. hidden to
+/// this client (Phase 2).
+struct GlobalInterceptor {
+    /// The allowlist policy (shared, immutable across relays).
+    policy: Arc<Policy>,
+    /// Globals the compositor has announced that the proxy has *shown*
+    /// to the client (allowlisted). A `bind` of one of these is
+    /// forwarded; of anything else it is rejected.
+    shown: HashSet<u32>,
+    /// Globals the compositor has announced that the proxy has *hidden*
+    /// from the client (not allowlisted). Tracked so the matching
+    /// `global_remove` can be dropped (the client never saw it).
+    hidden: HashSet<u32>,
+}
+
 /// One app connection and its tagged upstream, relayed bidirectionally
 /// on the calling thread.
 struct Relay {
@@ -188,10 +233,11 @@ struct Relay {
     down_fds: VecDeque<OwnedFd>,
     up_fds: VecDeque<OwnedFd>,
     tables: ObjectTables,
+    g: GlobalInterceptor,
 }
 
 impl Relay {
-    fn new(down: UnixStream, up: UnixStream) -> Self {
+    fn new(down: UnixStream, up: UnixStream, policy: Arc<Policy>) -> Self {
         Self {
             down: ProxySocket::new(down),
             up: ProxySocket::new(up),
@@ -200,6 +246,11 @@ impl Relay {
             down_fds: VecDeque::new(),
             up_fds: VecDeque::new(),
             tables: ObjectTables::new(),
+            g: GlobalInterceptor {
+                policy,
+                shown: HashSet::new(),
+                hidden: HashSet::new(),
+            },
         }
     }
 
@@ -246,9 +297,9 @@ impl Relay {
     /// Read one chunk from the given direction and relay every complete
     /// message it yields to the other side.
     fn pump(&mut self, dir: Dir) -> Result<(), RelayEnd> {
-        let (sock, reassembled, fds, dst) = match dir {
-            Dir::ClientToServer => (&self.down, &mut self.down_buf, &mut self.down_fds, &self.up),
-            Dir::ServerToClient => (&self.up, &mut self.up_buf, &mut self.up_fds, &self.down),
+        let (sock, reassembled, fds) = match dir {
+            Dir::ClientToServer => (&self.down, &mut self.down_buf, &mut self.down_fds),
+            Dir::ServerToClient => (&self.up, &mut self.up_buf, &mut self.up_fds),
         };
         let mut chunk = [0u8; READ_SIZE];
         let n = sock.recv(&mut chunk, fds).map_err(RelayEnd::Io)?;
@@ -262,20 +313,32 @@ impl Relay {
                 None => return Ok(()),
             };
             let raw = &reassembled[..len];
-            Self::forward(&mut self.tables, dir, raw, fds, dst)?;
+            Self::forward(&mut self.tables, &mut self.g, dir, raw, fds, &self.down, &self.up)?;
             reassembled.drain(..len);
         }
     }
 
-    /// Parse, validate and bookkeep one complete message, then relay
-    /// its original bytes (with its fds) to the other side.
+    /// Parse, validate, bookkeep and — where the policy says to —
+    /// intercept one complete message, then relay its original bytes
+    /// (with its fds) to the other side.
+    ///
+    /// `down` is the app's socket and `up` the tagged upstream; the
+    /// ordinary destination is whichever end the message is headed for,
+    /// but the `wl_registry` interceptor may instead drop the message or
+    /// inject a synthetic `wl_display.error` back to the app.
     fn forward(
         tables: &mut ObjectTables,
+        g: &mut GlobalInterceptor,
         dir: Dir,
         raw: &[u8],
         src_fds: &mut VecDeque<OwnedFd>,
-        dst: &ProxySocket,
+        down: &ProxySocket,
+        up: &ProxySocket,
     ) -> Result<(), RelayEnd> {
+        let dst = match dir {
+            Dir::ClientToServer => up,
+            Dir::ServerToClient => down,
+        };
         if raw.len() < wire::HEADER_SIZE {
             return Err(RelayEnd::Protocol("message shorter than a header".into()));
         }
@@ -311,6 +374,98 @@ impl Relay {
             .apply(dir, &msg, desc, sender)
             .map_err(|e| RelayEnd::Protocol(e.to_string()))?;
 
+        // ---- Phase 2: the global-allowlist interceptor. ----
+        // Only `wl_registry` traffic is inspected; everything else is a
+        // straight pass-through. A hidden global is never announced to
+        // the client, so the only way it could be reached is a `bind`
+        // of a name the client was never shown — the proxy rejects that
+        // with a fatal `invalid_object` error instead of letting the
+        // compositor create the object by name.
+        let action = if sender.name != "wl_registry" {
+            ForwardAction::Forward
+        } else {
+            match (dir, desc.name) {
+                (Dir::ServerToClient, "global") => {
+                    let (name, iface) = match (&msg.args[0], &msg.args[1]) {
+                        (Argument::Uint(n), Argument::Str(Some(s))) => {
+                            (*n, s.to_string_lossy().into_owned())
+                        }
+                        _ => {
+                            return Err(RelayEnd::Protocol(
+                                "malformed wl_registry.global event".into(),
+                            ))
+                        }
+                    };
+                    if g.policy.allows(&iface) {
+                        g.shown.insert(name);
+                        ForwardAction::Forward
+                    } else {
+                        g.hidden.insert(name);
+                        debug!("hiding global {name} ({iface}) per the allowlist");
+                        ForwardAction::Drop
+                    }
+                }
+                (Dir::ServerToClient, "global_remove") => {
+                    let name = match &msg.args[0] {
+                        Argument::Uint(n) => *n,
+                        _ => {
+                            return Err(RelayEnd::Protocol(
+                                "malformed wl_registry.global_remove event".into(),
+                            ))
+                        }
+                    };
+                    if g.hidden.remove(&name) {
+                        // We hid it, so the client never saw the
+                        // announcement: the removal is unneeded.
+                        debug!("dropping global_remove {name} (the global was hidden)");
+                        ForwardAction::Drop
+                    } else {
+                        // Shown (the client must be told to drop its binding)
+                        // or a stray removal the client will ignore.
+                        g.shown.remove(&name);
+                        ForwardAction::Forward
+                    }
+                }
+                (Dir::ClientToServer, "bind") => {
+                    let name = match &msg.args[0] {
+                        Argument::Uint(n) => *n,
+                        _ => {
+                            return Err(RelayEnd::Protocol(
+                                "malformed wl_registry.bind request".into(),
+                            ))
+                        }
+                    };
+                    if g.shown.contains(&name) {
+                        ForwardAction::Forward
+                    } else {
+                        let what = format!(
+                            "wlsctx: bind of global {name} is blocked by the global allowlist"
+                        );
+                        let err = Self::display_error(tables, 0 /* invalid_object */, &what)?;
+                        let n = down.send(&err, &[]).map_err(RelayEnd::Io)?;
+                        if n != err.len() {
+                            return Err(RelayEnd::Protocol(
+                                "partial send of the injected wl_display.error".into(),
+                            ));
+                        }
+                        warn!("{what}");
+                        // The error is fatal: the app exits on it and the
+                        // relay tears down both ends.
+                        return Err(RelayEnd::Protocol(format!(
+                            "rejected the app's bind of non-allowlisted global {name}"
+                        )));
+                    }
+                }
+                _ => ForwardAction::Forward,
+            }
+        };
+
+        if matches!(action, ForwardAction::Drop) {
+            // `scratch` (any fds belonging to this message) is dropped
+            // with it here; nothing is forwarded to the peer.
+            return Ok(());
+        }
+
         // Forward the original bytes with the fds the parse consumed.
         let mut out_fds = Vec::with_capacity(msg.args.len());
         for a in &msg.args {
@@ -328,6 +483,43 @@ impl Relay {
             )));
         }
         Ok(())
+    }
+
+    /// Serialize a synthetic `wl_display.error` event addressed to this
+    /// connection's display object.
+    ///
+    /// The shape follows what a real compositor posts for a display-level
+    /// failure — both `libwayland` (`wl_resource_post_error(
+    /// display_resource, WL_DISPLAY_ERROR_*, …)`) and wayland-backend
+    /// (`Client::post_display_error`) emit it from the display object,
+    /// with the `object_id` argument also naming the display:
+    /// `error(object_id, code, message)`.
+    fn display_error(tables: &ObjectTables, code: u32, message: &str) -> Result<Vec<u8>, RelayEnd> {
+        let (opcode, desc) = WL_DISPLAY_INTERFACE
+            .events
+            .iter()
+            .enumerate()
+            .find(|(_, d)| d.name == "error")
+            .ok_or_else(|| RelayEnd::Protocol("no wl_display.error event in the protocol".into()))?;
+        let display_id = tables.display().unwrap_or(1);
+        let msg = Message {
+            sender_id: display_id,
+            opcode: opcode as u16,
+            args: vec![
+                Argument::Object(display_id),
+                Argument::Uint(code),
+                Argument::Str(Some(Box::new(
+                    CString::new(message)
+                        .map_err(|e| RelayEnd::Protocol(format!("bad error message: {e}")))?,
+                ))),
+            ]
+            .into(),
+        };
+        let mut buf = vec![0u8; 512];
+        let mut fds = Vec::new();
+        let n = wire::write_message(&msg, desc.signature, &mut buf, &mut fds)
+            .map_err(|e| RelayEnd::Protocol(e.to_string()))?;
+        Ok(buf[..n].to_vec())
     }
 }
 
@@ -387,7 +579,7 @@ pub fn bind_listener(path: &Path) -> io::Result<UnixListener> {
 /// The tagged connection is the one the compositor stamps with the
 /// security context; the app's own connection (on the public socket)
 /// carries none.
-fn spawn_relay(app: UnixStream, tagged_path: &Path) -> io::Result<()> {
+fn spawn_relay(app: UnixStream, tagged_path: &Path, policy: Arc<Policy>) -> io::Result<()> {
     let up = UnixStream::connect(tagged_path).map_err(|e| {
         io::Error::other(format!(
             "connecting to the tagged socket {tagged_path:?} failed: {e}"
@@ -399,7 +591,7 @@ fn spawn_relay(app: UnixStream, tagged_path: &Path) -> io::Result<()> {
             // Block the signalfd-bound mask so SIGTERM/SIGINT/SIGHUP
             // reach the main thread's signalfd, not this thread.
             let _ = proxy_signal_mask().thread_block();
-            let mut relay = Relay::new(app, up);
+            let mut relay = Relay::new(app, up, policy);
             let end = relay.run();
             match &end {
                 RelayEnd::Eof => debug!("relay closed: peer disconnected"),
@@ -424,8 +616,10 @@ fn spawn_relay(app: UnixStream, tagged_path: &Path) -> io::Result<()> {
 pub fn event_loop(
     public: &UnixListener,
     tagged_path: &Path,
+    policy: &Policy,
     stop: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
+    let policy = Arc::new(policy.clone());
     let sigfd = match stop {
         None => Some(setup_signalfd()?),
         Some(_) => None,
@@ -461,7 +655,7 @@ pub fn event_loop(
             } else {
                 match public.accept() {
                     Ok((stream, _)) => {
-                        if let Err(e) = spawn_relay(stream, tagged_path) {
+                        if let Err(e) = spawn_relay(stream, tagged_path, policy.clone()) {
                             warn!("dropping app connection: {e}");
                         }
                     }

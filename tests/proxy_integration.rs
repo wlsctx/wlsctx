@@ -382,7 +382,12 @@ fn relay_passes_messages_and_fds() {
     let proxy = thread::Builder::new()
         .name("wlsctx-proxy".into())
         .spawn(move || {
-            let _ = wlsctx::proxy::event_loop(&public, &tagged_for_proxy, Some(stop_proxy));
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                Some(stop_proxy),
+            );
         })
         .unwrap();
 

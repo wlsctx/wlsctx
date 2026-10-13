@@ -418,6 +418,14 @@ impl ObjectTables {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The connection's implicit `wl_display` object ID (0 for C peers,
+    /// 1 for Rust), once pinned by the first message; `None` before
+    /// that. Used to address synthesized `wl_display` events (the
+    /// interceptor's `wl_display.error`).
+    pub fn display(&self) -> Option<u32> {
+        self.display
+    }
 }
 
 #[cfg(test)]
