@@ -29,15 +29,18 @@
 # Optional clipboard receive-gate: set WLSCTX_CLIPBOARD_POLICY=deny
 # (default: allow) to stop sandboxed apps from reading selections
 # owned by sources they never created — i.e. data copied on the host
-# desktop. A foreign read is consumed silently: the app's fd stays
-# empty, so it sees an empty clipboard rather than the data. Reads
-# of the app's own selections are unaffected. The value reaches the
-# wlsctx process through the container environment, so a drop-in
-# that sets it should add Environment= lines to both [Service] and
-# [Container].
+# desktop. The gate covers both the clipboard (wl_data_device) and
+# the primary selection (wp_primary_selection_unstable_v1, the
+# X-style middle-click paste): a foreign read of either is consumed
+# silently, the app's fd stays empty and it sees an empty selection
+# rather than the data. Reads of the app's own selections are
+# unaffected. The value reaches the wlsctx process through the
+# container environment, so a drop-in that sets it should add
+# Environment= lines to both [Service] and [Container].
 #
 # Optional prompt broker (phase 4): with the gate in deny, dropped
-# foreign reads can be *asked about* instead of silently lost — the
+# foreign reads (of either selection) can be *asked about* instead
+# of silently lost — the
 # sidecar's proxy connects to the host-side broker (the
 # wlsctx-broker.socket / wlsctx-broker.service units, which notify
 # the user and wait for `wlsctx --decide`) and, on an allow, opens
