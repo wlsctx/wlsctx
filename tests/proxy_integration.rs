@@ -33,6 +33,15 @@
 //! `ClipboardPolicy::Allow` both reads reach the compositor and
 //! both memfds are filled.
 //!
+//! The primary-selection tests (Phase 5) run the same scenario on
+//! the `wp_primary_selection_unstable_v1` protocol: a fake
+//! compositor that speaks the zwp_* interfaces, and an app that
+//! copies and reads back its own primary selection, then reads the
+//! selection after the compositor switches it to a foreign (host
+//! desktop) source. The gate covers both protocols' `receive`
+//! requests, so the per-policy outcomes are identical to the
+//! clipboard tests'.
+//!
 //! The broker tests wire the deny gate to a broker (the Phase 4
 //! prompt broker): an auto-allow daemon makes the foreign read flow
 //! end to end, a counting stand-in that answers `deny` proves the
@@ -1333,6 +1342,540 @@ fn clipboard_allow_is_a_passthrough() {
 #[test]
 fn clipboard_deny_allows_own_readback_and_drops_foreign() {
     run_clipboard_session(wlsctx::proxy::ClipboardPolicy::Deny);
+}
+
+// ------------------------------------------------------------------------
+// Phase 5: primary selection (wp_primary_selection_unstable_v1)
+// ------------------------------------------------------------------------
+//
+// The same three-party scenario as the clipboard tests, on the
+// primary-selection protocol: a fake compositor that speaks the
+// zwp_* protocol, and an app that copies (its own primary
+// selection) and reads it back, then reads the selection after the
+// compositor switches it to a foreign (host-owned) source. The
+// receive-gate covers both protocols' `receive` requests (Phase 5),
+// so the outcomes must be identical to the clipboard tests' for each
+// policy.
+
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1 as cl_zps_mgr,
+    zwp_primary_selection_device_v1 as cl_zps_device,
+    zwp_primary_selection_offer_v1 as cl_zps_offer,
+    zwp_primary_selection_source_v1 as cl_zps_source,
+};
+use wayland_protocols::wp::primary_selection::zv1::server::{
+    zwp_primary_selection_device_manager_v1 as srv_zps_mgr,
+    zwp_primary_selection_device_v1 as srv_zps_device,
+    zwp_primary_selection_offer_v1 as srv_zps_offer,
+    zwp_primary_selection_source_v1 as srv_zps_source,
+};
+
+/// The primary-selection fake compositor: the [`Srv2`] twin on the
+/// zwp_* protocol. It answers `create_source`/`get_device`, echoes a
+/// `set_selection` with `data_offer` + `selection` (its own data),
+/// serves `receive` on its offers, and — after serving the own
+/// read-back — switches the selection to a synthetic foreign source
+/// the app never created.
+struct Srv3 {
+    /// `(origin tag, mime)` for every `receive` served.
+    received: Arc<Mutex<Vec<(String, String)>>>,
+    /// The foreign selection is announced only once.
+    foreign_announced: bool,
+    /// The app's `zwp_primary_selection_device_v1` (the foreign
+    /// selection is announced on it).
+    device: Option<srv_zps_device::ZwpPrimarySelectionDeviceV1>,
+    /// The current selection's offer (kept alive for the client).
+    current_offer: Option<srv_zps_offer::ZwpPrimarySelectionOfferV1>,
+}
+
+impl GlobalDispatch<srv_zps_mgr::ZwpPrimarySelectionDeviceManagerV1, ()> for Srv3 {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_zps_mgr::ZwpPrimarySelectionDeviceManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl GlobalDispatch<srv_wl_seat::WlSeat, ()> for Srv3 {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_wl_seat::WlSeat>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl ServerDispatch<srv_zps_mgr::ZwpPrimarySelectionDeviceManagerV1, ()> for Srv3 {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_zps_mgr::ZwpPrimarySelectionDeviceManagerV1,
+        request: srv_zps_mgr::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            srv_zps_mgr::Request::CreateSource { id } => {
+                data_init.init(id, ());
+            }
+            // The seat argument is only validated.
+            srv_zps_mgr::Request::GetDevice { id, .. } => {
+                data_init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ServerDispatch<srv_wl_seat::WlSeat, ()> for Srv3 {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_seat::WlSeat,
+        _request: srv_wl_seat::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+impl ServerDispatch<srv_zps_device::ZwpPrimarySelectionDeviceV1, ()> for Srv3 {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &srv_zps_device::ZwpPrimarySelectionDeviceV1,
+        request: srv_zps_device::Request,
+        _data: &(),
+        dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            // The app sets the primary selection to a source it
+            // created: echo it like a compositor (data_offer first,
+            // then the confirming selection).
+            srv_zps_device::Request::SetSelection { source: Some(_), .. } => {
+                state.device = Some(resource.clone());
+                let offer = client
+                    .create_resource::<
+                        srv_zps_offer::ZwpPrimarySelectionOfferV1,
+                        OfferState,
+                        Srv3,
+                    >(
+                        dhandle,
+                        1,
+                        OfferState {
+                            data: OWN_DATA.as_bytes().to_vec(),
+                            foreign: false,
+                        },
+                    )
+                    .expect("create the offer for the app's own primary selection");
+                state.current_offer = Some(offer.clone());
+                resource.data_offer(&offer);
+                resource.selection(Some(&offer));
+            }
+            srv_zps_device::Request::SetSelection { source: None, .. } => {
+                state.current_offer = None;
+                resource.selection(None);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ServerDispatch<srv_zps_source::ZwpPrimarySelectionSourceV1, ()> for Srv3 {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_zps_source::ZwpPrimarySelectionSourceV1,
+        _request: srv_zps_source::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+impl ServerDispatch<srv_zps_offer::ZwpPrimarySelectionOfferV1, OfferState> for Srv3 {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        _resource: &srv_zps_offer::ZwpPrimarySelectionOfferV1,
+        request: srv_zps_offer::Request,
+        data: &OfferState,
+        dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let srv_zps_offer::Request::Receive { mime_type, fd } = request {
+            let payload = data.data.clone();
+            let foreign = data.foreign;
+            let mut f = std::fs::File::from(fd);
+            f.write_all(&payload).expect("write the primary selection data");
+            drop(f);
+            state.received.lock().unwrap().push((
+                if foreign { "foreign" } else { "own" }.to_string(),
+                mime_type,
+            ));
+            // After serving the own read-back, simulate the host
+            // desktop changing the primary selection to a source the
+            // app never created.
+            if !foreign && !state.foreign_announced
+                && let Some(device) = &state.device
+            {
+                state.foreign_announced = true;
+                let offer = client
+                    .create_resource::<
+                        srv_zps_offer::ZwpPrimarySelectionOfferV1,
+                        OfferState,
+                        Srv3,
+                    >(
+                        dhandle,
+                        1,
+                        OfferState {
+                            data: FOREIGN_DATA.as_bytes().to_vec(),
+                            foreign: true,
+                        },
+                    )
+                    .expect("create the foreign primary offer");
+                state.current_offer = Some(offer.clone());
+                device.data_offer(&offer);
+                device.selection(Some(&offer));
+            }
+        }
+        // destroy: no-op.
+    }
+}
+
+/// The primary-selection fake compositor: listens on the tagged
+/// socket, advertises `zwp_primary_selection_device_manager_v1` (and
+/// `wl_seat`, which `get_device` requires), and serves `receive` on
+/// every offer it created.
+fn run_fake_primary_compositor(
+    tagged_path: PathBuf,
+    ready: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
+    received: Arc<Mutex<Vec<(String, String)>>>,
+) -> std::io::Result<()> {
+    let tagged = ListeningSocket::bind_absolute(tagged_path)
+        .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
+    let mut display = Display::<Srv3>::new()
+        .map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
+    let mut handle = display.handle();
+    handle.create_global::<Srv3, srv_zps_mgr::ZwpPrimarySelectionDeviceManagerV1, ()>(1, ());
+    handle.create_global::<Srv3, srv_wl_seat::WlSeat, ()>(10, ());
+    let mut state = Srv3 {
+        received,
+        foreign_announced: false,
+        device: None,
+        current_offer: None,
+    };
+    ready.store(true, Ordering::SeqCst);
+
+    loop {
+        while let Ok(Some(stream)) = tagged.accept() {
+            let data = Arc::new(ClientDataImpl { live: live.clone() });
+            handle.insert_client(stream, data)?;
+        }
+        display.dispatch_clients(&mut state)?;
+        display.flush_clients()?;
+        if stop.load(Ordering::SeqCst) && live.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The sandboxed app for the primary-selection tests: it puts its
+/// own data on the primary selection and reads it back, then — when
+/// the compositor switches the selection to a foreign source — reads
+/// that one too. Each read goes into its own memfd, so the test can
+/// inspect what the selection owner wrote (or didn't).
+struct PrimaryApp {
+    /// `(global name, interface, version)` from `wl_registry.global`.
+    globals: Vec<(u32, String, u32)>,
+    /// Read target for the own selection's read-back.
+    own_fd: OwnedFd,
+    /// Read target for the foreign selection's read.
+    foreign_fd: OwnedFd,
+    /// Set when the app called `receive` on the first selection.
+    own_received: Arc<AtomicBool>,
+    /// Set when the app called `receive` on the second one.
+    foreign_received: Arc<AtomicBool>,
+    /// How many non-NULL `selection` events arrived.
+    selections: u32,
+}
+
+impl Dispatch<cl_zps_device::ZwpPrimarySelectionDeviceV1, ()> for PrimaryApp {
+    fn event(
+        state: &mut Self,
+        _resource: &cl_zps_device::ZwpPrimarySelectionDeviceV1,
+        event: cl_zps_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let cl_zps_device::Event::Selection { id: Some(offer) } = event {
+            state.selections += 1;
+            if state.selections == 1 {
+                // The read-back of the app's own selection.
+                offer.receive("text/plain".into(), state.own_fd.as_fd());
+                state.own_received.store(true, Ordering::SeqCst);
+            } else {
+                // The foreign (host) selection: forwarded only under
+                // `Allow` (or inside an intent window); under
+                // `Deny` the gate consumes the request and this fd
+                // stays empty.
+                offer.receive("text/plain".into(), state.foreign_fd.as_fd());
+                state.foreign_received.store(true, Ordering::SeqCst);
+            }
+            offer.destroy();
+        }
+    }
+
+    // The `data_offer` event creates a `zwp_primary_selection_offer_v1`
+    // child; the user-data specialization has to be given explicitly.
+    wayland_client::event_created_child!(PrimaryApp, cl_zps_device::ZwpPrimarySelectionDeviceV1, [
+        cl_zps_device::EVT_DATA_OFFER_OPCODE => (cl_zps_offer::ZwpPrimarySelectionOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for PrimaryApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            state.globals.push((name, interface, version));
+        }
+    }
+}
+
+no_events!(
+    PrimaryApp,
+    cl_zps_mgr::ZwpPrimarySelectionDeviceManagerV1,
+    cl_zps_mgr::Event
+);
+no_events!(PrimaryApp, cl_zps_source::ZwpPrimarySelectionSourceV1, cl_zps_source::Event);
+no_events!(PrimaryApp, cl_zps_offer::ZwpPrimarySelectionOfferV1, cl_zps_offer::Event);
+no_events!(PrimaryApp, wl_seat::WlSeat, wl_seat::Event);
+
+/// One primary-selection session through the proxy: the app copies
+/// (its own selection) and then reads a foreign one. Returns the
+/// contents of the two memfds after the session.
+fn one_primary_session(
+    public_path: &Path,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let memfd = |name: &str| -> std::io::Result<OwnedFd> {
+        Ok(rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::empty())?)
+    };
+    let own_fd = memfd("wlsctx-test-own-primary")?;
+    let foreign_fd = memfd("wlsctx-test-foreign-primary")?;
+
+    let own_received = Arc::new(AtomicBool::new(false));
+    let foreign_received = Arc::new(AtomicBool::new(false));
+
+    let stream = UnixStream::connect(public_path)?;
+    let conn = Connection::from_socket(stream)?;
+    let mut app = PrimaryApp {
+        globals: Vec::new(),
+        own_fd,
+        foreign_fd,
+        own_received: own_received.clone(),
+        foreign_received: foreign_received.clone(),
+        selections: 0,
+    };
+    let mut eq = conn.new_event_queue::<PrimaryApp>();
+    let qh = eq.handle();
+    let display = conn.display();
+    let registry = display.get_registry(&qh, ());
+    eq.roundtrip(&mut app)?;
+
+    let psm_name = app
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "zwp_primary_selection_device_manager_v1")
+        .ok_or("no zwp_primary_selection_device_manager_v1 global in the registry")?
+        .0;
+    let seat_name = app
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_seat")
+        .ok_or("no wl_seat global in the registry")?
+        .0;
+
+    let psm = registry.bind::<cl_zps_mgr::ZwpPrimarySelectionDeviceManagerV1, (), PrimaryApp>(
+        psm_name, 1, &qh, (),
+    );
+    let seat = registry.bind::<wl_seat::WlSeat, (), PrimaryApp>(seat_name, 10, &qh, ());
+    let device = psm.get_device(&seat, &qh, ());
+
+    // The app copies: a new source offering text/plain becomes the
+    // primary selection. The compositor echoes it with a
+    // data_offer + selection pair, and the first `selection`
+    // handler does the read-back into `own_fd`.
+    let source = psm.create_source(&qh, ());
+    source.offer("text/plain".into());
+    device.set_selection(Some(&source), 0);
+
+    // Pump until the app has performed both reads.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        eq.blocking_dispatch(&mut app)?;
+        if app
+            .own_received
+            .load(Ordering::SeqCst)
+            && app.foreign_received.load(Ordering::SeqCst)
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "timed out: own={} foreign={} selections={}",
+                app.own_received.load(Ordering::SeqCst),
+                app.foreign_received.load(Ordering::SeqCst),
+                app.selections
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // Tear down (each destructor is answered by a `delete_id`, so the
+    // blocking read also surfaces any pending protocol error).
+    source.destroy();
+    device.destroy();
+    seat.release();
+    eq.blocking_dispatch(&mut app)?;
+    eq.dispatch_pending(&mut app)?;
+    assert!(
+        conn.protocol_error().is_none(),
+        "protocol error: {:?}",
+        conn.protocol_error()
+    );
+
+    let mut own = Vec::new();
+    let mut own_fd = std::fs::File::from(app.own_fd);
+    own_fd.seek(SeekFrom::Start(0))?;
+    own_fd.read_to_end(&mut own)?;
+    let mut foreign = Vec::new();
+    let mut foreign_fd = std::fs::File::from(app.foreign_fd);
+    foreign_fd.seek(SeekFrom::Start(0))?;
+    foreign_fd.read_to_end(&mut foreign)?;
+    Ok((own, foreign))
+}
+
+/// Run the whole three-party primary-selection scenario (compositor,
+/// proxy with `policy`, one app session) and assert the outcome.
+fn run_primary_session(policy: wlsctx::proxy::ClipboardPolicy) {
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                policy,
+                None,
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
+    let stop_comp = stop.clone();
+    let comp = thread::Builder::new()
+        .name("fake-primary-compositor".into())
+        .spawn(move || {
+            run_fake_primary_compositor(
+                tagged_path,
+                ready_c,
+                stop_comp,
+                live_c,
+                recv_c,
+            )
+        })
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    let (own, foreign) = one_primary_session(&public_path)
+        .expect("primary-selection session failed");
+
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = proxy.join();
+
+    match policy {
+        wlsctx::proxy::ClipboardPolicy::Allow => {
+            // Pass-through: both reads were served, from both origins.
+            assert_eq!(own, OWN_DATA.as_bytes(), "own read-back payload");
+            assert_eq!(foreign, FOREIGN_DATA.as_bytes(), "foreign payload");
+            assert_eq!(
+                *received.lock().unwrap(),
+                vec![
+                    ("own".to_string(), "text/plain".to_string()),
+                    ("foreign".to_string(), "text/plain".to_string()),
+                ],
+                "the compositor must have served both reads"
+            );
+        }
+        wlsctx::proxy::ClipboardPolicy::Deny => {
+            // The own read-back went through; the foreign read was
+            // consumed by the gate — the compositor never saw it, and
+            // the app's fd for it stayed empty.
+            assert_eq!(own, OWN_DATA.as_bytes(), "own read-back payload");
+            assert!(foreign.is_empty(), "foreign read must stay empty");
+            assert_eq!(
+                *received.lock().unwrap(),
+                vec![("own".to_string(), "text/plain".to_string())],
+                "the foreign receive never reached the compositor"
+            );
+        }
+    }
+
+    drop(dir);
+}
+
+#[test]
+fn primary_selection_allow_is_a_passthrough() {
+    run_primary_session(wlsctx::proxy::ClipboardPolicy::Allow);
+}
+
+#[test]
+fn primary_selection_deny_allows_own_readback_and_drops_foreign() {
+    run_primary_session(wlsctx::proxy::ClipboardPolicy::Deny);
 }
 
 /// Phase 4: the same three-party clipboard session, but with the
