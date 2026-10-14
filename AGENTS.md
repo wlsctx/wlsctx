@@ -7,8 +7,11 @@ the `wp_security_context_v1` protocol so the compositor identifies sandboxed
 clients; in the default mode B deployment it additionally runs a
 transparent protocol relay (`--proxy`) with an optional global allowlist
 and a clipboard/primary-selection receive-gate, plus an optional
-host-side consent broker (`--broker`). **README.md is the full
-architecture/threat-model doc — read it before non-trivial changes.**
+host-side broker (`--broker`) that serves both a consent prompt (dropped
+*reads*) and a fire-and-forget copy-out notification (app *writes*,
+`--notify-copy-out`). **README.md is the full architecture/threat-model
+doc — read it before non-trivial changes. TASKS.md tracks deferred work
+(the next item is the selection-audit log).**
 
 ## Layout
 
@@ -16,11 +19,17 @@ architecture/threat-model doc — read it before non-trivial changes.**
   lifecycle, and the `--broker` / `--decide` entry points
 - `src/lib.rs` — library modules: `proxy/` (the `--proxy` relay: wire
   parser, object bookkeeping, interface tables, global allowlist
-  policy, the selection receive-gate, the broker client), `broker.rs`
-  (the consent broker daemon)
+  policy, the selection receive-gate — which also *detects* app writes
+  via `ClipboardGate::writes_selection` — and the broker client),
+  `broker.rs` (the broker daemon: N-D-JSON, one consent
+  `clipboard-read` request/response *and* one one-way
+  `clipboard-write` notification per connection)
 - `tests/proxy_integration.rs` — three-party integration tests (fake
   compositor, real wayland-client, the relay): pass-through,
-  allowlist, clipboard, primary selection, broker
+  allowlist, clipboard, primary selection, broker consent, copy-out
+  notification
+- `TASKS.md` — deferred / follow-up tasks (next: the selection-audit
+  log; hooks are already in `forward`)
 - `scripts/gen_interface_table.py` — generates
   `src/proxy/interfaces.rs` and `src/proxy/wlr_tables.rs` from the
   protocol XMLs; do not hand-edit the generated files
@@ -60,6 +69,13 @@ architecture/threat-model doc — read it before non-trivial changes.**
 - The broker is a **host** user service (`systemd/user/`), not a
   quadlet: the scratch wlsctx image has no session bus, so a
   containerized broker could never notify the user.
+- The broker speaks N-D-JSON with **two request kinds** (both over the
+  same socket, dispatched on the line's `kind` field): `clipboard-read`
+  (request/response, the consent prompt — the daemon answers after the
+  user decides) and `clipboard-write` (one-way, Phase 6 — the daemon
+  fires `notify-send` and closes with no reply). The write notification
+  is fire-and-forget and fails open: the relay's `notify_write` uses a
+  2 s deadline and never blocks or alters the write.
 - Rust edition 2024; deps in Cargo.toml are pinned in Cargo.lock.
   wayland-backend 0.31.11, wayland-scanner 0.31.7,
   wayland-protocols 0.32.9 (features `client, staging, unstable`),

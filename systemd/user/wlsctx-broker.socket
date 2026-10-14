@@ -1,10 +1,13 @@
 # Socket-activated half of the prompt broker (Phase 4).
 #
 # Owns $XDG_RUNTIME_DIR/wlsctx-broker, the Unix stream socket a wlsctx
-# PROXY connects to (one connection, one request line, one answer
-# line) when its clipboard receive-gate drops a foreign read and wants
-# the user's consent. The activated service runs the broker itself
-# (see wlsctx-broker.service).
+# PROXY connects to. Each connection carries one N-D-JSON line of one
+# of two kinds (dispatched on the `kind` field): a `clipboard-read`
+# request/response (the gate dropped a foreign read and wants the
+# user's consent) or a one-way `clipboard-write` notification (the app
+# wrote to a selection; the broker notifies and never answers — Phase
+# 6). The activated service runs the broker itself (see
+# wlsctx-broker.service).
 #
 # The broker is a host-side, in-session service on purpose: it must
 # reach the session bus (notify-send) and must outlive any one

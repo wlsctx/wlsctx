@@ -55,6 +55,16 @@
 # The mount is only visible to this sidecar (each container gets its
 # own private %t tmpfs); the proxy's asks still fail closed if the
 # broker is stopped, so this is strictly opt-in.
+#
+# The same broker socket also carries the Phase 6 copy-out
+# notification: add
+#   Environment=WLSCTX_NOTIFY_COPY_OUT=true
+# to the drop-in (both [Service] and [Container]) to fire a desktop
+# notification each time a sandboxed app *writes* to the clipboard or
+# the primary selection (a set_selection) — the copy-out signal, since
+# that data is then reachable by every client on the desktop. It is
+# independent of the gate's policy (a write is always forwarded) and
+# fails open if the broker is down (the write is unaffected).
 [Unit]
 Description=Minimal Wayland security context manager
 StopWhenUnneeded=yes

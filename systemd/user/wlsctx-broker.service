@@ -1,5 +1,5 @@
-# Prompt broker (Phase 4): the host-side consent service for the
-# clipboard receive-gate.
+# Broker (Phase 4 consent prompt; Phase 6 copy-out notification): the
+# host-side service for the clipboard receive-gate.
 #
 # Runs in the user's desktop session (NOT in a container): it must
 # reach the session bus for notify-send and it must be the thing that
@@ -31,6 +31,12 @@
 # opens the gate for that burst); deny and every failure (missing
 # binary, lost bus, unreadable answer, timeout) answer a deny or are
 # dropped — the read never flows without a real, in-window allow.
+#
+# The second kind is one-way (`clipboard-write`, Phase 6, from
+# --notify-copy-out): the proxy fired it because the app wrote to the
+# clipboard or primary selection. The broker runs notify-send and
+# closes with no reply — no decision socket, no wait, no consent. It
+# is fire-and-forget: a lost notification never affects the write.
 #
 # WLSCTX_BROKER_TIMEOUT_MILLIS (default 30000) bounds the wait; the
 # same variable can be set here for a session-wide default.

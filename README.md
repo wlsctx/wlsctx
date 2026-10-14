@@ -150,12 +150,23 @@ The binary has four operating modes (the relay logic lives in
      Every failure path (broker down, timeout) is a drop. A `receive`
      whose fd is not an in-memory channel (memfd/pipe/socket) is a
      fatal protocol error in both policies.
+   - `--notify-copy-out` (requires `--broker-socket=<path>`) fires a
+     one-way desktop notification to the broker each time the app
+     *writes* to the clipboard or primary selection (a `set_selection`)
+     — the copy-*out* signal, since that data is now reachable by every
+     client on the desktop. Independent of the policy above (a write is
+     always forwarded); fire-and-forget and fail-open (a missing broker
+     only loses the notice, it never blocks or alters the write).
 3. **Prompt broker** (host user service, not a container):
    `--broker --socket-activation` (the `wlsctx-broker.socket` /
-   `.service` units): each dropped read arrives as one JSON line; the
-   broker announces it with a desktop notification, binds a private
-   decision socket, and waits (default 30 s; `--broker-timeout-millis`)
-   for the user's answer — a timeout is a deny.
+   `.service` units): each dropped read arrives as one JSON
+   `{"kind":"clipboard-read",…}` line; the broker announces it with a
+   desktop notification, binds a private decision socket, and waits
+   (default 30 s; `--broker-timeout-millis`) for the user's answer — a
+   timeout is a deny. It also serves one-way
+   `{"kind":"clipboard-write",…}` notifications (Phase 6, from
+   `--notify-copy-out`): it fires a desktop notification and closes
+   without replying.
 4. **One-shot decider**: `--decide --decision allow|deny` sends the
    answer to the most recent pending prompt (the broker's `latest`
    pointer); intended for a keybinding or a notification action.
@@ -298,9 +309,14 @@ broker is wired, explicitly approved by the user first.
   clipboard or primary selection (`set_selection`/`start_drag` are
   relayed), and the host desktop can then read it — an exfiltration
   channel into the selection, which anyone on the host can see.
-  Blocking it would break the app's own copy-and-paste, so it is
-  accepted: the clipboard is treated as shared scratch space, not a
-  secret boundary.
+  Blocking it would break the app's own copy-and-paste, so the write is
+  **not blocked**; instead it is made *visible*: with
+  `--notify-copy-out` (Phase 6) each write fires a desktop notification
+  naming the app and the selection. The clipboard is treated as shared
+  scratch space, not a secret boundary — the notification is a tripwire
+  (opt-in, fail-open), not a wall. A persistent, structured **audit
+  log** of all selection write/read traffic is the deferred follow-up
+  (see `TASKS.md`).
 - **The shared `downloads` volume.** Every app pod mounts the *same*
   `downloads` volume at `~/Downloads` (`noexec`). A compromised app can
   tamper with files another app will open or download later — apps in
@@ -353,10 +369,15 @@ system can reach it.
 
 ## Known gaps / WIP
 
-- The consent broker is wired by default in neither mode: it is
-  opt-in in both (a drop-in that bind-mounts the host's
-  `wlsctx-broker` socket into the relay container and sets
-  `WLSCTX_BROKER_SOCKET` — see the unit headers).
+- The broker is wired by default in neither mode: it is opt-in in both
+  (a drop-in that bind-mounts the host's `wlsctx-broker` socket into the
+  relay container and sets `WLSCTX_BROKER_SOCKET` — see the unit
+  headers). Both broker features ride on that one socket: the consent
+  prompt (`--clipboard-policy=deny`) and the copy-out notification
+  (`--notify-copy-out`, Phase 6) are each enabled independently.
+- The copy-out **audit log** (a structured, persistent record of every
+  selection write/read/clear the relay sees) is not implemented yet; the
+  hook points are in place and the design is in `TASKS.md` (Phase 9).
 - The at-spi proxy is **intentionally** in allow-nothing mode: its
   `--call`/`--broadcast` rules are commented out in `wl-dbus@.container`
   (marked there) and the `--sloppy-names` filter lets nothing through by
