@@ -54,24 +54,24 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
-    wl_data_offer, wl_data_source, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
+    wl_data_source, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_server::Dispatch as ServerDispatch;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use wayland_server::protocol::{
     wl_buffer as srv_wl_buffer, wl_compositor as srv_wl_compositor,
-    wl_data_device as srv_wl_data_device,
-    wl_data_device_manager as srv_wl_data_device_manager, wl_data_offer as srv_wl_data_offer,
-    wl_data_source as srv_wl_data_source, wl_seat as srv_wl_seat, wl_shm as srv_wl_shm,
-    wl_shm_pool as srv_wl_shm_pool, wl_surface as srv_wl_surface,
+    wl_data_device as srv_wl_data_device, wl_data_device_manager as srv_wl_data_device_manager,
+    wl_data_offer as srv_wl_data_offer, wl_data_source as srv_wl_data_source,
+    wl_seat as srv_wl_seat, wl_shm as srv_wl_shm, wl_shm_pool as srv_wl_shm_pool,
+    wl_surface as srv_wl_surface,
 };
-use wayland_server::Dispatch as ServerDispatch;
 use wayland_server::{
     Client, DataInit, Display, DisplayHandle, GlobalDispatch, ListeningSocket, New, Resource,
 };
@@ -247,11 +247,10 @@ fn run_fake_compositor(
 ) -> std::io::Result<()> {
     let tagged = ListeningSocket::bind_absolute(tagged_path)
         .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
-    let mut display = Display::<Srv>::new()
-        .map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
+    let mut display =
+        Display::<Srv>::new().map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
     let mut handle = display.handle();
-    let _comp_global =
-        handle.create_global::<Srv, srv_wl_compositor::WlCompositor, ()>(4, ());
+    let _comp_global = handle.create_global::<Srv, srv_wl_compositor::WlCompositor, ()>(4, ());
     let shm_global = handle.create_global::<Srv, srv_wl_shm::WlShm, ()>(2, ());
     let mut state = Srv { received };
     ready.store(true, Ordering::SeqCst);
@@ -299,7 +298,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             state.globals.push((name, interface, version));
         }
     }
@@ -332,7 +336,8 @@ macro_rules! no_events {
                 _data: &(),
                 _conn: &Connection,
                 _qh: &QueueHandle<Self>,
-            ) {}
+            ) {
+            }
         }
     };
 }
@@ -365,7 +370,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AllowlistApp {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            wl_registry::Event::Global { name, interface, version } => {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
                 state.globals.push((name, interface, version));
             }
             wl_registry::Event::GlobalRemove { name } => {
@@ -391,7 +400,11 @@ impl Dispatch<wl_callback::WlCallback, ()> for AllowlistApp {
     }
 }
 
-no_events!(AllowlistApp, wl_compositor::WlCompositor, wl_compositor::Event);
+no_events!(
+    AllowlistApp,
+    wl_compositor::WlCompositor,
+    wl_compositor::Event
+);
 no_events!(AllowlistApp, wl_shm::WlShm, wl_shm::Event);
 no_events!(AllowlistApp, wl_surface::WlSurface, wl_surface::Event);
 
@@ -413,7 +426,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Snooper {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             state.globals.push((name, interface, version));
         }
     }
@@ -421,7 +439,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Snooper {
 
 /// The `(wl_compositor name, wl_shm name)` pair as seen on the tagged
 /// socket.
-fn snooper_names(tagged_path: &Path) -> Result<(u32, u32), Box<dyn std::error::Error + Send + Sync>> {
+fn snooper_names(
+    tagged_path: &Path,
+) -> Result<(u32, u32), Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(tagged_path)?;
     let conn = Connection::from_socket(stream)?;
     let mut snooper = Snooper {
@@ -482,16 +502,14 @@ fn one_allowlist_session(
     );
     assert_eq!(app.globals[0].1, "wl_compositor");
     assert_eq!(
-        app.globals[0].0,
-        comp_name,
+        app.globals[0].0, comp_name,
         "the announced name must be the compositor's real name"
     );
 
     // (b) The allowlisted path still works end to end: the bound
     // object is usable, and `sync` gets its `done`.
-    let compositor = registry.bind::<wl_compositor::WlCompositor, (), AllowlistApp>(
-        comp_name, 4, &qh, (),
-    );
+    let compositor =
+        registry.bind::<wl_compositor::WlCompositor, (), AllowlistApp>(comp_name, 4, &qh, ());
     let surface = compositor.create_surface(&qh, ());
     let _callback = display.sync(&qh, ());
     eq.roundtrip(&mut app)?;
@@ -522,11 +540,7 @@ fn one_allowlist_session(
     let err = conn
         .protocol_error()
         .ok_or("no protocol error after the blocked bind")?;
-    assert_eq!(
-        err.code, 0,
-        "expected invalid_object (0), got {}",
-        err.code
-    );
+    assert_eq!(err.code, 0, "expected invalid_object (0), got {}", err.code);
     assert!(
         err.message.contains("allowlist"),
         "unexpected error message: {}",
@@ -563,9 +577,8 @@ fn one_app_session(public_path: &Path) -> Result<(), Box<dyn std::error::Error +
         .ok_or("no wl_shm global in the registry")?
         .0;
 
-    let compositor = registry.bind::<wl_compositor::WlCompositor, (), App>(
-        compositor_name, 4, &qh, (),
-    );
+    let compositor =
+        registry.bind::<wl_compositor::WlCompositor, (), App>(compositor_name, 4, &qh, ());
     let shm = registry.bind::<wl_shm::WlShm, (), App>(shm_name, 2, &qh, ());
     let surface = compositor.create_surface(&qh, ());
     let _callback = display.sync(&qh, ());
@@ -660,9 +673,7 @@ fn relay_passes_messages_and_fds() {
     let stop_comp = stop.clone();
     let comp = thread::Builder::new()
         .name("fake-compositor".into())
-        .spawn(move || {
-            run_fake_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c, None)
-        })
+        .spawn(move || run_fake_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c, None))
         .unwrap();
 
     wait_until(|| ready.load(Ordering::SeqCst), 10);
@@ -758,14 +769,8 @@ fn allowlist_hides_globals_and_rejects_their_binds() {
     // The sandboxed session: hidden global never announced, allowlisted
     // path works, hidden global_remove never delivered, bind of the
     // hidden name fatal.
-    one_allowlist_session(
-        &public_path,
-        comp_name,
-        shm_name,
-        remove_shm,
-        shm_removed,
-    )
-    .expect("allowlist session failed");
+    one_allowlist_session(&public_path, comp_name, shm_name, remove_shm, shm_removed)
+        .expect("allowlist session failed");
 
     // The relay was torn down after the fatal error: the compositor must
     // see its (upstream) connection go away.
@@ -857,7 +862,8 @@ impl ServerDispatch<srv_wl_data_device_manager::WlDataDeviceManager, ()> for Srv
         data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            srv_wl_data_device_manager::Request::CreateDataSource { id } => {                data_init.init(
+            srv_wl_data_device_manager::Request::CreateDataSource { id } => {
+                data_init.init(
                     id,
                     SourceState {
                         mime: std::sync::Mutex::new(None),
@@ -903,17 +909,12 @@ impl ServerDispatch<srv_wl_data_device::WlDataDevice, ()> for Srv2 {
             // compositor would (the `data_offer` first, then the
             // `selection` that confirms the change).
             srv_wl_data_device::Request::SetSelection {
-                source: Some(src),
-                ..
+                source: Some(src), ..
             } => {
                 state.device = Some(resource.clone());
                 let _ = src; // the offered mime is recorded, not needed here
                 let offer = client
-                    .create_resource::<
-                        srv_wl_data_offer::WlDataOffer,
-                        OfferState,
-                        Srv2,
-                    >(
+                    .create_resource::<srv_wl_data_offer::WlDataOffer, OfferState, Srv2>(
                         dhandle,
                         3,
                         OfferState {
@@ -948,8 +949,7 @@ impl ServerDispatch<srv_wl_data_source::WlDataSource, SourceState> for Srv2 {
     ) {
         // `offer` records the mime; `destroy`/`set_actions` are no-ops.
         if let srv_wl_data_source::Request::Offer { mime_type } = request {
-            *resource.data::<SourceState>().unwrap().mime.lock().unwrap() =
-                Some(mime_type);
+            *resource.data::<SourceState>().unwrap().mime.lock().unwrap() = Some(mime_type);
         }
     }
 }
@@ -981,16 +981,13 @@ impl ServerDispatch<srv_wl_data_offer::WlDataOffer, OfferState> for Srv2 {
             // Having served the app's read-back, simulate the host
             // desktop changing the clipboard: a new selection owned
             // by a source the app never created.
-            if !foreign && !state.foreign_announced
+            if !foreign
+                && !state.foreign_announced
                 && let Some(device) = &state.device
             {
                 state.foreign_announced = true;
                 let offer = client
-                    .create_resource::<
-                        srv_wl_data_offer::WlDataOffer,
-                        OfferState,
-                        Srv2,
-                    >(
+                    .create_resource::<srv_wl_data_offer::WlDataOffer, OfferState, Srv2>(
                         dhandle,
                         3,
                         OfferState {
@@ -1021,8 +1018,8 @@ fn run_fake_data_device_compositor(
 ) -> std::io::Result<()> {
     let tagged = ListeningSocket::bind_absolute(tagged_path)
         .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
-    let mut display = Display::<Srv2>::new()
-        .map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
+    let mut display =
+        Display::<Srv2>::new().map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
     let mut handle = display.handle();
     handle.create_global::<Srv2, srv_wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
     handle.create_global::<Srv2, srv_wl_seat::WlSeat, ()>(10, ());
@@ -1078,7 +1075,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClipboardApp {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             state.globals.push((name, interface, version));
         }
     }
@@ -1125,9 +1127,17 @@ no_events!(
     wl_data_device_manager::WlDataDeviceManager,
     wl_data_device_manager::Event
 );
-no_events!(ClipboardApp, wl_data_source::WlDataSource, wl_data_source::Event);
+no_events!(
+    ClipboardApp,
+    wl_data_source::WlDataSource,
+    wl_data_source::Event
+);
 no_events!(ClipboardApp, wl_seat::WlSeat, wl_seat::Event);
-no_events!(ClipboardApp, wl_data_offer::WlDataOffer, wl_data_offer::Event);
+no_events!(
+    ClipboardApp,
+    wl_data_offer::WlDataOffer,
+    wl_data_offer::Event
+);
 
 /// One clipboard session through the proxy: the app copies (its own
 /// selection) and then reads a foreign one. Returns the contents of
@@ -1136,7 +1146,10 @@ fn one_clipboard_session(
     public_path: &Path,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let memfd = |name: &str| -> std::io::Result<OwnedFd> {
-        Ok(rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::empty())?)
+        Ok(rustix::fs::memfd_create(
+            name,
+            rustix::fs::MemfdFlags::empty(),
+        )?)
     };
     let own_fd = memfd("wlsctx-test-own")?;
     let foreign_fd = memfd("wlsctx-test-foreign")?;
@@ -1174,7 +1187,10 @@ fn one_clipboard_session(
         .0;
 
     let ddm = registry.bind::<wl_data_device_manager::WlDataDeviceManager, (), ClipboardApp>(
-        ddm_name, 3, &qh, (),
+        ddm_name,
+        3,
+        &qh,
+        (),
     );
     let seat = registry.bind::<wl_seat::WlSeat, (), ClipboardApp>(seat_name, 10, &qh, ());
     let device = ddm.get_data_device(&seat, &qh, ());
@@ -1196,11 +1212,7 @@ fn one_clipboard_session(
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         eq.blocking_dispatch(&mut app)?;
-        if app
-            .own_received
-            .load(Ordering::SeqCst)
-            && app.foreign_received.load(Ordering::SeqCst)
-        {
+        if app.own_received.load(Ordering::SeqCst) && app.foreign_received.load(Ordering::SeqCst) {
             break;
         }
         if Instant::now() > deadline {
@@ -1280,20 +1292,13 @@ fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
     let comp = thread::Builder::new()
         .name("fake-compositor".into())
         .spawn(move || {
-            run_fake_data_device_compositor(
-                tagged_path,
-                ready_c,
-                stop_comp,
-                live_c,
-                recv_c,
-            )
+            run_fake_data_device_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c)
         })
         .unwrap();
 
     wait_until(|| ready.load(Ordering::SeqCst), 10);
 
-    let (own, foreign) = one_clipboard_session(&public_path)
-        .expect("clipboard session failed");
+    let (own, foreign) = one_clipboard_session(&public_path).expect("clipboard session failed");
 
     // The app disconnected before the shutdown, so the compositor's
     // view must settle to zero live clients before it exits.
@@ -1464,14 +1469,12 @@ impl ServerDispatch<srv_zps_device::ZwpPrimarySelectionDeviceV1, ()> for Srv3 {
             // The app sets the primary selection to a source it
             // created: echo it like a compositor (data_offer first,
             // then the confirming selection).
-            srv_zps_device::Request::SetSelection { source: Some(_), .. } => {
+            srv_zps_device::Request::SetSelection {
+                source: Some(_), ..
+            } => {
                 state.device = Some(resource.clone());
                 let offer = client
-                    .create_resource::<
-                        srv_zps_offer::ZwpPrimarySelectionOfferV1,
-                        OfferState,
-                        Srv3,
-                    >(
+                    .create_resource::<srv_zps_offer::ZwpPrimarySelectionOfferV1, OfferState, Srv3>(
                         dhandle,
                         1,
                         OfferState {
@@ -1520,7 +1523,8 @@ impl ServerDispatch<srv_zps_offer::ZwpPrimarySelectionOfferV1, OfferState> for S
             let payload = data.data.clone();
             let foreign = data.foreign;
             let mut f = std::fs::File::from(fd);
-            f.write_all(&payload).expect("write the primary selection data");
+            f.write_all(&payload)
+                .expect("write the primary selection data");
             drop(f);
             state.received.lock().unwrap().push((
                 if foreign { "foreign" } else { "own" }.to_string(),
@@ -1529,16 +1533,13 @@ impl ServerDispatch<srv_zps_offer::ZwpPrimarySelectionOfferV1, OfferState> for S
             // After serving the own read-back, simulate the host
             // desktop changing the primary selection to a source the
             // app never created.
-            if !foreign && !state.foreign_announced
+            if !foreign
+                && !state.foreign_announced
                 && let Some(device) = &state.device
             {
                 state.foreign_announced = true;
                 let offer = client
-                    .create_resource::<
-                        srv_zps_offer::ZwpPrimarySelectionOfferV1,
-                        OfferState,
-                        Srv3,
-                    >(
+                    .create_resource::<srv_zps_offer::ZwpPrimarySelectionOfferV1, OfferState, Srv3>(
                         dhandle,
                         1,
                         OfferState {
@@ -1569,8 +1570,8 @@ fn run_fake_primary_compositor(
 ) -> std::io::Result<()> {
     let tagged = ListeningSocket::bind_absolute(tagged_path)
         .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
-    let mut display = Display::<Srv3>::new()
-        .map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
+    let mut display =
+        Display::<Srv3>::new().map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
     let mut handle = display.handle();
     handle.create_global::<Srv3, srv_zps_mgr::ZwpPrimarySelectionDeviceManagerV1, ()>(1, ());
     handle.create_global::<Srv3, srv_wl_seat::WlSeat, ()>(10, ());
@@ -1659,7 +1660,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for PrimaryApp {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             state.globals.push((name, interface, version));
         }
     }
@@ -1670,8 +1676,16 @@ no_events!(
     cl_zps_mgr::ZwpPrimarySelectionDeviceManagerV1,
     cl_zps_mgr::Event
 );
-no_events!(PrimaryApp, cl_zps_source::ZwpPrimarySelectionSourceV1, cl_zps_source::Event);
-no_events!(PrimaryApp, cl_zps_offer::ZwpPrimarySelectionOfferV1, cl_zps_offer::Event);
+no_events!(
+    PrimaryApp,
+    cl_zps_source::ZwpPrimarySelectionSourceV1,
+    cl_zps_source::Event
+);
+no_events!(
+    PrimaryApp,
+    cl_zps_offer::ZwpPrimarySelectionOfferV1,
+    cl_zps_offer::Event
+);
 no_events!(PrimaryApp, wl_seat::WlSeat, wl_seat::Event);
 
 /// One primary-selection session through the proxy: the app copies
@@ -1681,7 +1695,10 @@ fn one_primary_session(
     public_path: &Path,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let memfd = |name: &str| -> std::io::Result<OwnedFd> {
-        Ok(rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::empty())?)
+        Ok(rustix::fs::memfd_create(
+            name,
+            rustix::fs::MemfdFlags::empty(),
+        )?)
     };
     let own_fd = memfd("wlsctx-test-own-primary")?;
     let foreign_fd = memfd("wlsctx-test-foreign-primary")?;
@@ -1719,7 +1736,10 @@ fn one_primary_session(
         .0;
 
     let psm = registry.bind::<cl_zps_mgr::ZwpPrimarySelectionDeviceManagerV1, (), PrimaryApp>(
-        psm_name, 1, &qh, (),
+        psm_name,
+        1,
+        &qh,
+        (),
     );
     let seat = registry.bind::<wl_seat::WlSeat, (), PrimaryApp>(seat_name, 10, &qh, ());
     let device = psm.get_device(&seat, &qh, ());
@@ -1736,11 +1756,7 @@ fn one_primary_session(
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         eq.blocking_dispatch(&mut app)?;
-        if app
-            .own_received
-            .load(Ordering::SeqCst)
-            && app.foreign_received.load(Ordering::SeqCst)
-        {
+        if app.own_received.load(Ordering::SeqCst) && app.foreign_received.load(Ordering::SeqCst) {
             break;
         }
         if Instant::now() > deadline {
@@ -1816,21 +1832,13 @@ fn run_primary_session(policy: wlsctx::proxy::ClipboardPolicy) {
     let stop_comp = stop.clone();
     let comp = thread::Builder::new()
         .name("fake-primary-compositor".into())
-        .spawn(move || {
-            run_fake_primary_compositor(
-                tagged_path,
-                ready_c,
-                stop_comp,
-                live_c,
-                recv_c,
-            )
-        })
+        .spawn(move || run_fake_primary_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c))
         .unwrap();
 
     wait_until(|| ready.load(Ordering::SeqCst), 10);
 
-    let (own, foreign) = one_primary_session(&public_path)
-        .expect("primary-selection session failed");
+    let (own, foreign) =
+        one_primary_session(&public_path).expect("primary-selection session failed");
 
     wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
     stop.store(true, Ordering::SeqCst);
@@ -1938,6 +1946,9 @@ fn run_broker_session(outcome: BrokerOutcome) {
                     _ => Duration::from_secs(10),
                 },
                 window: Duration::from_millis(1500),
+                // This test exercises the consent (read) flow only;
+                // the Phase 6 copy-out notification has its own test.
+                notify_copy_out: false,
             };
             let _ = wlsctx::proxy::event_loop(
                 &public,
@@ -1955,13 +1966,7 @@ fn run_broker_session(outcome: BrokerOutcome) {
     let comp = thread::Builder::new()
         .name("fake-compositor".into())
         .spawn(move || {
-            run_fake_data_device_compositor(
-                tagged_path,
-                ready_c,
-                stop_comp,
-                live_c,
-                recv_c,
-            )
+            run_fake_data_device_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c)
         })
         .unwrap();
 
@@ -1999,11 +2004,10 @@ fn run_broker_session(outcome: BrokerOutcome) {
                     // moot (the decision is gone over there) but
                     // proves the stand-in behaved like a slow user.
                     thread::sleep(Duration::from_secs(2));
-                    let line =
-                        wlsctx::broker::encode_decision(&wlsctx::broker::Decision::Allow {
-                            window_ms: wlsctx::broker::INTENT_WINDOW_MS,
-                        })
-                        .unwrap();
+                    let line = wlsctx::broker::encode_decision(&wlsctx::broker::Decision::Allow {
+                        window_ms: wlsctx::broker::INTENT_WINDOW_MS,
+                    })
+                    .unwrap();
                     let _ = stream.write_all(line.as_bytes());
                 }
             }
@@ -2079,6 +2083,160 @@ fn broker_auto_deny_stays_dropped_and_is_consulted() {
 #[test]
 fn broker_timeout_fails_closed() {
     run_broker_session(BrokerOutcome::Timeout);
+}
+
+/// Phase 6: the copy-out notification. The same three-party clipboard
+/// session, but the proxy has a copy-out notifier wired to a stand-in
+/// broker. When the app sets its own selection (a `set_selection`),
+/// the relay (1) forwards the write to the compositor — the read-back
+/// works, proving the notification never blocks or alters the write —
+/// and (2) fires a one-way `clipboard-write` line at the broker. The
+/// stand-in records the line and (like the daemon) never answers.
+///
+/// Two outcomes:
+/// * reachable — the stand-in receives exactly one notification with
+///   the app's identity and the `clipboard` selection.
+/// * unreachable — no broker is bound; the notify fails and the
+///   session still completes (fail-open).
+fn run_copy_out_session(broker_reachable: bool) {
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+    let broker_path = dir.path().join("broker.sock");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let notifications: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let broker_for_proxy = broker_path.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            let broker_cfg = wlsctx::proxy::BrokerConfig {
+                socket: broker_for_proxy,
+                app: "testapp".into(),
+                instance: "inst".into(),
+                notify_copy_out: true,
+                ..Default::default()
+            };
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                wlsctx::proxy::ClipboardPolicy::Allow,
+                Some(broker_cfg),
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
+    let stop_comp = stop.clone();
+    let comp = thread::Builder::new()
+        .name("fake-compositor".into())
+        .spawn(move || {
+            run_fake_data_device_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c)
+        })
+        .unwrap();
+
+    // The stand-in broker: a non-blocking accept loop that reads each
+    // notification line, records it, and never answers (fire-and-forget
+    // — the daemon's `handle_write` behaves the same way).
+    let (notifs_c, broker_c, stop_b) = (notifications.clone(), broker_path.clone(), stop.clone());
+    let broker = thread::Builder::new()
+        .name("broker".into())
+        .spawn(move || {
+            if !broker_reachable {
+                // No listener is bound: the socket file never exists,
+                // so the proxy's connect fails (the fail-open path).
+                thread::sleep(Duration::from_secs(1));
+                return;
+            }
+            let listener = wlsctx::broker::bind_listener(&broker_c).unwrap();
+            let _ = listener.set_nonblocking(true);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut line = String::new();
+                        if wlsctx::broker::read_line(&mut stream, &mut line).is_ok()
+                            && !line.is_empty()
+                            && let Ok(note) = wlsctx::broker::decode_notification(&line)
+                        {
+                            notifs_c.lock().unwrap().push((
+                                note.app,
+                                note.instance,
+                                note.selection,
+                            ));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop_b.load(Ordering::SeqCst) || Instant::now() > deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    let (own, _foreign) =
+        one_clipboard_session(&public_path).expect("clipboard session (copy-out) failed");
+
+    // The app disconnected; let the compositor's view settle.
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = broker.join();
+    let _ = proxy.join();
+
+    // The write is always forwarded: the own read-back always works,
+    // regardless of whether the notification reached a broker.
+    assert_eq!(own, OWN_DATA.as_bytes(), "own read-back payload");
+
+    if broker_reachable {
+        let n = notifications.lock().unwrap();
+        assert_eq!(
+            *n,
+            vec![(
+                "testapp".to_string(),
+                "inst".to_string(),
+                "clipboard".to_string()
+            )],
+            "the app's single set_selection fired exactly one copy-out notification"
+        );
+    } else {
+        assert!(
+            notifications.lock().unwrap().is_empty(),
+            "no broker means no recorded notification — but the write still went through"
+        );
+    }
+
+    drop(dir);
+}
+
+#[test]
+fn copy_out_write_fires_a_notification() {
+    run_copy_out_session(true);
+}
+
+#[test]
+fn copy_out_fail_open_when_no_broker() {
+    run_copy_out_session(false);
 }
 
 fn wait_until(pred: impl Fn() -> bool, secs: u64) {
