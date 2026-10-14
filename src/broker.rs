@@ -31,6 +31,19 @@
 //!   `{"decision":"allow","window_ms":1500}` or
 //!   `{"decision":"deny","reason":"…"}` and closes the connection.
 //!
+//! A second kind is **one-way**: when a sandboxed app *writes* to the
+//! clipboard or the primary selection (a `set_selection`), the proxy
+//! connects and sends
+//! `{"v":1,"kind":"clipboard-write","app":"…","instance":"…","selection":"…"}`.
+//! The broker fires a desktop notification (`notify-send`) and closes
+//! the connection **without a reply**. The notification is
+//! fire-and-forget and **fails open**: a missing or busy broker simply
+//! loses the notice; the write itself is never altered or delayed.
+//! This is the copy-*out* signal — the data the app just placed is now
+//! reachable by every client on the desktop (the consent flow above
+//! covers the copy-*in* direction). See Phase 6 in the README threat
+//! model.
+//!
 //! On an allow, the proxy opens the gate's *intent window*
 //! ([`crate::proxy::clipboard::ClipboardGate::unlock`] with the
 //! `window_ms` from the response, 1500 ms by default): this read, and
@@ -50,7 +63,7 @@ use std::process;
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
-use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use serde::{Deserialize, Serialize};
 
 /// The broker's default wait for the user's decision.
@@ -58,8 +71,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The intent window the broker offers on an allow (milliseconds):
 /// what the proxy passes to [`crate::proxy::clipboard::ClipboardGate::unlock`].
 pub const INTENT_WINDOW_MS: u64 = 1500;
-/// The only request kind the proxy sends (room to grow).
+/// The consent request kind: the proxy asks about a dropped foreign
+/// read (request/response; the broker prompts the user and answers).
 pub const REQUEST_KIND: &str = "clipboard-read";
+/// The copy-out notification kind (Phase 6): the app wrote to a
+/// selection (one-way; the broker notifies and never answers).
+pub const NOTIFY_KIND: &str = "clipboard-write";
 /// The protocol version in every line (both directions).
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -90,6 +107,27 @@ fn default_selection() -> String {
     "clipboard".into()
 }
 
+/// A one-way notification from the proxy (Phase 6): the app behind it
+/// just wrote to a selection, so its data is now reachable by every
+/// client on the desktop (a copy-*out*). The broker announces this to
+/// the desktop and closes the connection without replying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardWrite {
+    /// The protocol version (currently 1).
+    pub v: u8,
+    /// The notification kind ([`NOTIFY_KIND`]).
+    pub kind: String,
+    /// The app ID from the sandbox's security context.
+    pub app: String,
+    /// The instance ID from the sandbox's security context.
+    pub instance: String,
+    /// Which selection the app wrote: `"clipboard"` (the stable
+    /// selection) or `"primary"` (the X-style primary selection).
+    /// Optional on the wire; reads as `"clipboard"` when absent.
+    #[serde(default = "default_selection")]
+    pub selection: String,
+}
+
 /// The broker's answer to the proxy: allow the read (opening an
 /// intent window of `window_ms`) or drop it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,16 +152,14 @@ pub enum UserDecision {
 fn encode<T: Serialize>(msg: &T) -> io::Result<String> {
     Ok(format!(
         "{}\n",
-        serde_json::to_string(msg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        serde_json::to_string(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     ))
 }
 
 /// Decode one wire line (a newline is optional in input; the
 /// `Decision`/`UserDecision` tags must be the given value).
 fn decode<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T, String> {
-    serde_json::from_str(line.trim())
-        .map_err(|e| format!("malformed line {line:?}: {e}"))
+    serde_json::from_str(line.trim()).map_err(|e| format!("malformed line {line:?}: {e}"))
 }
 
 /// Encode a request line (the proxy → broker direction).
@@ -144,6 +180,42 @@ pub fn decode_request(line: &str) -> Result<ClipboardRead, String> {
         return Err(format!("unknown request kind {:?}", req.kind));
     }
     Ok(req)
+}
+
+/// Encode a copy-out notification line (the proxy → broker direction,
+/// Phase 6). Like a request, but the broker never answers it.
+pub fn encode_notification(note: &ClipboardWrite) -> io::Result<String> {
+    encode(note)
+}
+
+/// Decode a copy-out notification line; the version and kind must
+/// match.
+pub fn decode_notification(line: &str) -> Result<ClipboardWrite, String> {
+    let note = decode::<ClipboardWrite>(line)?;
+    if note.v != PROTOCOL_VERSION {
+        return Err(format!(
+            "unsupported protocol version {} (the broker speaks {PROTOCOL_VERSION})",
+            note.v
+        ));
+    }
+    if note.kind != NOTIFY_KIND {
+        return Err(format!("unknown notification kind {:?}", note.kind));
+    }
+    Ok(note)
+}
+
+/// The minimal envelope the daemon sniffs to decide the handling path
+/// before committing to a full decode (the `kind` is the only field it
+/// needs; version and the rest are re-validated by the per-kind
+/// decoders).
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    kind: String,
+}
+
+/// Decode just the `kind` of a wire line, for dispatch.
+fn decode_envelope(line: &str) -> Result<Envelope, String> {
+    decode::<Envelope>(line)
 }
 
 /// Encode a decision line (the broker → proxy direction).
@@ -238,7 +310,7 @@ pub fn bind_listener(path: &Path) -> io::Result<UnixListener> {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("{path:?} already exists and is not a socket"),
-            ))
+            ));
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -282,9 +354,9 @@ pub fn run(args: &BrokerArgs, listener: UnixListener) -> io::Result<()> {
         args.timeout.as_millis()
     );
     loop {
-        let (stream, addr) = listener.accept().map_err(|e| {
-            io::Error::other(format!("accepting on the broker socket failed: {e}"))
-        })?;
+        let (stream, addr) = listener
+            .accept()
+            .map_err(|e| io::Error::other(format!("accepting on the broker socket failed: {e}")))?;
         let _ = stream.set_read_timeout(Some(args.timeout));
         info!("broker request from {addr:?}");
         handle_connection(stream, args);
@@ -295,29 +367,63 @@ pub fn run(args: &BrokerArgs, listener: UnixListener) -> io::Result<()> {
 /// broker: a bad request gets a `deny` answer, a dead proxy a
 /// dropped reply, and the loop continues. Public so that tests can
 /// drive the daemon's per-connection path without its accept loop.
+///
+/// The line's `kind` decides the handling path: a *consent request*
+/// (`clipboard-read`) is answered (the connection stays open until the
+/// decision) and a *copy-out notification* (`clipboard-write`) fires a
+/// desktop notification and closes with no reply.
 pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs) {
     let mut line = String::new();
     if read_line(&mut stream, &mut line).is_err() || line.is_empty() {
         warn!("broker: the request connection closed before a line; ignoring");
         return;
     }
-    let req = match decode_request(&line) {
-        Ok(req) => req,
+    let kind = match decode_envelope(&line) {
+        Ok(env) => env.kind,
         Err(e) => {
             warn!("broker: rejecting the request: {e}");
-            if let Ok(answer) =
-                encode_decision(&Decision::Deny {
-                    reason: "protocol".into(),
-                })
-            {
-                let _ = stream.write_all(answer.as_bytes());
-            }
+            deny_reply(&mut stream, "protocol");
             return;
         }
     };
+    match kind.as_str() {
+        REQUEST_KIND => {
+            let req = match decode_request(&line) {
+                Ok(req) => req,
+                Err(e) => {
+                    warn!("broker: rejecting the request: {e}");
+                    deny_reply(&mut stream, "protocol");
+                    return;
+                }
+            };
+            handle_read(&mut stream, &req, args);
+        }
+        // One-way: fire the notification, close, no reply.
+        NOTIFY_KIND => {
+            let note = match decode_notification(&line) {
+                Ok(note) => note,
+                Err(e) => {
+                    warn!("broker: dropping the notification: {e}");
+                    return;
+                }
+            };
+            handle_write(&note);
+        }
+        _ => {
+            warn!("broker: unknown request kind {kind:?}");
+            deny_reply(&mut stream, "unknown-kind");
+        }
+    }
+}
+
+/// The consent path (a `clipboard-read` request): decide, then answer.
+fn handle_read(stream: &mut UnixStream, req: &ClipboardRead, args: &BrokerArgs) {
     info!(
         "consent request: app {}/{} wants to read the {} (`{}`; its own reads were never asked about)",
-        req.app, req.instance, selection_name(&req.selection), req.mime
+        req.app,
+        req.instance,
+        selection_name(&req.selection),
+        req.mime
     );
 
     let decision = match args.auto_decide {
@@ -327,7 +433,7 @@ pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs) {
         Some(AutoDecide::Deny) => Decision::Deny {
             reason: "auto".into(),
         },
-        None => decide_interactive(&req, args),
+        None => decide_interactive(req, args),
     };
 
     let answered = match encode_decision(&decision) {
@@ -337,13 +443,40 @@ pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs) {
     if !answered {
         // The proxy gave up on us (its own deadline expired): the
         // decision is moot, the read was dropped over there.
-        warn!("broker: the request connection is gone; the {} decision is moot", decision_reason(&decision));
+        warn!(
+            "broker: the request connection is gone; the {} decision is moot",
+            decision_reason(&decision)
+        );
     } else {
         info!(
             "clipboard consent: {} ({})",
             decision_reason(&decision),
             decision_detail(&decision)
         );
+    }
+}
+
+/// The copy-out path (a `clipboard-write` notification, Phase 6):
+/// announce the write to the desktop. One-way — no decision, no
+/// intent window, no reply. Fire-and-forget: a missing `notify-send`
+/// or an unreachable session bus just loses the notice.
+fn handle_write(note: &ClipboardWrite) {
+    info!(
+        "copy-out notification: app {}/{} wrote to the {}",
+        note.app,
+        note.instance,
+        selection_name(&note.selection)
+    );
+    announce_write(note);
+}
+
+/// A `deny` reply to a request-shaped line (the only reply such a
+/// line can receive; a notification gets none).
+fn deny_reply(stream: &mut UnixStream, reason: &str) {
+    if let Ok(answer) = encode_decision(&Decision::Deny {
+        reason: reason.to_string(),
+    }) {
+        let _ = stream.write_all(answer.as_bytes());
     }
 }
 
@@ -365,7 +498,9 @@ fn decision_detail(d: &Decision) -> String {
 /// the user's answer on a private decision socket, map it to a
 /// [`Decision`] (a timeout is a deny).
 fn decide_interactive(req: &ClipboardRead, args: &BrokerArgs) -> Decision {
-    let path = args.runtime_dir.join(format!("broker-{}.sock", process::id()));
+    let path = args
+        .runtime_dir
+        .join(format!("broker-{}.sock", process::id()));
     let listener = match bind_decision_socket(&path) {
         Ok(l) => l,
         Err(e) => {
@@ -408,28 +543,30 @@ fn decide_interactive(req: &ClipboardRead, args: &BrokerArgs) -> Decision {
                 break None;
             }
             Ok(0) => break None, // timeout: the user did not answer
-            Ok(_) => break match listener.accept() {
-                Err(e) => {
-                    warn!("broker: accepting the decision failed: {e}");
-                    None
-                }
-                Ok((mut stream, _)) => {
-                    let mut line = String::new();
-                    let _ = stream.set_read_timeout(Some(args.timeout));
-                    if read_line(&mut stream, &mut line).is_err() || line.is_empty() {
-                        warn!("broker: the decision connection closed without a line");
+            Ok(_) => {
+                break match listener.accept() {
+                    Err(e) => {
+                        warn!("broker: accepting the decision failed: {e}");
                         None
-                    } else {
-                        match decode_user_decision(&line) {
-                            Ok(d) => Some(d),
-                            Err(e) => {
-                                warn!("broker: rejecting the decision: {e}");
-                                None
+                    }
+                    Ok((mut stream, _)) => {
+                        let mut line = String::new();
+                        let _ = stream.set_read_timeout(Some(args.timeout));
+                        if read_line(&mut stream, &mut line).is_err() || line.is_empty() {
+                            warn!("broker: the decision connection closed without a line");
+                            None
+                        } else {
+                            match decode_user_decision(&line) {
+                                Ok(d) => Some(d),
+                                Err(e) => {
+                                    warn!("broker: rejecting the decision: {e}");
+                                    None
+                                }
                             }
                         }
                     }
-                }
-            },
+                };
+            }
         }
     };
     // The decision socket is one-shot; leave the file for the
@@ -459,7 +596,7 @@ fn bind_decision_socket(path: &Path) -> io::Result<UnixListener> {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("{path:?} exists and is not a socket"),
-            ))
+            ));
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -500,9 +637,31 @@ fn announce(req: &ClipboardRead, decision_path: &Path) {
         .spawn()
     {
         Ok(_) => {}
-        Err(e) => warn!(
-            "notify-send failed ({e}); the prompt is on the decision socket only"
-        ),
+        Err(e) => warn!("notify-send failed ({e}); the prompt is on the decision socket only"),
+    }
+}
+
+/// Tell the desktop that a sandboxed app just wrote to a selection
+/// (Phase 6, copy-*out*). Fire-and-forget: a missing `notify-send` or
+/// an unreachable session bus simply loses the notice; the write
+/// itself is unaffected (it never waited on this).
+fn announce_write(note: &ClipboardWrite) {
+    let summary = "wlsctx: clipboard write (copy-out)";
+    let body = format!(
+        "The sandboxed app {}/{} just placed data on your {}.\n\
+         (copy-out only — it was not asked to read anything from the host)",
+        note.app,
+        note.instance,
+        selection_name(&note.selection)
+    );
+    match process::Command::new("notify-send")
+        .args(["--app-name", "wlsctx", summary, &body])
+        .spawn()
+    {
+        Ok(_) => {}
+        Err(e) => {
+            warn!("notify-send failed ({e}); the copy-out notice is lost (the write is unaffected)")
+        }
     }
 }
 
@@ -533,7 +692,8 @@ mod tests {
     fn request_without_selection_field_defaults_to_clipboard() {
         // An older peer (pre-Phase-5) does not send the field: the
         // decode must still succeed and read as the plain clipboard.
-        let line = r#"{"v":1,"kind":"clipboard-read","app":"a","instance":"i","mime":"text/plain"}"#;
+        let line =
+            r#"{"v":1,"kind":"clipboard-read","app":"a","instance":"i","mime":"text/plain"}"#;
         let r = decode_request(line).unwrap();
         assert_eq!(r.selection, "clipboard");
     }
@@ -548,9 +708,66 @@ mod tests {
         assert!(decode_request(&encode_request(&r).unwrap()).is_err());
     }
 
+    fn sample_notification() -> ClipboardWrite {
+        ClipboardWrite {
+            v: PROTOCOL_VERSION,
+            kind: NOTIFY_KIND.to_string(),
+            app: "jetbrains".into(),
+            instance: "rustrover".into(),
+            selection: "primary".into(),
+        }
+    }
+
+    #[test]
+    fn notification_roundtrip() {
+        let n = sample_notification();
+        let line = encode_notification(&n).unwrap();
+        assert!(line.ends_with('\n'));
+        assert_eq!(decode_notification(&line).unwrap(), n);
+    }
+
+    #[test]
+    fn notification_without_selection_defaults_to_clipboard() {
+        let line = r#"{"v":1,"kind":"clipboard-write","app":"a","instance":"i"}"#;
+        let n = decode_notification(line).unwrap();
+        assert_eq!(n.selection, "clipboard");
+    }
+
+    #[test]
+    fn notification_rejects_other_kinds_and_versions() {
+        let mut n = sample_notification();
+        n.v = 2;
+        assert!(decode_notification(&encode_notification(&n).unwrap()).is_err());
+        let mut n = sample_notification();
+        n.kind = "clipboard-read".into();
+        assert!(decode_notification(&encode_notification(&n).unwrap()).is_err());
+    }
+
+    #[test]
+    fn envelope_sniffs_the_kind() {
+        // The daemon sniffs the kind before a full decode; both kinds
+        // carry a `kind` field, so the envelope is enough to dispatch.
+        assert_eq!(
+            decode_envelope(&encode_request(&sample_request()).unwrap())
+                .unwrap()
+                .kind,
+            REQUEST_KIND
+        );
+        assert_eq!(
+            decode_envelope(&encode_notification(&sample_notification()).unwrap())
+                .unwrap()
+                .kind,
+            NOTIFY_KIND
+        );
+        // A line with no `kind` field cannot be dispatched.
+        assert!(decode_envelope(r#"{"v":1}"#).is_err());
+    }
+
     #[test]
     fn decision_roundtrip() {
-        let a = Decision::Allow { window_ms: INTENT_WINDOW_MS };
+        let a = Decision::Allow {
+            window_ms: INTENT_WINDOW_MS,
+        };
         let d = Decision::Deny {
             reason: "timeout".into(),
         };
@@ -574,6 +791,40 @@ mod tests {
             r#"{"decision":"deny"}"#
         );
         assert!(decode_user_decision("nonsense").is_err());
+    }
+
+    /// A `clipboard-write` line through the daemon's real per-connection
+    /// path (`handle_connection`): it must be handled without error and
+    /// produce **no reply** (the notification is one-way; the stream
+    /// closes with no decision line).
+    #[test]
+    fn handle_connection_serves_a_notification_without_a_reply() {
+        use std::io::Read as _;
+
+        let (mut client, broker_end) = UnixStream::pair().unwrap();
+        client
+            .write_all(
+                encode_notification(&sample_notification())
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        // A notification never touches the runtime dir (no decision
+        // socket); the args here are inert for this path.
+        let args = BrokerArgs {
+            runtime_dir: std::env::temp_dir().join("wlsctx-broker-nt-test"),
+            auto_decide: None,
+            timeout: Duration::from_secs(1),
+        };
+        handle_connection(broker_end, &args);
+
+        // The client must see a clean EOF, not a decision line.
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert!(
+            reply.trim().is_empty(),
+            "a notification must not produce a reply, got: {reply:?}"
+        );
     }
 
     #[test]

@@ -14,8 +14,15 @@
 //!
 //! The ask blocks the relay thread for up to [`BrokerConfig::timeout`]
 //! (default 30 s, the user's think time): both ends of *this*
-// connection sit idle meanwhile, and other connections have their own
+//! connection sit idle meanwhile, and other connections have their own
 //! threads, so a slow decision never stalls the desktop.
+//!
+//! A second, one-way use (Phase 6): when `notify_copy_out` is set, the
+//! relay also sends a *copy-out* notification (`BrokerConfig::notify_write`)
+//! to the same socket each time the app writes to the clipboard or the
+//! primary selection. That line gets a desktop notification and no
+//! reply; it is fire-and-forget and fails open (a missing broker simply
+//! loses the notice, the write is never altered).
 
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
@@ -24,7 +31,10 @@ use std::time::Duration;
 
 use log::warn;
 
-use crate::broker::{ClipboardRead, Decision, PROTOCOL_VERSION, REQUEST_KIND, encode_request};
+use crate::broker::{
+    ClipboardRead, ClipboardWrite, Decision, NOTIFY_KIND, PROTOCOL_VERSION, REQUEST_KIND,
+    encode_notification, encode_request,
+};
 
 /// The broker the relay consults about dropped foreign reads.
 #[derive(Clone, Debug)]
@@ -45,6 +55,13 @@ pub struct BrokerConfig {
     /// it passes to
     /// [`ClipboardGate::unlock`](super::clipboard::ClipboardGate::unlock).
     pub window: Duration,
+    /// Phase 6: when set, the relay also fires a one-way *copy-out*
+    /// notification ([`Self::notify_write`]) to this broker each time
+    /// the app writes to the clipboard or primary selection. Independent
+    /// of the consent flow above (which only fires on a *dropped*
+    /// read): a write is always forwarded, the notice is fire-and-forget
+    /// and fails open.
+    pub notify_copy_out: bool,
 }
 
 impl BrokerConfig {
@@ -64,6 +81,7 @@ impl Default for BrokerConfig {
             instance: String::new(),
             timeout: Self::DEFAULT_TIMEOUT,
             window: Self::DEFAULT_WINDOW,
+            notify_copy_out: false,
         }
     }
 }
@@ -113,4 +131,53 @@ impl BrokerConfig {
             }
         }
     }
+
+    /// The Phase 6 copy-out notification: the app just wrote to
+    /// `selection` (`"clipboard"` or `"primary"`). Fire-and-forget —
+    /// one connection, one line, no reply is read. The broker (on the
+    /// host) turns it into a desktop notification; the write itself is
+    /// never gated or delayed by this.
+    ///
+    /// A short deadline bounds the relay thread: a missing broker
+    /// socket, a full socket buffer, or an unresponsive broker all
+    /// surface as an error here, which the caller logs and then
+    /// *ignores* (fail-open — the write was already forwarded before
+    /// this was called).
+    pub fn notify_write(&self, selection: &str) -> Result<(), String> {
+        let mut stream = UnixStream::connect(&self.socket).map_err(|e| {
+            format!(
+                "connecting to the broker socket {:?} for the copy-out note: {e}",
+                self.socket
+            )
+        })?;
+        // Bounded by the shorter of a fixed 2 s (enough to enqueue a
+        // small line even against a broker busy on a 30 s consent
+        // prompt) and the configured consent timeout.
+        let deadline = self.timeout.min(NOTIFY_DEADLINE);
+        let _ = stream.set_write_timeout(Some(deadline));
+
+        let note = ClipboardWrite {
+            v: PROTOCOL_VERSION,
+            kind: NOTIFY_KIND.to_string(),
+            app: self.app.clone(),
+            instance: self.instance.clone(),
+            selection: selection.to_string(),
+        };
+        stream
+            .write_all(
+                encode_notification(&note)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            )
+            .map_err(|e| format!("writing the copy-out notification to the broker: {e}"))?;
+        // The connection closes here (the OwnedFd/stream drops). No
+        // reply is expected or read.
+        Ok(())
+    }
 }
+
+/// The connect+write deadline for the fire-and-forget copy-out
+/// notification (kept short so a stuck broker can never hold the
+/// relay thread; a dropped notice is acceptable, a blocked app is
+/// not).
+const NOTIFY_DEADLINE: Duration = Duration::from_millis(2000);

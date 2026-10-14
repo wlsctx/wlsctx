@@ -110,8 +110,8 @@ use std::time::Instant;
 use log::info;
 use wayland_backend::protocol::{Argument, Interface, Message, MessageDesc};
 
-use super::objects::Dir;
 use super::ForwardAction;
+use super::objects::Dir;
 
 /// The clipboard policy for sandboxed clients.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -276,9 +276,7 @@ impl ClipboardGate {
                 // (`allow-null`): a NULL source (a clear) or one the
                 // client does not own cannot be attributed to it.
                 self.pending = match msg.args.first() {
-                    Some(Argument::Object(id)) if self.own_sources.contains(id) => {
-                        Some(kind)
-                    }
+                    Some(Argument::Object(id)) if self.own_sources.contains(id) => Some(kind),
                     _ => None,
                 };
             }
@@ -443,6 +441,52 @@ impl ClipboardGate {
             }
         }
     }
+
+    /// The Phase 6 hook: which selection this message *writes*, if
+    /// any.
+    ///
+    /// A client `set_selection` on either selection protocol whose
+    /// source argument is **not NULL** is the app placing data on that
+    /// selection — data now reachable by every client on the desktop,
+    /// i.e. a copy-*out* (the read-gate and the broker's consent flow
+    /// cover the copy-*in* direction). A NULL source is a *clear*, not
+    /// a write, and returns `None` as does every other message
+    /// (including the server's `selection` *event*, which only ever
+    /// echoes a prior write).
+    ///
+    /// The source is guaranteed to be one *this* client created: the
+    /// relay's bookkeeping (run before this, in `forward`) rejects any
+    /// reference to an object the client does not own, and a client
+    /// can only set a selection with a source it created itself. So a
+    /// non-NULL source here is unambiguously the app writing — no
+    /// origin-tracking state is needed (nor wanted: a write must be
+    /// reported even for a source the read-gate later attributes
+    /// foreign, because the *write* is what matters).
+    ///
+    /// Returns the human-facing name — `"clipboard"` (the stable
+    /// selection) or `"primary"` (the X-style primary selection) — so
+    /// the relay can notify the host; `None` otherwise.
+    pub(crate) fn writes_selection(
+        dir: Dir,
+        sender: &Interface,
+        desc: &MessageDesc,
+        msg: &Message<u32, OwnedFd>,
+    ) -> Option<&'static str> {
+        if dir != Dir::ClientToServer || desc.name != "set_selection" {
+            return None;
+        }
+        // A NULL source (a clear) is not a write; neither is a
+        // malformed arg (the parse would have caught it).
+        let is_write = matches!(msg.args.first(), Some(Argument::Object(id)) if *id != 0);
+        if !is_write {
+            return None;
+        }
+        match sender.name {
+            "wl_data_device" => Some("clipboard"),
+            "zwp_primary_selection_device_v1" => Some("primary"),
+            _ => None,
+        }
+    }
 }
 
 /// Verify that `fd` is an ephemeral in-memory channel (memfd,
@@ -483,8 +527,9 @@ mod tests {
         WL_DATA_DEVICE_INTERFACE, WL_DATA_DEVICE_MANAGER_INTERFACE, WL_DATA_OFFER_INTERFACE,
     };
     use wayland_protocols::wp::primary_selection::zv1::client::__interfaces::{
-        ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
-        ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE,
+        ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
+        ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE,
+        ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE,
     };
 
     /// The 0-based opcode a request/event of `name` has in `table`
@@ -495,8 +540,7 @@ mod tests {
         } else {
             table.events
         };
-        u16::try_from(arr.iter().position(|d| d.name == name).unwrap())
-            .expect("opcode fits a u16")
+        u16::try_from(arr.iter().position(|d| d.name == name).unwrap()).expect("opcode fits a u16")
     }
 
     fn msg(sender: u32, opcode: u16, args: Vec<Argument<u32, OwnedFd>>) -> Message<u32, OwnedFd> {
@@ -535,7 +579,10 @@ mod tests {
             .iter()
             .find(|d| d.name == name)
             .unwrap();
-        (opcode(&ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, "ev", name), d)
+        (
+            opcode(&ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, "ev", name),
+            d,
+        )
     }
 
     fn ps_device_request(name: &str) -> (u16, &'static MessageDesc) {
@@ -544,7 +591,10 @@ mod tests {
             .iter()
             .find(|d| d.name == name)
             .unwrap();
-        (opcode(&ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, "req", name), d)
+        (
+            opcode(&ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE, "req", name),
+            d,
+        )
     }
 
     fn ps_mgr_request(name: &str) -> (u16, &'static MessageDesc) {
@@ -553,7 +603,14 @@ mod tests {
             .iter()
             .find(|d| d.name == name)
             .unwrap();
-        (opcode(&ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE, "req", name), d)
+        (
+            opcode(
+                &ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
+                "req",
+                name,
+            ),
+            d,
+        )
     }
 
     /// The app created a zwp primary-selection source.
@@ -575,7 +632,11 @@ mod tests {
             Dir::ClientToServer,
             &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
             d,
-            &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC), Argument::Uint(0)]),
+            &msg(
+                PS_DEVICE,
+                op,
+                vec![Argument::Object(PS_SRC), Argument::Uint(0)],
+            ),
         );
         let (op, d) = ps_event("data_offer");
         g.observe(
@@ -635,7 +696,12 @@ mod tests {
                 ],
             )
         };
-        g.observe(Dir::ClientToServer, &ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, d, &mk());
+        g.observe(
+            Dir::ClientToServer,
+            &ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE,
+            d,
+            &mk(),
+        );
         g.on_receive(&mk())
     }
 
@@ -667,7 +733,8 @@ mod tests {
                 "req",
                 "create_data_source",
             ),
-            &WL_DATA_DEVICE_MANAGER_INTERFACE.requests
+            &WL_DATA_DEVICE_MANAGER_INTERFACE
+                .requests
                 .iter()
                 .find(|d| d.name == "create_data_source")
                 .unwrap(),
@@ -692,11 +759,7 @@ mod tests {
             Dir::ServerToClient,
             &WL_DATA_DEVICE_INTERFACE,
             d,
-            &msg(
-                DEVICE,
-                op,
-                vec![Argument::Object(OFFER_FOREIGN)],
-            ),
+            &msg(DEVICE, op, vec![Argument::Object(OFFER_FOREIGN)]),
         );
     }
 
@@ -708,11 +771,7 @@ mod tests {
             Dir::ClientToServer,
             &WL_DATA_DEVICE_INTERFACE,
             d,
-            &msg(
-                DEVICE,
-                op,
-                vec![Argument::Object(SRC), Argument::Uint(0)],
-            ),
+            &msg(DEVICE, op, vec![Argument::Object(SRC), Argument::Uint(0)]),
         );
         let (op, d) = event("data_offer");
         g.observe(
@@ -727,6 +786,81 @@ mod tests {
             &WL_DATA_DEVICE_INTERFACE,
             d,
             &msg(DEVICE, op, vec![Argument::Object(OFFER_OWN)]),
+        );
+    }
+
+    /// The Phase 6 copy-out detector: a client `set_selection` with a
+    /// non-NULL source (either protocol) is a write; a clear (a NULL
+    /// source), a compositor `selection` echo, and any other request
+    /// are not.
+    #[test]
+    fn writes_selection_detects_writes_not_clears_or_echoes() {
+        // A stable `set_selection` with a non-NULL source is a write.
+        let (op, d) = request("set_selection");
+        assert_eq!(
+            ClipboardGate::writes_selection(
+                Dir::ClientToServer,
+                &WL_DATA_DEVICE_INTERFACE,
+                d,
+                &msg(DEVICE, op, vec![Argument::Object(SRC)]),
+            ),
+            Some("clipboard")
+        );
+        // The primary-selection twin.
+        let (op, d) = ps_device_request("set_selection");
+        assert_eq!(
+            ClipboardGate::writes_selection(
+                Dir::ClientToServer,
+                &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+                d,
+                &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC)]),
+            ),
+            Some("primary")
+        );
+        // A NULL source is a clear, not a write (both protocols).
+        let (op, d) = request("set_selection");
+        assert_eq!(
+            ClipboardGate::writes_selection(
+                Dir::ClientToServer,
+                &WL_DATA_DEVICE_INTERFACE,
+                d,
+                &msg(DEVICE, op, vec![Argument::Object(0)]),
+            ),
+            None
+        );
+        let (op, d) = ps_device_request("set_selection");
+        assert_eq!(
+            ClipboardGate::writes_selection(
+                Dir::ClientToServer,
+                &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
+                d,
+                &msg(PS_DEVICE, op, vec![Argument::Object(0)]),
+            ),
+            None
+        );
+        // The compositor's `selection` *event* is an echo of a prior
+        // write, not a write (server -> client).
+        let (op, d) = event("selection");
+        assert_eq!(
+            ClipboardGate::writes_selection(
+                Dir::ServerToClient,
+                &WL_DATA_DEVICE_INTERFACE,
+                d,
+                &msg(DEVICE, op, vec![Argument::Object(OFFER_OWN)]),
+            ),
+            None
+        );
+        // An unrelated request on the device (`start_drag`) is not a
+        // `set_selection`.
+        let (op, d) = request("start_drag");
+        assert_eq!(
+            ClipboardGate::writes_selection(
+                Dir::ClientToServer,
+                &WL_DATA_DEVICE_INTERFACE,
+                d,
+                &msg(DEVICE, op, vec![]),
+            ),
+            None
         );
     }
 
@@ -791,8 +925,7 @@ mod tests {
         // Move the File out (into_raw_fd) so the OwnedFd below is the
         // sole owner of the fd — a second owner would double-close on
         // drop and abort the test process with an IO safety violation.
-        let path =
-            std::env::temp_dir().join(format!("wlsctx-fdtest-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("wlsctx-fdtest-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         let file_fd = unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) };
         let err = fd_is_memchannel(&file_fd).unwrap_err();
@@ -808,18 +941,12 @@ mod tests {
         own_source_then_foreign_selection(&mut g);
 
         // Reading the host selection: dropped silently.
-        assert_eq!(
-            receive(&mut g, OFFER_FOREIGN).unwrap(),
-            ForwardAction::Drop
-        );
+        assert_eq!(receive(&mut g, OFFER_FOREIGN).unwrap(), ForwardAction::Drop);
 
         // The app copies (sets its own selection); the read-back of
         // its own offer is forwarded.
         app_sets_own_selection(&mut g);
-        assert_eq!(
-            receive(&mut g, OFFER_OWN).unwrap(),
-            ForwardAction::Forward
-        );
+        assert_eq!(receive(&mut g, OFFER_OWN).unwrap(), ForwardAction::Forward);
 
         // A new foreign selection replaces it; the stale own offer
         // still only serves the app's own data (the source behind it
@@ -839,10 +966,7 @@ mod tests {
             d,
             &msg(DEVICE, op, vec![Argument::Object(0xFF00_0103)]),
         );
-        assert_eq!(
-            receive(&mut g, OFFER_OWN).unwrap(),
-            ForwardAction::Forward
-        );
+        assert_eq!(receive(&mut g, OFFER_OWN).unwrap(), ForwardAction::Forward);
         assert_eq!(receive(&mut g, 0xFF00_0103).unwrap(), ForwardAction::Drop);
     }
 
@@ -863,10 +987,7 @@ mod tests {
 
         // In the past: no effect.
         g.unlock(Instant::now() - std::time::Duration::from_secs(1));
-        assert_eq!(
-            receive(&mut g, OFFER_FOREIGN).unwrap(),
-            ForwardAction::Drop
-        );
+        assert_eq!(receive(&mut g, OFFER_FOREIGN).unwrap(), ForwardAction::Drop);
 
         // In the future: the foreign read is allowed.
         g.unlock(Instant::now() + std::time::Duration::from_secs(5));
@@ -886,7 +1007,8 @@ mod tests {
                 "req",
                 "create_data_source",
             ),
-            &WL_DATA_DEVICE_MANAGER_INTERFACE.requests
+            &WL_DATA_DEVICE_MANAGER_INTERFACE
+                .requests
                 .iter()
                 .find(|d| d.name == "create_data_source")
                 .unwrap(),
@@ -967,10 +1089,7 @@ mod tests {
                 ],
             ),
         );
-        assert_eq!(
-            receive(&mut g, OFFER_DRAG).unwrap(),
-            ForwardAction::Forward
-        );
+        assert_eq!(receive(&mut g, OFFER_DRAG).unwrap(), ForwardAction::Forward);
     }
 
     #[test]
@@ -983,7 +1102,8 @@ mod tests {
                 "req",
                 "create_data_source",
             ),
-            &WL_DATA_DEVICE_MANAGER_INTERFACE.requests
+            &WL_DATA_DEVICE_MANAGER_INTERFACE
+                .requests
                 .iter()
                 .find(|d| d.name == "create_data_source")
                 .unwrap(),
@@ -1000,11 +1120,7 @@ mod tests {
             Dir::ClientToServer,
             &WL_DATA_DEVICE_INTERFACE,
             d,
-            &msg(
-                DEVICE,
-                op,
-                vec![Argument::Object(SRC), Argument::Uint(0)],
-            ),
+            &msg(DEVICE, op, vec![Argument::Object(SRC), Argument::Uint(0)]),
         );
         // …but the echo that arrives clears the selection (another
         // client won the race, or the app cleared it): the pending
@@ -1030,10 +1146,7 @@ mod tests {
             d,
             &msg(DEVICE, op, vec![Argument::Object(0xFF00_0105)]),
         );
-        assert_eq!(
-            receive(&mut g, 0xFF00_0105).unwrap(),
-            ForwardAction::Drop
-        );
+        assert_eq!(receive(&mut g, 0xFF00_0105).unwrap(), ForwardAction::Drop);
     }
 
     #[test]
@@ -1113,7 +1226,11 @@ mod tests {
         // The app's stable set_selection is pending (the source is
         // one the app created, so the request is attributable).
         let (op, d) = (
-            opcode(&WL_DATA_DEVICE_MANAGER_INTERFACE, "req", "create_data_source"),
+            opcode(
+                &WL_DATA_DEVICE_MANAGER_INTERFACE,
+                "req",
+                "create_data_source",
+            ),
             &WL_DATA_DEVICE_MANAGER_INTERFACE
                 .requests
                 .iter()
@@ -1131,11 +1248,7 @@ mod tests {
             Dir::ClientToServer,
             &WL_DATA_DEVICE_INTERFACE,
             d,
-            &msg(
-                DEVICE,
-                op,
-                vec![Argument::Object(SRC), Argument::Uint(0)],
-            ),
+            &msg(DEVICE, op, vec![Argument::Object(SRC), Argument::Uint(0)]),
         );
         // …but the *next* zwp data_offer must not be attributed to
         // it: different protocol, different echo sequence.
@@ -1183,18 +1296,18 @@ mod tests {
             Dir::ClientToServer,
             &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
             d,
-            &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC), Argument::Uint(0)]),
+            &msg(
+                PS_DEVICE,
+                op,
+                vec![Argument::Object(PS_SRC), Argument::Uint(0)],
+            ),
         );
         let (op, d) = event("data_offer");
         g.observe(
             Dir::ServerToClient,
             &WL_DATA_DEVICE_INTERFACE,
             d,
-            &msg(
-                DEVICE,
-                op,
-                vec![Argument::NewId(0xFF00_0104)],
-            ),
+            &msg(DEVICE, op, vec![Argument::NewId(0xFF00_0104)]),
         );
         assert_eq!(
             receive(&mut g, 0xFF00_0104).unwrap(),
@@ -1264,13 +1377,22 @@ mod tests {
             .iter()
             .find(|d| d.name == "destroy")
             .unwrap();
-        g.observe(Dir::ClientToServer, &ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE, d, &msg(PS_SRC, op, Vec::new()));
+        g.observe(
+            Dir::ClientToServer,
+            &ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE,
+            d,
+            &msg(PS_SRC, op, Vec::new()),
+        );
         let (op, d) = ps_device_request("set_selection");
         g.observe(
             Dir::ClientToServer,
             &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
             d,
-            &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC), Argument::Uint(0)]),
+            &msg(
+                PS_DEVICE,
+                op,
+                vec![Argument::Object(PS_SRC), Argument::Uint(0)],
+            ),
         );
         let (op, d) = ps_event("data_offer");
         g.observe(

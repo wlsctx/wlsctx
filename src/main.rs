@@ -93,6 +93,17 @@ struct Cli {
     /// broker is missing or times out, the read is dropped anyway
     #[arg(long, env = "WLSCTX_BROKER_SOCKET")]
     broker_socket: Option<path::PathBuf>,
+    /// (Proxy mode only) notify the host broker — a desktop
+    /// notification — each time a sandboxed app writes to the clipboard
+    /// or the primary selection (a `set_selection`). This is the
+    /// copy-*out* signal: the data the app just placed is now reachable
+    /// by every client on the desktop. Fire-and-forget and fail-open:
+    /// a missing broker only loses the notice; the write is never
+    /// blocked or altered. Requires `--broker-socket` (the notification
+    /// travels over that socket); independent of `--clipboard-policy`
+    /// (a write is always forwarded)
+    #[arg(long, env = "WLSCTX_NOTIFY_COPY_OUT")]
+    notify_copy_out: bool,
     /// Run as the clipboard prompt broker (a host user service,
     /// outside the sandbox): each denied foreign clipboard read
     /// arrives as a JSON request on the listen socket, is announced
@@ -106,7 +117,13 @@ struct Cli {
     auto_decide: Option<String>,
     /// (Broker mode) how long to wait for the user's decision, in
     /// milliseconds (a timeout is a deny)
-    #[arg(long, env = "WLSCTX_BROKER_TIMEOUT_MILLIS", requires = "broker", default_value_t = 30_000, value_name = "MS")]
+    #[arg(
+        long,
+        env = "WLSCTX_BROKER_TIMEOUT_MILLIS",
+        requires = "broker",
+        default_value_t = 30_000,
+        value_name = "MS"
+    )]
     broker_timeout_millis: u64,
     /// Send a decision to the pending broker prompt (the most recent
     /// one, via the `latest` pointer in the runtime directory) —
@@ -141,7 +158,8 @@ fn validate(cli: &Cli) -> Result<()> {
             missing.1
         );
     }
-    if cli.broker && cli.auto_decide.is_some()
+    if cli.broker
+        && cli.auto_decide.is_some()
         && let Err(e) = wlsctx::broker::parse_decision(cli.auto_decide.as_deref().unwrap())
     {
         bail!("{e}");
@@ -163,6 +181,20 @@ fn validate(cli: &Cli) -> Result<()> {
              the broker socket is only used to ask about dropped reads, \
              which only the relay can have"
         );
+    }
+    if cli.notify_copy_out {
+        if !cli.proxy {
+            bail!(
+                "--notify-copy-out is only valid together with --proxy; \
+                 only the relay sees the app's set_selection traffic"
+            );
+        }
+        if cli.broker_socket.is_none() {
+            bail!(
+                "--notify-copy-out needs --broker-socket: the copy-out \
+                 notification is delivered to the host broker over that socket"
+            );
+        }
     }
     if !cli.proxy
         && let Some(p) = &cli.tagged_socket
@@ -299,7 +331,9 @@ fn run_tag_and_park(cli: &Cli) -> Result<()> {
     let close_fd = wlsctx::security_context::create_security_context(
         conn,
         &listener,
-        cli.sandbox_engine.as_deref().context("--sandbox-engine is required")?,
+        cli.sandbox_engine
+            .as_deref()
+            .context("--sandbox-engine is required")?,
         &app_id,
         &instance_id,
     )?;
@@ -330,7 +364,9 @@ fn run_proxy(cli: &Cli) -> Result<()> {
     let close_fd = wlsctx::security_context::create_security_context(
         conn,
         &tagged,
-        cli.sandbox_engine.as_deref().context("--sandbox-engine is required")?,
+        cli.sandbox_engine
+            .as_deref()
+            .context("--sandbox-engine is required")?,
         &app_id,
         &instance_id,
     )?;
@@ -344,32 +380,48 @@ fn run_proxy(cli: &Cli) -> Result<()> {
 
     let policy = wlsctx::proxy::Policy::from_names(cli.allow_globals.clone());
     if policy.is_active() {
-        info!("Global allowlist active: showing {} interface(s) to sandboxed clients", policy.allow_count());
+        info!(
+            "Global allowlist active: showing {} interface(s) to sandboxed clients",
+            policy.allow_count()
+        );
     } else {
         info!("No global allowlist: pass-through (all globals shown)");
     }
     let clipboard = wlsctx::proxy::ClipboardPolicy::parse(&cli.clipboard_policy)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if clipboard.is_active() {
-        info!("Clipboard gate active (deny): sandboxed reads of foreign selections come back empty");
+        info!(
+            "Clipboard gate active (deny): sandboxed reads of foreign selections come back empty"
+        );
     } else {
         info!("Clipboard gate: pass-through (allow)");
     }
-    info!("Clipboard fd sanity check is on in both policies (receive fds must be in-memory channels)");
+    info!(
+        "Clipboard fd sanity check is on in both policies (receive fds must be in-memory channels)"
+    );
     // The optional prompt broker: when a denied read lands, the
     // relay asks here (a fresh connection per ask) before dropping.
     let broker = match &cli.broker_socket {
         Some(p) => {
             let p = resolve_listener_path(p)?;
-            info!(
-                "Prompt broker: {} (denied reads are asked before dropping; a missing or \
-                 slow broker fails closed)",
-                p.display()
-            );
+            if cli.notify_copy_out {
+                info!(
+                    "Copy-out notifier: {} (each app write to the clipboard or primary \
+                     selection fires a desktop notification; fire-and-forget, fails open)",
+                    p.display()
+                );
+            } else {
+                info!(
+                    "Prompt broker: {} (denied reads are asked before dropping; a missing or \
+                     slow broker fails closed)",
+                    p.display()
+                );
+            }
             Some(wlsctx::proxy::BrokerConfig {
                 socket: p,
                 app: app_id,
                 instance: instance_id,
+                notify_copy_out: cli.notify_copy_out,
                 ..Default::default()
             })
         }
@@ -436,13 +488,12 @@ fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
             )
         })?;
         let socket_abspath = resolve_listener_path(socket_path)?;
-        let listener =
-            wlsctx::proxy::bind_listener(&socket_abspath).with_context(|| {
-                format!(
-                    "binding {socket_abspath:?} failed (a stale socket could not be removed, \
+        let listener = wlsctx::proxy::bind_listener(&socket_abspath).with_context(|| {
+            format!(
+                "binding {socket_abspath:?} failed (a stale socket could not be removed, \
                      or the path is not writable)"
-                )
-            })?;
+            )
+        })?;
         Ok((app_id, instance_id, listener))
     }
 }
@@ -709,6 +760,73 @@ mod tests {
                 cli.tagged_socket.as_deref(),
                 Some(std::path::Path::new("/run/user/1000/wlsctx-tagged"))
             );
+            assert!(validate(&cli).is_ok());
+        });
+    }
+
+    #[test]
+    fn notify_copy_out_requires_proxy_and_broker_socket() {
+        without_wlsctx_env(|| {
+            // Without --proxy.
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--notify-copy-out",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .unwrap();
+            let err =
+                validate(&cli).expect_err("--notify-copy-out without --proxy must be rejected");
+            assert!(err.to_string().contains("--proxy"), "{err}");
+
+            // With --proxy but no --broker-socket: the notification
+            // has nowhere to travel.
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--notify-copy-out",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .unwrap();
+            let err = validate(&cli)
+                .expect_err("--notify-copy-out without --broker-socket must be rejected");
+            assert!(err.to_string().contains("--broker-socket"), "{err}");
+
+            // With both: valid.
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--broker-socket",
+                "/tmp/broker.sock",
+                "--notify-copy-out",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .unwrap();
+            assert!(cli.notify_copy_out);
             assert!(validate(&cli).is_ok());
         });
     }

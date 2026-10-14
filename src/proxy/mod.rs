@@ -113,20 +113,20 @@ use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixStream, UnixListener};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{debug, info, warn};
-use nix::sys::signal::{Signal, Signal::*, SigSet};
+use nix::sys::signal::{SigSet, Signal, Signal::*};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use rustix::event::{poll, Timespec, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::net::{
-    recvmsg, send, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
-    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, send, sendmsg,
 };
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -135,9 +135,9 @@ use std::time::Instant;
 use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message, MessageDesc};
 use wayland_client::protocol::__interfaces::WL_DISPLAY_INTERFACE;
 
-use self::objects::{BookkeepingError, Dir, ObjectTables};
 pub use self::broker::BrokerConfig;
 pub use self::clipboard::{ClipboardGate, ClipboardPolicy};
+use self::objects::{BookkeepingError, Dir, ObjectTables};
 pub use self::policy::Policy;
 
 /// Max number of fds accepted in a single `recvmsg` (a Wayland message
@@ -188,8 +188,7 @@ impl ProxySocket {
             return send(self.fd.as_fd(), bytes, flags).map_err(Into::into);
         }
         let iov = [IoSlice::new(bytes)];
-        let mut cmsg_space =
-            vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
+        let mut cmsg_space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
         let mut cmsg_buffer = SendAncillaryBuffer::new(&mut cmsg_space);
         let borrowed: Vec<BorrowedFd> = fds.iter().map(|f| f.as_fd()).collect();
         cmsg_buffer.push(SendAncillaryMessage::ScmRights(&borrowed));
@@ -459,6 +458,30 @@ impl Relay {
         // `receive` request below.
         clipboard.observe(dir, sender, desc, &msg);
 
+        // ---- Phase 6: the copy-out notification (fire-and-forget). ----
+        // A client `set_selection` with a non-NULL source is the app
+        // placing data on that selection — the one direction that
+        // moves data *out* of the sandbox (the read-gate below covers
+        // the reverse). If a copy-out notifier is configured, tell the
+        // host. Fail-open: a missing/unreachable broker only loses the
+        // notice; the write itself is always forwarded (it was decided
+        // as a straight pass-through before this, and no interceptor
+        // touches `set_selection`).
+        //
+        // TODO(audit-log): this hook — and the `receive` decision
+        // below — are also where a structured audit entry per
+        // selection write/read should be emitted (app, instance,
+        // selection, own-vs-foreign, mime, action). See TASKS.md.
+        if let (Some(broker), Some(selection)) = (
+            broker.filter(|b| b.notify_copy_out),
+            ClipboardGate::writes_selection(dir, sender, desc, &msg),
+        ) && let Err(e) = broker.notify_write(selection)
+        {
+            warn!(
+                "{selection} copy-out note: broker unreachable ({e}); the write is forwarded regardless"
+            );
+        }
+
         // ---- Phase 2 + 3 (+ 5): the interceptors. ----
         // Only `wl_registry` and the `receive` requests of the two
         // selection protocols (`wl_data_offer`, and
@@ -488,12 +511,14 @@ impl Relay {
             && matches!(
                 sender.name,
                 "wl_data_offer" | "zwp_primary_selection_offer_v1"
-            )
-        {
+            ) {
             // Which selection the read is about (for the broker
             // prompt; both protocols read identically from here).
-            let selection =
-                if sender.name == "zwp_primary_selection_offer_v1" { "primary" } else { "clipboard" };
+            let selection = if sender.name == "zwp_primary_selection_offer_v1" {
+                "primary"
+            } else {
+                "clipboard"
+            };
             match clipboard.on_receive(&msg).map_err(RelayEnd::Protocol)? {
                 ForwardAction::Forward => ForwardAction::Forward,
                 // The gate dropped a read of a foreign selection (the
@@ -529,7 +554,9 @@ impl Relay {
                             }
                             Ok(false) => ForwardAction::Drop,
                             Err(e) => {
-                                warn!("{selection} gate: the broker is unreachable ({e}); dropping the read");
+                                warn!(
+                                    "{selection} gate: the broker is unreachable ({e}); dropping the read"
+                                );
                                 ForwardAction::Drop
                             }
                         }
@@ -547,7 +574,7 @@ impl Relay {
                         _ => {
                             return Err(RelayEnd::Protocol(
                                 "malformed wl_registry.global event".into(),
-                            ))
+                            ));
                         }
                     };
                     if g.policy.allows(&iface) {
@@ -565,7 +592,7 @@ impl Relay {
                         _ => {
                             return Err(RelayEnd::Protocol(
                                 "malformed wl_registry.global_remove event".into(),
-                            ))
+                            ));
                         }
                     };
                     if g.hidden.remove(&name) {
@@ -586,7 +613,7 @@ impl Relay {
                         _ => {
                             return Err(RelayEnd::Protocol(
                                 "malformed wl_registry.bind request".into(),
-                            ))
+                            ));
                         }
                     };
                     if g.shown.contains(&name) {
@@ -656,7 +683,9 @@ impl Relay {
             .iter()
             .enumerate()
             .find(|(_, d)| d.name == "error")
-            .ok_or_else(|| RelayEnd::Protocol("no wl_display.error event in the protocol".into()))?;
+            .ok_or_else(|| {
+                RelayEnd::Protocol("no wl_display.error event in the protocol".into())
+            })?;
         let display_id = tables.display().unwrap_or(1);
         let msg = Message {
             sender_id: display_id,
@@ -664,10 +693,9 @@ impl Relay {
             args: vec![
                 Argument::Object(display_id),
                 Argument::Uint(code),
-                Argument::Str(Some(Box::new(
-                    CString::new(message)
-                        .map_err(|e| RelayEnd::Protocol(format!("bad error message: {e}")))?,
-                ))),
+                Argument::Str(Some(Box::new(CString::new(message).map_err(|e| {
+                    RelayEnd::Protocol(format!("bad error message: {e}"))
+                })?))),
             ]
             .into(),
         };
@@ -692,7 +720,11 @@ fn match_desc(dir: Dir, sender: &Interface, opcode: u16) -> Result<&'static Mess
         Dir::ClientToServer => sender.requests.get(opcode as usize),
         Dir::ServerToClient => sender.events.get(opcode as usize),
     };
-    let what = if dir == Dir::ClientToServer { "request" } else { "event" };
+    let what = if dir == Dir::ClientToServer {
+        "request"
+    } else {
+        "event"
+    };
     desc.ok_or_else(|| {
         RelayEnd::Protocol(format!(
             "unknown {what} opcode {opcode} for interface {}",
@@ -718,7 +750,7 @@ pub fn bind_listener(path: &Path) -> io::Result<UnixListener> {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("{path:?} already exists and is not a socket"),
-            ))
+            ));
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -819,10 +851,13 @@ pub fn event_loop(
             } else {
                 match public.accept() {
                     Ok((stream, _)) => {
-                        if let Err(
-                            e,
-                        ) = spawn_relay(stream, tagged_path, policy.clone(), clipboard, broker.clone())
-                        {
+                        if let Err(e) = spawn_relay(
+                            stream,
+                            tagged_path,
+                            policy.clone(),
+                            clipboard,
+                            broker.clone(),
+                        ) {
                             warn!("dropping app connection: {e}");
                         }
                     }
@@ -832,9 +867,7 @@ pub fn event_loop(
             }
         }
         // Test hook: the stop flag is checked on every 200 ms tick.
-        let stopped = stop
-            .as_ref()
-            .is_some_and(|s| s.load(Ordering::SeqCst));
+        let stopped = stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst));
         if stopped {
             return Ok(());
         }
@@ -871,14 +904,12 @@ fn setup_signalfd() -> io::Result<SignalFd> {
 /// SIGHUP exits with status 129 directly (no restart is implemented);
 /// SIGCHLD reaps children; the rest is ignored.
 fn handle_signal(sigfd: &SignalFd) -> io::Result<bool> {
-    let siginfo = sigfd.read_signal().map_err(io::Error::other)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::BrokenPipe, "signalfd closed")
-    })?;
+    let siginfo = sigfd
+        .read_signal()
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "signalfd closed"))?;
     let signal = Signal::try_from(siginfo.ssi_signo as i32).map_err(|e| {
-        io::Error::other(format!(
-            "unknown signal number {}: {e}",
-            siginfo.ssi_signo
-        ))
+        io::Error::other(format!("unknown signal number {}: {e}", siginfo.ssi_signo))
     })?;
     debug!("Signal: {signal:?}");
     Ok(match signal {
