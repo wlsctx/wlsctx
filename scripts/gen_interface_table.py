@@ -6,18 +6,28 @@ every `wayland_protocol!` invocation, resolves the Rust path of its generated
 `__interfaces` module, and reads the interface names from the protocol XML.
 Also covers the wlroots family vendored under protocols/.
 
-Run from the repository root (after `cargo vendor`-style registry access is
-not needed: paths are passed explicitly):
+Run from the repository root. The dependency sources are located in the
+cargo registry: after `cargo fetch --locked` plus any build that extracts
+them (e.g. `cargo check`), the extracted sources live in
+`$CARGO_HOME/registry/src/<index-hash>/`. The crate versions are read from
+Cargo.toml, so a version bump in the manifest is all it takes to
+regenerate against the new sources. The registry layout is overridable
+for unusual setups:
+
+    WLSCTX_CARGO_REGISTRY   root of the registry `src/` tree
+                            (default: $CARGO_HOME or ~/.cargo, + /registry/src)
+    WLSCTX_WAYLAND_CLIENT_SRC    directory of the extracted wayland-client source
+    WLSCTX_WAYLAND_PROTOCOLS_SRC directory of the extracted wayland-protocols source
 
     python3 scripts/gen_interface_table.py
 """
 
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-REG = "/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f"
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "src" / "proxy" / "interfaces.rs"
 
@@ -87,6 +97,57 @@ def parse_modules(src_text: str, crate_root: Path, file_mod: str):
         i += 1
 
 
+def manifest_version(crate: str) -> str:
+    """The version the manifest pins for `crate` (e.g. `0.31.11`)."""
+    toml = (REPO / "Cargo.toml").read_text()
+    for line in toml.splitlines():
+        m = re.match(rf"^{crate}\s*=\s*\{{[^}}]*version\s*=\s*\"([^\"]+)\"|^{crate}\s*=\s*\"([^\"]+)\"", line)
+        if m:
+            return m.group(1) or m.group(2)
+    sys.exit(f"{crate} not found in Cargo.toml")
+
+
+def find_extracted_source(crate: str) -> Path:
+    """Locate the extracted sources of `crate` in the cargo registry.
+
+    Prefers an explicit override env var; otherwise scans
+    `$CARGO_HOME/registry/src/*/` for the exact `crate-version` directory
+    named by Cargo.toml. (cargo fetch only downloads the .crate file into
+    `registry/cache/`; the `src/` tree appears once something builds —
+    CI runs `cargo check` first.)
+    """
+    override = os.environ.get(f"WLSCTX_{crate.upper().replace('-', '_')}_SRC")
+    if override:
+        p = Path(override)
+        if not p.is_dir():
+            sys.exit(f"{override} (from WLSCTX_{crate.upper()}_SRC) is not a directory")
+        return p
+
+    cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+    src_root = Path(os.environ.get(
+        "WLSCTX_CARGO_REGISTRY",
+        str(Path(cargo_home) / "registry" / "src"),
+    ))
+    version = manifest_version(crate)
+    # Glob per index-hash directory, keeping exact-version directories only.
+    candidates = [
+        d for idx in sorted(src_root.glob("*")) if idx.is_dir()
+        for d in [idx / f"{crate}-{version}"] if d.is_dir()
+    ]
+    if len(candidates) > 1:
+        sys.exit(f"multiple {crate}-{version} sources under {src_root}: "
+                 f"{[str(c) for c in candidates]}")
+    if not candidates:
+        sys.exit(
+            f"could not find the extracted {crate}-{version} sources under "
+            f"{src_root} (looked for <index-hash>/{crate}-{version}); "
+            f"run `cargo fetch --locked && cargo check` first, or point "
+            f"WLSCTX_{crate.upper()}_SRC at the source directory"
+        )
+    print(f"using {crate} sources: {candidates[0]}", file=sys.stderr)
+    return candidates[0]
+
+
 def main():
     arms = []
     seen = {}
@@ -98,13 +159,17 @@ def main():
         seen[name] = origin
         arms.append((name, rust_path, origin))
 
+    wc_root = find_extracted_source("wayland-client")
+    wp_root = find_extracted_source("wayland-protocols")
+
     # 1. Core protocol (wayland-client's wayland.xml)
-    core_xml = Path(REG) / "wayland-client-0.31.11" / "wayland.xml"
+    core_xml = wc_root / "wayland.xml"
+    if not core_xml.exists():
+        sys.exit(f"missing {core_xml}")
     for name in xml_interfaces(core_xml):
         add(name, f"wayland_client::protocol::__interfaces::{ident(name)}", "core")
 
     # 2. wayland-protocols (client-side generated tables)
-    wp_root = Path(REG) / "wayland-protocols-0.32.9"
     for src_file in ("xdg.rs", "wp.rs", "ext.rs"):
         file_mod = src_file[: -len(".rs")]
         for modpath, xml_abs, feats in parse_modules(

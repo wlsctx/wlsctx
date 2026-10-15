@@ -1,0 +1,57 @@
+# wlsctx CI.
+#
+# The single job does, in this order:
+#
+# 1. `cargo check --all-targets --locked` — compiles the whole graph
+#    (which extracts the cargo-registry sources the table generator
+#    reads) and, as a side effect, is the sync check for
+#    src/proxy/wlr_tables.rs: that file is a
+#    wayland_scanner::generate_interfaces! expansion over the vendored
+#    protocols/*.xml, rebuilt by the compiler on every build, so a
+#    protocol-XML change that breaks or alters the table is caught
+#    here, not by a file diff.
+#
+# 2. `python3 scripts/gen_interface_table.py` + `git diff --exit-code`
+#    on the output — the sync check for src/proxy/interfaces.rs (the
+#    *static* name -> Interface table; that one is a checked-in file,
+#    so it is diffed instead of recompiled). If a protocol XML (in
+#    wayland-protocols, in wayland-client's wayland.xml, or vendored
+#    under protocols/) adds or renames an interface and the table is
+#    not regenerated, this step fails the build.
+#
+# 3. the usual gates: rustfmt, clippy (deny warnings), the test suite.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Compile (extracts the registry sources the generator reads; builds the wlr tables)
+        run: cargo check --all-targets --locked
+
+      - name: Regenerate the proxy interface table
+        run: python3 scripts/gen_interface_table.py
+
+      - name: Fail if the checked-in table has drifted
+        run: git diff --exit-code -- src/proxy/interfaces.rs
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
