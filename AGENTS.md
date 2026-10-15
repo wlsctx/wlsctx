@@ -47,8 +47,11 @@ full write-ups live in `docs/postmortems/`.**
   per incident), referenced from `LESSONS.md`; currently the
   fd-misrouting post-mortem
 - `scripts/gen_interface_table.py` — generates
-  `src/proxy/interfaces.rs` and `src/proxy/wlr_tables.rs` from the
-  protocol XMLs; do not hand-edit the generated files
+  `src/proxy/interfaces.rs` (the name → `&'static Interface` lookup
+  table) from the protocol XMLs. `src/proxy/wlr_tables.rs` is a
+  checked-in `wayland_scanner::generate_interfaces!` table over
+  `protocols/*.xml` that expands at compile time. Do not hand-edit
+  either file
 - `containers/systemd/` — quadlets: `wl-app@.pod` + sidecars (`wl-display@`,
   `wl-dbus@`, `wl-xwayland@`), app containers (`app-podman-@`), image/build
   units. Drop-ins: `wl-.container.d/` (pod defaults), `app-podman-.container.d/`
