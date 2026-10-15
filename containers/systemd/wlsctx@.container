@@ -19,6 +19,12 @@
 # itself is the tagged one, no relay, no interception): remove
 # --proxy --tagged-socket=... from Exec.
 #
+# The relay's selection audit log (Phase 9) is written to its stderr
+# (the `audit` log target); with LogDriver=passthrough (below) and
+# StandardError=journal it lands in the HOST journal like mode B's
+# (journalctl -u wlsctx@%i, greppable on the key=value fields).
+# RUST_LOG=warn (instead of the default debug) silences the stream.
+#
 # Optional prompt broker: as in mode B, bind the host's
 # wlsctx-broker socket into this container's private /run and point
 # the relay at it (a missing or slow broker fails closed — the read
@@ -73,7 +79,15 @@ Mount=type=bind,ro,source=%t/${WAYLAND_DISPLAY},destination=%t/wayland-1
 ContainerName=systemd-wlsctx_${INVOCATION_ID}
 #SecurityLabelDisable=true
 SecurityLabelType=wlsctx.process
+# The audit log (and the rest of the relay's logging) is on the
+# container's stderr; passthrough keeps it out of any container-local
+# log file so the host journal gets it directly.
+LogDriver=passthrough
 
 [Service]
 Restart=always
 Environment=WLSCTX_SANDBOX_ENGINE=podman
+# Host journal for the relay's stderr (the Phase 9 audit records;
+# same arrangement as mode B's wl-display@ sidecar).
+StandardOutput=journal
+StandardError=journal

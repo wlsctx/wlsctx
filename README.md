@@ -157,6 +157,25 @@ The binary has four operating modes (the relay logic lives in
      client on the desktop. Independent of the policy above (a write is
      always forwarded); fire-and-forget and fail-open (a missing broker
      only loses the notice, it never blocks or alters the write).
+   - **The selection audit log** (always on, no flag; Phase 9) writes
+     one structured line per selection event the relay is on the path
+     of: `set` (the app places data on a selection — the copy-out
+     declaration), `read` (a `receive`, with the gate's decision —
+     `forward`, `approved` through the prompt broker, or `dropped`),
+     `clear` (a NULL `set_selection`, with the origin of the selection
+     removed), and `serve` (a `send` event on one of the app's source
+     objects — the per-mime byte flow behind a write). Each line
+     carries `app`, `instance`, `selection`, `action`, `origin`,
+     `mime`, `gate`, `fd_kind`, `payload_bytes` as `key=value` fields
+     under the `audit` log target. It records **sizes, never content**
+     (the relay only `fstat`s the fd it already holds: a memfd's size
+     is settled by a small probe — 250 ms ticks, two stable readings,
+     5 s deadline — while a pipe/socket reports no size, and a dropped
+     read records 0). The relay's stderr reaches the **host** journal
+     in both modes (`LogDriver=passthrough` + `StandardError=journal`),
+     so `journalctl -u <relay unit>` shows one line per event;
+     `RUST_LOG=warn` silences the stream (the records are then simply
+     not retained).
 3. **Prompt broker** (host user service, not a container):
    `--broker --socket-activation` (the `wlsctx-broker.socket` /
    `.service` units): each dropped read arrives as one JSON
@@ -312,11 +331,15 @@ broker is wired, explicitly approved by the user first.
   Blocking it would break the app's own copy-and-paste, so the write is
   **not blocked**; instead it is made *visible*: with
   `--notify-copy-out` (Phase 6) each write fires a desktop notification
-  naming the app and the selection. The clipboard is treated as shared
-  scratch space, not a secret boundary — the notification is a tripwire
-  (opt-in, fail-open), not a wall. A persistent, structured **audit
-  log** of all selection write/read traffic is the deferred follow-up
-  (see `TASKS.md`).
+  naming the app and the selection, and — always on, in both
+  deployment modes — every selection event the relay sees is recorded
+  in the **selection audit log** (Phase 9): one structured line per
+  `set`/`read`/`clear`/`serve` with the app/instance identity, the
+  gate's decision, and the payload *size* (never content), written to
+  the host journal (`audit` log target) — see "The selection audit
+  log" in the binary section above. The clipboard is treated as shared
+  scratch space, not a secret boundary: the notification is a tripwire
+  (opt-in, fail-open), the audit log is the persistent record.
 - **The shared `downloads` volume.** Every app pod mounts the *same*
   `downloads` volume at `~/Downloads` (`noexec`). A compromised app can
   tamper with files another app will open or download later — apps in
@@ -375,9 +398,11 @@ system can reach it.
   headers). Both broker features ride on that one socket: the consent
   prompt (`--clipboard-policy=deny`) and the copy-out notification
   (`--notify-copy-out`, Phase 6) are each enabled independently.
-- The copy-out **audit log** (a structured, persistent record of every
-  selection write/read/clear the relay sees) is not implemented yet; the
-  hook points are in place and the design is in `TASKS.md` (Phase 9).
+- **Drag-and-drop** selection traffic is only partially covered by the
+  audit log: `start_drag` is not audited as a write (the gate still
+  attributes drags for the read-gate, and `serve` events fired during a
+  drag are recorded under the clipboard label — `wl_data_source` is
+  shared by both).
 - The at-spi proxy is **intentionally** in allow-nothing mode: its
   `--call`/`--broadcast` rules are commented out in `wl-dbus@.container`
   (marked there) and the `--sloppy-names` filter lets nothing through by
