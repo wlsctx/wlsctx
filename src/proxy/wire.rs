@@ -162,8 +162,8 @@ pub fn parse_message<'a>(
 ///
 /// Returns the number of bytes written (including the header). Fd
 /// arguments are cloned (dup'd) into `out_fds` in signature order and
-/// must be passed to the peer via SCM_RIGHTS (see
-/// [`crate::proxy::send_msg`]).
+/// must be passed to the peer via SCM_RIGHTS (the relay's private
+/// `ProxySocket::send` does that with `sendmsg`).
 ///
 /// Ported from `wayland_backend::rs::wire::write_to_buffers` (which dups
 /// raw fds; here the owned fds are cloned instead — the dup happens in

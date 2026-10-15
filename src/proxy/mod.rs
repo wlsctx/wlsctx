@@ -1337,7 +1337,7 @@ fn handle_signal(sigfd: &SignalFd) -> io::Result<bool> {
 /// distinguishable in the journal.
 ///
 /// This signal handler is inspired by the implementation in catatonit:
-/// https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588
+/// <https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588>
 pub fn run_signal_loop() -> anyhow::Result<()> {
     let sigfd =
         setup_signalfd().map_err(|e| anyhow::anyhow!("setting up the signalfd failed: {e}"))?;
