@@ -80,10 +80,7 @@ pub fn parse_message<'a>(
     fds: &mut VecDeque<OwnedFd>,
 ) -> Result<(Message<u32, OwnedFd>, &'a [u8]), Error> {
     // Helper function to read arrays
-    fn read_array_from_payload(
-        array_len: usize,
-        payload: &[u8],
-    ) -> Result<(&[u8], &[u8]), Error> {
+    fn read_array_from_payload(array_len: usize, payload: &[u8]) -> Result<(&[u8], &[u8]), Error> {
         let len = next_multiple_of(array_len, 4);
         if len > payload.len() {
             return Err(Error::Incomplete);
@@ -137,11 +134,12 @@ pub fn parse_message<'a>(
                     }
                     ArgumentType::Object(_) => Ok(Argument::Object(front)),
                     ArgumentType::NewId => Ok(Argument::NewId(front)),
-                    ArgumentType::Array => read_array_from_payload(front as usize, tail)
-                        .map(|(v, r)| {
+                    ArgumentType::Array => {
+                        read_array_from_payload(front as usize, tail).map(|(v, r)| {
                             tail = r;
                             Argument::Array(Box::new(v.into()))
-                        }),
+                        })
+                    }
                     ArgumentType::Fd => unreachable!(),
                 };
                 payload = tail;
@@ -152,7 +150,11 @@ pub fn parse_message<'a>(
         })
         .collect::<Result<Vec<_>, Error>>()?;
 
-    let msg = Message { sender_id, opcode, args: arguments.into() };
+    let msg = Message {
+        sender_id,
+        opcode,
+        args: arguments.into(),
+    };
     Ok((msg, rest))
 }
 
@@ -301,8 +303,7 @@ mod tests {
         let n = write_message(&msg, &sig()[..7], &mut bytes, &mut fds).unwrap();
         assert!(fds.is_empty());
         let mut fdsq = VecDeque::new();
-        let (rebuilt, rest) =
-            parse_message(&bytes[..n], &sig()[..7], &mut fdsq).expect("parse");
+        let (rebuilt, rest) = parse_message(&bytes[..n], &sig()[..7], &mut fdsq).expect("parse");
         assert!(rest.is_empty());
         assert_eq!(rebuilt.sender_id, 42);
         assert_eq!(rebuilt.opcode, 7);
@@ -313,7 +314,10 @@ mod tests {
             rebuilt.args[2],
             Argument::Str(Some(Box::new(CString::new(b"I like trains!").unwrap())))
         );
-        assert_eq!(rebuilt.args[3], Argument::Array(vec![1, 2, 3, 4, 5, 6, 7, 8, 9].into()));
+        assert_eq!(
+            rebuilt.args[3],
+            Argument::Array(vec![1, 2, 3, 4, 5, 6, 7, 8, 9].into())
+        );
         assert_eq!(rebuilt.args[4], Argument::Object(88));
         assert_eq!(rebuilt.args[5], Argument::NewId(56));
         assert_eq!(rebuilt.args[6], Argument::Int(-25));
@@ -339,10 +343,12 @@ mod tests {
         // parse it back, consuming the fd
         let mut fdsq = VecDeque::new();
         fdsq.push_back(out.pop().unwrap());
-        let (rebuilt, rest) =
-            parse_message(&bytes[..n], &sig_of_send(), &mut fdsq).expect("parse");
+        let (rebuilt, rest) = parse_message(&bytes[..n], &sig_of_send(), &mut fdsq).expect("parse");
         assert!(rest.is_empty());
-        assert_eq!(rebuilt.args[0], Argument::Str(Some(Box::new(CString::new(b"text/plain").unwrap()))));
+        assert_eq!(
+            rebuilt.args[0],
+            Argument::Str(Some(Box::new(CString::new(b"text/plain").unwrap())))
+        );
         assert!(matches!(rebuilt.args[1], Argument::Fd(_)));
         let _ = r;
     }

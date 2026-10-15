@@ -57,7 +57,9 @@ impl Policy {
 
     /// A policy that shows only the given interface names.
     pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
-        Self { allowlist: Some(HashSet::from_iter(names)) }
+        Self {
+            allowlist: Some(HashSet::from_iter(names)),
+        }
     }
 
     /// Parse a comma-separated list of interface names (empty/blank

@@ -16,8 +16,8 @@
 use wayland_client::backend::protocol::{AllowNull, ArgumentType, Interface};
 use wayland_client::protocol::__interfaces::{
     WL_DATA_DEVICE_INTERFACE, WL_DATA_OFFER_INTERFACE, WL_DATA_SOURCE_INTERFACE,
-    WL_KEYBOARD_INTERFACE, WL_POINTER_INTERFACE, WL_REGISTRY_INTERFACE, WL_TOUCH_INTERFACE,
-    WL_DISPLAY_INTERFACE,
+    WL_DISPLAY_INTERFACE, WL_KEYBOARD_INTERFACE, WL_POINTER_INTERFACE, WL_REGISTRY_INTERFACE,
+    WL_TOUCH_INTERFACE,
 };
 
 fn check(name: &str, expected: &Interface) {
@@ -33,7 +33,10 @@ fn check(name: &str, expected: &Interface) {
         _ => panic!("unknown {name}"),
     };
     assert_eq!(table.name, expected.name, "name mismatch for {name}");
-    assert_eq!(table.version, expected.version, "version mismatch for {name}");
+    assert_eq!(
+        table.version, expected.version,
+        "version mismatch for {name}"
+    );
     assert_eq!(
         table.requests.len(),
         expected.requests.len(),
@@ -44,15 +47,29 @@ fn check(name: &str, expected: &Interface) {
         expected.events.len(),
         "event count mismatch for {name}"
     );
-    for (i, (a, b)) in table.requests.iter().zip(expected.requests.iter()).enumerate() {
+    for (i, (a, b)) in table
+        .requests
+        .iter()
+        .zip(expected.requests.iter())
+        .enumerate()
+    {
         assert_eq!(a.name, b.name, "request {i} of {name}");
-        assert_eq!(a.signature, b.signature, "request {i} ({}) signature of {name}", a.name);
+        assert_eq!(
+            a.signature, b.signature,
+            "request {i} ({}) signature of {name}",
+            a.name
+        );
     }
     for (i, (a, b)) in table.events.iter().zip(expected.events.iter()).enumerate() {
         assert_eq!(a.name, b.name, "event {i} of {name}");
-        assert_eq!(a.signature, b.signature, "event {i} ({}) signature of {name}", a.name);
+        assert_eq!(
+            a.signature, b.signature,
+            "event {i} ({}) signature of {name}",
+            a.name
+        );
     }
-    println!("{name}: v{} | requests: {:?} | events: {:?}",
+    println!(
+        "{name}: v{} | requests: {:?} | events: {:?}",
         table.version,
         table.requests.iter().map(|m| m.name).collect::<Vec<_>>(),
         table.events.iter().map(|m| m.name).collect::<Vec<_>>(),
@@ -101,7 +118,11 @@ fn a2_registry_bind_expansion() {
     assert_eq!(global.name, "global");
     assert_eq!(
         global.signature,
-        &[ArgumentType::Uint, ArgumentType::Str(AllowNull::No), ArgumentType::Uint]
+        &[
+            ArgumentType::Uint,
+            ArgumentType::Str(AllowNull::No),
+            ArgumentType::Uint
+        ]
     );
 
     // opcode == index in the table (tables are built in XML order)
@@ -139,7 +160,10 @@ fn a2b_clipboard_message_signatures() {
         .iter()
         .find(|m| m.name == "send")
         .expect("wl_data_source has send");
-    assert_eq!(send.signature, &[ArgumentType::Str(AllowNull::No), ArgumentType::Fd]);
+    assert_eq!(
+        send.signature,
+        &[ArgumentType::Str(AllowNull::No), ArgumentType::Fd]
+    );
 
     // wl_data_device.data_offer: (new_id wl_data_offer)
     let data_offer = &WL_DATA_DEVICE_INTERFACE
@@ -149,8 +173,5 @@ fn a2b_clipboard_message_signatures() {
         .expect("wl_data_device has data_offer");
     assert_eq!(data_offer.signature, &[ArgumentType::NewId]);
     assert!(data_offer.child_interface.is_some());
-    assert_eq!(
-        data_offer.child_interface.unwrap().name,
-        "wl_data_offer"
-    );
+    assert_eq!(data_offer.child_interface.unwrap().name, "wl_data_offer");
 }

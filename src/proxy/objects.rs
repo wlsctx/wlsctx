@@ -192,10 +192,7 @@ impl ObjectTables {
         // destroyed a client-range object. Both implementations send it
         // only for IDs below the server-ID boundary, never for the
         // display; anything else is a violation.
-        if dir == Dir::ServerToClient
-            && sender.name == "wl_display"
-            && desc.name == "delete_id"
-        {
+        if dir == Dir::ServerToClient && sender.name == "wl_display" && desc.name == "delete_id" {
             let id = match &msg.args.first() {
                 Some(Argument::Uint(id)) => *id,
                 _ => return Err(BookkeepingError("malformed delete_id".into())),
@@ -229,7 +226,7 @@ impl ObjectTables {
                 None => {
                     return Err(BookkeepingError(format!(
                         "delete_id for object {id} the proxy never saw"
-                    )))
+                    )));
                 }
             }
             return Ok(());
@@ -240,8 +237,15 @@ impl ObjectTables {
         // send_request; C marks the proxy destroyed), and the server
         // would kill the connection for it. Fail closed.
         if dir == Dir::ClientToServer && Some(msg.sender_id) != self.display {
-            let table = if msg.sender_id < limit { &self.client } else { &self.server };
-            if table.get(&msg.sender_id).is_some_and(|e| e.client_destroyed) {
+            let table = if msg.sender_id < limit {
+                &self.client
+            } else {
+                &self.server
+            };
+            if table
+                .get(&msg.sender_id)
+                .is_some_and(|e| e.client_destroyed)
+            {
                 return Err(BookkeepingError(format!(
                     "request '{}' on object {} the client already destroyed",
                     desc.name, msg.sender_id
@@ -251,10 +255,7 @@ impl ObjectTables {
 
         // A destructor request: the client half of the object's
         // lifetime is over.
-        if dir == Dir::ClientToServer
-            && desc.is_destructor
-            && Some(msg.sender_id) != self.display
-        {
+        if dir == Dir::ClientToServer && desc.is_destructor && Some(msg.sender_id) != self.display {
             let table = if msg.sender_id < limit {
                 &mut self.client
             } else {
@@ -321,7 +322,7 @@ impl ObjectTables {
                         return Err(BookkeepingError(format!(
                             "untyped NewId in non-bind message '{}'",
                             desc.name
-                        )))
+                        )));
                     }
                 };
                 let version = match msg.args.get(2) {
@@ -330,7 +331,7 @@ impl ObjectTables {
                         return Err(BookkeepingError(format!(
                             "malformed bind in '{}'",
                             desc.name
-                        )))
+                        )));
                     }
                 };
                 // Fail-closed: the proxy must be able to parse every
@@ -430,8 +431,8 @@ impl ObjectTables {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
     use super::*;
+    use std::ffi::CString;
 
     fn registry_bind_iface() -> &'static Interface {
         &wayland_client::protocol::__interfaces::WL_REGISTRY_INTERFACE
@@ -454,7 +455,11 @@ mod tests {
     }
 
     fn msg(sender: u32, opcode: u16, args: Vec<Argument<u32, OwnedFd>>) -> Message<u32, OwnedFd> {
-        Message { sender_id: sender, opcode, args: args.into() }
+        Message {
+            sender_id: sender,
+            opcode,
+            args: args.into(),
+        }
     }
 
     /// Rust (wayland-backend) convention: the first message is
@@ -502,13 +507,18 @@ mod tests {
         assert_eq!(bind.name, "bind");
         // Rust convention: the registry (the sender of bind) is ID 2,
         // the first client allocation after the display (ID 1).
-        let m = msg(2, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(5),
-            Argument::NewId(100),
-        ]);
-        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap();
+        let m = msg(
+            2,
+            0,
+            vec![
+                Argument::Uint(7),
+                Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                Argument::Uint(5),
+                Argument::NewId(100),
+            ],
+        );
+        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap();
         let e = t.client.get(&100).unwrap();
         assert_eq!(e.iface.name, "wl_compositor");
         assert_eq!(e.version, 5);
@@ -526,17 +536,23 @@ mod tests {
         let get_registry = &display_iface().requests[1];
         assert_eq!(get_registry.name, "get_registry");
         let m = msg(0, 1, vec![Argument::NewId(1)]);
-        t.apply(Dir::ClientToServer, &m, get_registry, display_iface()).unwrap();
+        t.apply(Dir::ClientToServer, &m, get_registry, display_iface())
+            .unwrap();
         assert_eq!(t.client.get(&1).unwrap().iface.name, "wl_registry");
         // bind is addressed to that tracked ID 1, not to the display.
         let bind = &registry_bind_iface().requests[0];
-        let m = msg(1, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(5),
-            Argument::NewId(2),
-        ]);
-        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap();
+        let m = msg(
+            1,
+            0,
+            vec![
+                Argument::Uint(7),
+                Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                Argument::Uint(5),
+                Argument::NewId(2),
+            ],
+        );
+        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap();
         assert_eq!(t.client.get(&2).unwrap().iface.name, "wl_compositor");
         assert_eq!(t.sender_interface(1).unwrap().name, "wl_registry");
     }
@@ -545,13 +561,21 @@ mod tests {
     fn bind_of_unknown_interface_is_an_error() {
         let mut t = rust_tables();
         let bind = &registry_bind_iface().requests[0];
-        let m = msg(2, 0, vec![
-            Argument::Uint(8),
-            Argument::Str(Some(Box::new(CString::new(b"zwp_totally_bogus_v99").unwrap()))),
-            Argument::Uint(1),
-            Argument::NewId(101),
-        ]);
-        let err = t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap_err();
+        let m = msg(
+            2,
+            0,
+            vec![
+                Argument::Uint(8),
+                Argument::Str(Some(Box::new(
+                    CString::new(b"zwp_totally_bogus_v99").unwrap(),
+                ))),
+                Argument::Uint(1),
+                Argument::NewId(101),
+            ],
+        );
+        let err = t
+            .apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap_err();
         assert!(err.0.contains("unknown interface"), "{}", err.0);
     }
 
@@ -571,7 +595,13 @@ mod tests {
         let create_surface = &wl_compositor_iface().requests[0];
         assert_eq!(create_surface.name, "create_surface");
         let m = msg(10, 0, vec![Argument::NewId(11)]);
-        t.apply(Dir::ClientToServer, &m, create_surface, wl_compositor_iface()).unwrap();
+        t.apply(
+            Dir::ClientToServer,
+            &m,
+            create_surface,
+            wl_compositor_iface(),
+        )
+        .unwrap();
         assert_eq!(t.client.get(&11).unwrap().iface.name, "wl_surface");
     }
 
@@ -582,8 +612,12 @@ mod tests {
         let sync = &display_iface().requests[0];
         assert_eq!(sync.name, "sync");
         let m = msg(1, 0, vec![Argument::NewId(0xFF00_0001)]);
-        t.apply(Dir::ServerToClient, &m, sync, display_iface()).unwrap();
-        assert_eq!(t.server.get(&0xFF00_0001).unwrap().iface.name, "wl_callback");
+        t.apply(Dir::ServerToClient, &m, sync, display_iface())
+            .unwrap();
+        assert_eq!(
+            t.server.get(&0xFF00_0001).unwrap().iface.name,
+            "wl_callback"
+        );
     }
 
     #[test]
@@ -594,12 +628,21 @@ mod tests {
         let sync = &display_iface().requests[0];
         let mut c = c_tables();
         let m = msg(0, 0, vec![Argument::NewId(0x8000_0000)]);
-        c.apply(Dir::ServerToClient, &m, sync, display_iface()).unwrap();
-        assert_eq!(c.server.get(&0x8000_0000).unwrap().iface.name, "wl_callback");
+        c.apply(Dir::ServerToClient, &m, sync, display_iface())
+            .unwrap();
+        assert_eq!(
+            c.server.get(&0x8000_0000).unwrap().iface.name,
+            "wl_callback"
+        );
         // The same ID in a Rust-convention connection is a violation.
         let mut r = rust_tables();
         let err = r
-            .apply(Dir::ServerToClient, &msg(1, 0, vec![Argument::NewId(0x8000_0000)]), sync, display_iface())
+            .apply(
+                Dir::ServerToClient,
+                &msg(1, 0, vec![Argument::NewId(0x8000_0000)]),
+                sync,
+                display_iface(),
+            )
             .unwrap_err();
         assert!(err.0.contains("client-range"), "{}", err.0);
     }
@@ -611,7 +654,9 @@ mod tests {
         // the compositor must allocate server-range IDs for objects it
         // creates; a client-range ID here is a protocol violation
         let m = msg(1, 0, vec![Argument::NewId(5)]);
-        let err = t.apply(Dir::ServerToClient, &m, sync, display_iface()).unwrap_err();
+        let err = t
+            .apply(Dir::ServerToClient, &m, sync, display_iface())
+            .unwrap_err();
         assert!(err.0.contains("client-range"), "{}", err.0);
     }
 
@@ -638,15 +683,20 @@ mod tests {
             .unwrap();
         assert_eq!(destroy.name, "destroy");
         let m = msg(20, 0, vec![]);
-        t.apply(Dir::ClientToServer, &m, destroy, wl_surface_iface()).unwrap();
-        assert!(t.client.contains_key(&20), "still alive: server side not done");
+        t.apply(Dir::ClientToServer, &m, destroy, wl_surface_iface())
+            .unwrap();
+        assert!(
+            t.client.contains_key(&20),
+            "still alive: server side not done"
+        );
 
         // The server half: the wl_display.delete_id event (wire opcode
         // = the event's 0-based index in the interface = 1).
         let delete_id = &display_iface().events[1];
         assert_eq!(delete_id.name, "delete_id");
         let m = msg(1, 1, vec![Argument::Uint(20)]);
-        t.apply(Dir::ServerToClient, &m, delete_id, display_iface()).unwrap();
+        t.apply(Dir::ServerToClient, &m, delete_id, display_iface())
+            .unwrap();
         assert!(!t.client.contains_key(&20), "removed after both halves");
     }
 
@@ -655,7 +705,12 @@ mod tests {
         let mut t = c_tables();
         let delete_id = &display_iface().events[1];
         let err = t
-            .apply(Dir::ServerToClient, &msg(0, 1, vec![Argument::Uint(0)]), delete_id, display_iface())
+            .apply(
+                Dir::ServerToClient,
+                &msg(0, 1, vec![Argument::Uint(0)]),
+                delete_id,
+                display_iface(),
+            )
             .unwrap_err();
         assert!(err.0.contains("wl_display"), "{}", err.0);
     }
@@ -665,7 +720,12 @@ mod tests {
         let mut t = rust_tables();
         let delete_id = &display_iface().events[1];
         let err = t
-            .apply(Dir::ServerToClient, &msg(1, 1, vec![Argument::Uint(999)]), delete_id, display_iface())
+            .apply(
+                Dir::ServerToClient,
+                &msg(1, 1, vec![Argument::Uint(999)]),
+                delete_id,
+                display_iface(),
+            )
             .unwrap_err();
         assert!(err.0.contains("never saw"), "{}", err.0);
     }
@@ -691,13 +751,19 @@ mod tests {
     fn newid_of_display_id_is_an_error() {
         let mut t = rust_tables();
         let bind = &registry_bind_iface().requests[0];
-        let m = msg(2, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(4),
-            Argument::NewId(1),
-        ]);
-        let err = t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap_err();
+        let m = msg(
+            2,
+            0,
+            vec![
+                Argument::Uint(7),
+                Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                Argument::Uint(4),
+                Argument::NewId(1),
+            ],
+        );
+        let err = t
+            .apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap_err();
         assert!(err.0.contains("wl_display"), "{}", err.0);
     }
 
@@ -705,16 +771,30 @@ mod tests {
     fn reuse_of_live_id_is_an_error() {
         let mut t = rust_tables();
         let bind = &registry_bind_iface().requests[0];
-        let mk = |id: u32| msg(2, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(4),
-            Argument::NewId(id),
-        ]);
-        t.apply(Dir::ClientToServer, &mk(30), bind, registry_bind_iface()).unwrap();
-        let err = t.apply(Dir::ClientToServer, &mk(30), bind, registry_bind_iface()).unwrap_err();
+        let mk = |id: u32| {
+            msg(
+                2,
+                0,
+                vec![
+                    Argument::Uint(7),
+                    Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                    Argument::Uint(4),
+                    Argument::NewId(id),
+                ],
+            )
+        };
+        t.apply(Dir::ClientToServer, &mk(30), bind, registry_bind_iface())
+            .unwrap();
+        let err = t
+            .apply(Dir::ClientToServer, &mk(30), bind, registry_bind_iface())
+            .unwrap_err();
         assert!(err.0.contains("reused object ID"), "{}", err.0);
-        assert!(err.0.contains("client-destroyed: false, server-destroyed: false"), "{}", err.0);
+        assert!(
+            err.0
+                .contains("client-destroyed: false, server-destroyed: false"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
@@ -734,15 +814,26 @@ mod tests {
             },
         );
         let bind = &registry_bind_iface().requests[0];
-        let m = msg(2, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(4),
-            Argument::NewId(20),
-        ]);
-        let err = t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap_err();
+        let m = msg(
+            2,
+            0,
+            vec![
+                Argument::Uint(7),
+                Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                Argument::Uint(4),
+                Argument::NewId(20),
+            ],
+        );
+        let err = t
+            .apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap_err();
         assert!(err.0.contains("reused object ID 20"), "{}", err.0);
-        assert!(err.0.contains("client-destroyed: true, server-destroyed: false"), "{}", err.0);
+        assert!(
+            err.0
+                .contains("client-destroyed: true, server-destroyed: false"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
@@ -763,13 +854,18 @@ mod tests {
             },
         );
         let bind = &registry_bind_iface().requests[0];
-        let m = msg(2, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(4),
-            Argument::NewId(20),
-        ]);
-        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap();
+        let m = msg(
+            2,
+            0,
+            vec![
+                Argument::Uint(7),
+                Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                Argument::Uint(4),
+                Argument::NewId(20),
+            ],
+        );
+        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap();
         let e = t.client.get(&20).unwrap();
         assert_eq!(e.iface.name, "wl_compositor");
         assert!(!e.client_destroyed && !e.server_destroyed);
@@ -796,15 +892,28 @@ mod tests {
         assert_eq!(done.name, "done");
         assert!(done.is_destructor);
         // wire opcode = the event's 0-based index = 0
-        t.apply(Dir::ServerToClient, &msg(30, 0, vec![Argument::Uint(0)]), done, wl_callback_iface())
-            .unwrap();
+        t.apply(
+            Dir::ServerToClient,
+            &msg(30, 0, vec![Argument::Uint(0)]),
+            done,
+            wl_callback_iface(),
+        )
+        .unwrap();
         let e = t.client.get(&30).unwrap();
         assert!(e.client_destroyed && e.server_destroyed);
-        assert!(t.client.contains_key(&30), "ID still allocated until delete_id");
+        assert!(
+            t.client.contains_key(&30),
+            "ID still allocated until delete_id"
+        );
 
         let delete_id = &display_iface().events[1];
-        t.apply(Dir::ServerToClient, &msg(1, 1, vec![Argument::Uint(30)]), delete_id, display_iface())
-            .unwrap();
+        t.apply(
+            Dir::ServerToClient,
+            &msg(1, 1, vec![Argument::Uint(30)]),
+            delete_id,
+            display_iface(),
+        )
+        .unwrap();
         assert!(!t.client.contains_key(&30), "freed after delete_id");
     }
 
@@ -831,7 +940,10 @@ mod tests {
             wl_callback_iface(),
         )
         .unwrap();
-        assert!(!t.server.contains_key(&0xFF00_0010), "both halves done: removed");
+        assert!(
+            !t.server.contains_key(&0xFF00_0010),
+            "both halves done: removed"
+        );
 
         // The server reallocates the same ID (via an event with a
         // NewId; using the display's sync descriptor as the NewId
@@ -844,7 +956,10 @@ mod tests {
             display_iface(),
         )
         .unwrap();
-        assert_eq!(t.server.get(&0xFF00_0010).unwrap().iface.name, "wl_callback");
+        assert_eq!(
+            t.server.get(&0xFF00_0010).unwrap().iface.name,
+            "wl_callback"
+        );
     }
 
     #[test]
@@ -866,7 +981,12 @@ mod tests {
         let commit = &wl_surface_iface().requests[6];
         assert_eq!(commit.name, "commit");
         let err = t
-            .apply(Dir::ClientToServer, &msg(20, 6, vec![]), commit, wl_surface_iface())
+            .apply(
+                Dir::ClientToServer,
+                &msg(20, 6, vec![]),
+                commit,
+                wl_surface_iface(),
+            )
             .unwrap_err();
         assert!(err.0.contains("already destroyed"), "{}", err.0);
     }
@@ -878,13 +998,18 @@ mod tests {
         let err = t.sender_interface(0).unwrap_err(); // the other convention's display
         assert!(err.0.contains("mismatched"), "{}", err.0);
         let bind = &registry_bind_iface().requests[0];
-        let m = msg(2, 0, vec![
-            Argument::Uint(7),
-            Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
-            Argument::Uint(4),
-            Argument::NewId(40),
-        ]);
-        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface()).unwrap();
+        let m = msg(
+            2,
+            0,
+            vec![
+                Argument::Uint(7),
+                Argument::Str(Some(Box::new(CString::new(b"wl_compositor").unwrap()))),
+                Argument::Uint(4),
+                Argument::NewId(40),
+            ],
+        );
+        t.apply(Dir::ClientToServer, &m, bind, registry_bind_iface())
+            .unwrap();
         assert_eq!(t.sender_interface(40).unwrap().name, "wl_compositor");
         assert!(t.sender_interface(41).is_err());
     }
