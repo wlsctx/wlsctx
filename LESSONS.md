@@ -111,3 +111,9 @@ write-up.
    opcode 0 of `wl_data_device`" — deep in `wayland-client`'s event queue,
    far from the real cause. The macro must be a sibling of `fn event`, inside
    the `impl`. — *`tests/proxy_integration.rs` (Srv4).*
+12. **In a mode-based binary, global clap `required*` attributes break the
+    modes that don't need the argument.** `--listen` had
+    `required_unless_present = "socket_activation"`, so the `--decide`
+    one-shot (which never binds a socket) demanded a fake listen path.
+    Keep such arguments optional at parse time and enforce presence in
+    `validate()` for the specific modes that bind. — *commit `26f54c6`.*
