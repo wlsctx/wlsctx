@@ -9,11 +9,33 @@ design.
 
 ## Next up
 
-No single next phase is queued: the remaining work is the deferred
-refinements below (no fixed phase) — CI regeneration of the protocol
-tables, and the SIGHUP reload stub. Most recently done: the broker's
-session decision socket, the Phase 9 audit log, and the Phase 6
-copy-out rate limit.
+No single next phase is queued. Most recently done: the deferred
+refinements (CI regeneration of the protocol tables, the SIGHUP
+rebuild), the broker's session decision socket, the Phase 9 audit
+log, and the Phase 6 copy-out rate limit.
+
+---
+
+## Done: deferred refinements (no fixed phase)
+
+* **`wlr_tables.rs` / `interfaces.rs` regeneration** is wired into CI
+  (`.github/workflows/ci.yml`): the job runs `scripts/gen_interface_table.py`
+  — which now locates the crate sources under `$CARGO_HOME/registry/src`
+  from the pinned Cargo.toml versions (`WLSCTX_CARGO_REGISTRY` /
+  `WLSCTX_<CRATE>_SRC` overrides) — and diffs the result with `git
+  diff --exit-code`, so a protocol XML change that desyncs
+  `interfaces.rs` fails the build; `cargo check` itself is the sync
+  check for `wlr_tables.rs` (the compiler regenerates it from
+  `protocols/*.xml`).
+* **SIGHUP** is a rebuild, not a stub: in `--listen` mode the process
+  re-execs `/proc/self/exe` in place with its original argv and the
+  current environment (the new process re-binds and re-tags the freed
+  socket); in a socket-activated run it exits cleanly instead, and
+  `Restart=always` restarts it with a fresh socket (the activated fd
+  may be `FD_CLOEXEC`, and in tag-and-park mode the compositor may
+  refuse to re-stamp the tagged fd, so an in-place re-exec is not
+  viable there). See `src/proxy/mod.rs` (`interpret_signal`,
+  `LoopEnd`, `re_exec`) and the README's mode section.
 
 ---
 
@@ -88,13 +110,3 @@ traffic it guards; `RUST_LOG=warn` silences the stream). Open
 follow-ups: the Phase 6 notification debounce (above), and extending
 the audit to drag-and-drop (`start_drag` is not audited yet — only
 selections).
-
----
-
-## Deferred refinements (no fixed phase)
-
-* **`wlr_tables.rs` / `interfaces.rs` regeneration** currently depends
-  on `scripts/gen_interface_table.py`; wire it into CI so a protocol
-  XML change can't silently desync the tables.
-* **SIGHUP restart** is a stub (exits 129). Implement an in-place
-  config reload or a clean re-exec.

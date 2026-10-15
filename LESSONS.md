@@ -117,3 +117,20 @@ write-up.
     one-shot (which never binds a socket) demanded a fake listen path.
     Keep such arguments optional at parse time and enforce presence in
     `validate()` for the specific modes that bind. — *commit `26f54c6`.*
+13. **Don't re-exec a socket-activated process to "reload" it.** The
+    activated fd may carry `FD_CLOEXEC` (in which case `execve` closes
+    it, and the `LISTEN_*` env you restore points at a dead number), and
+    where the security context is stamped *on* that very fd
+    (tag-and-park), the compositor may refuse to re-stamp it. In
+    `wlsctx` the SIGHUP rebuild therefore branches on how the listener
+    was obtained: `--listen` re-execs in place (the freed path is
+    re-bound and re-tagged); a socket-activated run exits cleanly and
+    lets `Restart=always` re-pass a fresh fd. — *commits `e390b32`,
+    `6923ea5`.*
+14. **`CString::new` and `CString::from_vec_with_nul` have opposite
+    conventions about the trailing NUL.** `new` treats a trailing NUL
+    as an *interior* NUL and rejects it; `from_vec_with_nul` requires
+    the last byte to already be NUL and never appends one. To convert
+    NUL-free bytes (argv elements, `NAME=value` pairs for `execve`),
+    append the NUL first, then call `from_vec_with_nul`. — *`src/proxy/mod.rs`
+    (`osstring_bytes_to_cstring`).*

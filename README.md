@@ -205,9 +205,15 @@ The binary has four operating modes (the relay logic lives in
 In the tag-and-park and relay modes it runs its signal loop on
 `signalfd(2)` (catatonit-style): `SIGTERM`/`SIGINT` exit cleanly
 (releasing the reference pipe, which invalidates the tagged socket);
-`SIGHUP` exits with status **129** (no restart is implemented —
-in mode A, `Restart=always` brings it back; in mode B the socket dies
-with it).
+`SIGHUP` rebuilds: in mode B (`--listen`) the process re-execs
+`/proc/self/exe` in place with its original arguments (`execve`
+keeps the pid and the blocked-signal mask; the new process re-binds
+and re-tags the freed socket), while in mode A (socket-activated)
+it exits cleanly instead and `Restart=always` restarts it with a
+fresh socket (the activated fd may be `FD_CLOEXEC`, and in
+tag-and-park mode the tag sits on that very fd, which the
+compositor may refuse to re-stamp — so an in-place re-exec is not
+viable there).
 
 ## Images
 
@@ -422,9 +428,11 @@ system can reach it.
   (marked there) and the `--sloppy-names` filter lets nothing through by
   default. Accessibility inside the sandbox does not work until that is
   re-enabled and narrowed.
-- `SIGHUP` in `wlsctx` exits with status 129; there is deliberately no
-  restart logic in the binary (mode A's `Restart=always` covers it;
-  mode B's tagged socket dies with the process).
+- The SIGHUP in-place re-exec (mode B) re-runs the binary at
+  `/proc/self/exe`: in the container deployments the image is frozen
+  at container start, so picking up a *rebuilt* binary still needs a
+  container restart — the re-exec rebuilds state (listeners, tag,
+  connection); it does not update the image.
 - `wl-app@.pod` references `ServiceName=wl-pod@`, a unit that is not in
   this repo.
 - The JetBrains `.sha256.asc` GPG chain could not be exercised in the

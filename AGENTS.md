@@ -11,10 +11,10 @@ host-side broker (`--broker`) that serves both a consent prompt (dropped
 *reads*) and a fire-and-forget copy-out notification (app *writes*,
 `--notify-copy-out`). **README.md is the full architecture/threat-model
 doc — read it before non-trivial changes. TASKS.md tracks deferred
-work (next up: the deferred refinements — CI regeneration of the
-protocol tables, the SIGHUP reload stub; the broker's session
-decision socket, the Phase 9 audit log, and the Phase 6 copy-out
-rate limit are done). LESSONS.md is a short, living
+work; all of it is done so far (the deferred refinements — CI
+regeneration of the protocol tables, the SIGHUP rebuild — plus the
+broker's session decision socket, the Phase 9 audit log, and the
+Phase 6 copy-out rate limit). LESSONS.md is a short, living
 record of hard-won lessons — skim it before non-trivial changes; the
 full write-ups live in `docs/postmortems/`.**
 
@@ -45,10 +45,10 @@ full write-ups live in `docs/postmortems/`.**
 - `tests/broker_integration.rs` — end-to-end tests of the broker
   daemon as a subprocess: multiple pending prompts on the session
   decision socket (list/resolve by id, timeout, refused decides)
-- `TASKS.md` — deferred / follow-up tasks (next: the deferred
-  refinements — CI table regeneration, the SIGHUP stub; the broker's
-  session decision socket, the Phase 9 audit log, and the Phase 6
-  copy-out rate limit are done)
+- `TASKS.md` — deferred / follow-up tasks (all done so far: the
+  deferred refinements — CI table regeneration, the SIGHUP rebuild —
+  plus the broker's session decision socket, the Phase 9 audit log,
+  and the Phase 6 copy-out rate limit)
 - `LESSONS.md` — a short, living record of hard-won lessons from past
   work; add a line whenever a change teaches something durable, and
   promote long entries to `docs/postmortems/`
@@ -116,4 +116,4 @@ full write-ups live in `docs/postmortems/`.**
   wayland-protocols 0.32.9 (features `client, staging, unstable`),
   rustix 1.1.2, nix 0.30.1, serde/serde_json.
 - This is a personal WIP repo: several configs are intentionally mid-tuning
-  (commented knobs in drop-ins, stub SIGHUP handler, loose at-spi filter).
+  (commented knobs in drop-ins, loose at-spi filter).
