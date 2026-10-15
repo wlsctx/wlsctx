@@ -406,10 +406,6 @@ fn format_secs(ms: u64) -> String {
 /// with the security context, hold the reference pipe, park until
 /// killed. Apps connect to the tagged socket directly.
 fn run_tag_and_park(cli: &Cli) -> Result<()> {
-    // Capture before obtain_listener(): in a socket-activated run it
-    // consumes (unsets) the LISTEN_* environment, and the SIGHUP
-    // re-exec must restore it for the new process.
-    let activation = wlsctx::proxy::ActivationEnv::capture();
     let (app_id, instance_id, listener) = obtain_listener(cli)?;
 
     if log_enabled!(Level::Info)
@@ -438,14 +434,27 @@ fn run_tag_and_park(cli: &Cli) -> Result<()> {
         wlsctx::proxy::LoopEnd::ReExec => {
             // SIGHUP: release everything the tag depends on. Closing
             // the reference pipe invalidates the old tag; dropping the
-            // listener frees the socket path for the new process to
-            // re-bind (the socket-activated fd, if any, survives the
-            // exec and is re-taken from the restored LISTEN_* env).
+            // listener frees the socket path / closes the activated fd.
             // (The setup connection was already consumed by the
             // tagging exchange.)
             drop(close_fd);
             drop(listener);
-            wlsctx::proxy::re_exec(&activation).with_context(|| "SIGHUP re-exec failed")?;
+            if cli.socket_activation {
+                // Socket-activated run: the socket came from systemd and
+                // a re-exec can't re-take it in place (the fd may be
+                // CLOEXEC, and in tag-and-park mode the tag sits on that
+                // fd, which the compositor may refuse to re-stamp). Exit
+                // cleanly instead: with Restart=always, systemd restarts
+                // us and re-passes a fresh socket, which we tag fresh.
+                info!(
+                    "SIGHUP: socket-activated; exiting for a systemd restart \
+                     (a fresh socket is re-passed and re-tagged)"
+                );
+            } else {
+                // --listen path mode: in-place re-exec; the new process
+                // re-binds the freed path.
+                wlsctx::proxy::re_exec().with_context(|| "SIGHUP re-exec failed")?;
+            }
         }
     }
     info!("Shutting down.");
@@ -456,8 +465,6 @@ fn run_tag_and_park(cli: &Cli) -> Result<()> {
 /// to the public socket is relayed to the compositor through a fresh
 /// security-context connection to it.
 fn run_proxy(cli: &Cli) -> Result<()> {
-    // Capture before obtain_listener(): see run_tag_and_park.
-    let activation = wlsctx::proxy::ActivationEnv::capture();
     let (app_id, instance_id, public) = obtain_listener(cli)?;
     let tagged_path = resolve_listener_path(cli.tagged_socket.as_deref().unwrap())?;
     let tagged = wlsctx::proxy::bind_listener(&tagged_path)
@@ -557,15 +564,29 @@ fn run_proxy(cli: &Cli) -> Result<()> {
             // SIGHUP: close the reference pipe (invalidating the old
             // tag — the compositor keeps its copy of the old tagged
             // socket until the hangup) and close the public listener
-            // so the new process re-binds the path. In-flight app
-            // connections are severed by the exec (the relay is
-            // per-connection); the new process re-binds both
-            // listeners and creates a fresh context on the fresh
-            // tagged socket. (The setup connection was already
+            // (freeing its path, or closing the activated fd).
+            // In-flight app connections are severed (the relay is
+            // per-connection). (The setup connection was already
             // consumed by the tagging exchange.)
             drop(close_fd);
             drop(public);
-            wlsctx::proxy::re_exec(&activation).with_context(|| "SIGHUP re-exec failed")?;
+            if cli.socket_activation {
+                // Socket-activated run: the public socket came from
+                // systemd and a re-exec can't re-take it in place (the
+                // fd may be CLOEXEC). Exit cleanly instead: with
+                // Restart=always, systemd restarts us and re-passes a
+                // fresh public socket; the tagged socket is re-bound
+                // and re-tagged fresh on the new run.
+                info!(
+                    "SIGHUP: socket-activated; exiting for a systemd restart \\
+                     (a fresh socket is re-passed and the tag re-created)"
+                );
+            } else {
+                // --listen path mode: in-place re-exec; the new process
+                // re-binds both listeners and creates a fresh context on
+                // the fresh tagged socket.
+                wlsctx::proxy::re_exec().with_context(|| "SIGHUP re-exec failed")?;
+            }
         }
     }
     info!("Shutting down.");

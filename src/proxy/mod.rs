@@ -1182,8 +1182,8 @@ fn spawn_relay(
 /// If `stop` is `None` the loop is the process's signal handler: the
 /// signalfd-bound mask is blocked on this thread; SIGTERM/SIGINT make
 /// it return [`LoopEnd::Stopped`] and SIGHUP makes it return
-/// [`LoopEnd::ReExec`] (the caller re-execs; in-flight relays are
-/// severed by the exec). If `stop` is `Some`, no signals are handled:
+/// [`LoopEnd::ReExec`] (the caller rebuilds; in-flight relays are
+/// severed by the re-exec or the exit that follows). If `stop` is `Some`, no signals are handled:
 /// the loop polls with a 200 ms timeout and returns
 /// [`LoopEnd::Stopped`] as soon as the flag is set (the test hook).
 pub fn event_loop(
@@ -1289,8 +1289,9 @@ pub enum SignalAction {
     Continue,
     /// Exit cleanly: SIGTERM/SIGINT.
     Exit,
-    /// Re-exec: SIGHUP. The loop returns; the caller releases its
-    /// state and re-execs (see [`re_exec`]).
+    /// Rebuild: SIGHUP. The loop returns; the caller releases its
+    /// state and rebuilds (in-place re-exec in `--listen` mode, clean
+    /// exit in a socket-activated run; see [`re_exec`]).
     ReExec,
 }
 
@@ -1299,27 +1300,35 @@ pub enum SignalAction {
 pub enum LoopEnd {
     /// Asked to stop: SIGTERM/SIGINT, or the test stop flag.
     Stopped,
-    /// SIGHUP: the caller must re-exec the binary with its original
-    /// argv/env after releasing its state.
+    /// SIGHUP: after releasing its state the caller rebuilds
+    /// (in-place re-exec in `--listen` mode, clean exit for a systemd
+    /// restart in a socket-activated run).
     ReExec,
 }
 
 /// Map one signal to the loop's action.
 ///
-/// SIGHUP is a **re-exec**, not an exit: wlsctx has no config file to
-/// reload (everything is a CLI argument fixed at spawn), so "reload"
-/// means rebuilding the whole state — the compositor connection, the
-/// security context on the tagged listener, the listeners themselves.
-/// A re-exec with the original argv does exactly that: `execve`
-/// keeps the pid (systemd sees a continuous service), the fd table
-/// (an activated listener survives this way), and the blocked-signal
-/// mask (the signalfd contract survives), and the socket-activation
-/// environment is restored from [`ActivationEnv`] so the re-exec'd
-/// process re-takes the same listeners.
+/// SIGHUP asks for a **rebuild**, not an exit: wlsctx has no config
+/// file to reload (everything is a CLI argument fixed at spawn), so
+/// "reload" means rebuilding the whole state — the compositor
+/// connection, the security context on the tagged listener, the
+/// listeners themselves. How the caller rebuilds depends on how the
+/// listener was obtained:
 ///
-/// In proxy mode the re-exec severs in-flight app connections (the
-/// relay is per-connection); tag-and-park is unaffected — apps talk
-/// to the socket directly and a re-tag is transparent to them.
+/// - `--listen` path mode: an in-place re-exec ([`re_exec`]).
+///   `execve` keeps the pid (systemd sees a continuous service) and
+///   the blocked-signal mask (the signalfd contract survives); the
+///   freed socket path is re-bound and re-tagged by the new process.
+/// - Socket-activated mode: the caller exits cleanly instead. The
+///   activated fd may carry `FD_CLOEXEC` (in which case `execve`
+///   closes it anyway), and in tag-and-park mode the tag sits on that
+///   very fd, which the compositor may refuse to re-stamp. With
+///   `Restart=always` systemd restarts the service and re-passes a
+///   fresh socket, which the new process tags fresh.
+///
+/// In proxy mode the rebuild severs in-flight app connections (the
+/// relay is per-connection); tag-and-park is unaffected — apps
+/// talk to the socket directly and a re-tag is transparent to them.
 pub fn interpret_signal(signal: Signal) -> SignalAction {
     debug!("Signal: {signal:?}");
     match signal {
@@ -1329,8 +1338,8 @@ pub fn interpret_signal(signal: Signal) -> SignalAction {
         }
         SIGHUP => {
             info!(
-                "SIGHUP received: the process will re-exec with its original arguments \
-                 (fresh compositor connection, fresh security context, re-bound listeners)"
+                "SIGHUP received: rebuilding — fresh compositor connection, fresh \
+                 security context, re-bound listeners"
             );
             SignalAction::ReExec
         }
@@ -1372,72 +1381,6 @@ fn handle_signal(sigfd: &SignalFd) -> io::Result<SignalAction> {
     Ok(interpret_signal(signal))
 }
 
-/// The systemd socket-activation environment, captured **before**
-/// `listen_fds_with_names(true)` consumes it.
-///
-/// The consumption unsets the variables, but the fd numbers they
-/// describe survive `execve` (the fd table is inherited) and the pid
-/// does not change either, so restoring the captured values is
-/// exactly what the re-exec'd process needs to re-take the same
-/// listeners. A non-activated run captures nothing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ActivationEnv {
-    pub listen_fds: Option<String>,
-    pub listen_pid: Option<String>,
-    pub listen_fdnames: Option<String>,
-}
-
-impl ActivationEnv {
-    /// Capture the current activation environment (call this before
-    /// anything consumes the variables).
-    pub fn capture() -> Self {
-        Self {
-            listen_fds: std::env::var("LISTEN_FDS").ok(),
-            listen_pid: std::env::var("LISTEN_PID").ok(),
-            listen_fdnames: std::env::var("LISTEN_FDNAMES").ok(),
-        }
-    }
-
-    /// The current process environment with the captured variables
-    /// restored (they are unset after the first consumption), as
-    /// `execve`'s `env` argument: `NAME=value` strings, NUL-terminated.
-    ///
-    /// # Errors
-    /// An `InvalidInput` error if an environment variable contains an
-    /// interior NUL (impossible in a process that started correctly —
-    /// `execve` itself rejects them).
-    pub fn env(&self) -> io::Result<Vec<CString>> {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let mut out = Vec::new();
-        for (k, v) in std::env::vars_os() {
-            // Robust against a stale consumer: skip any present;
-            // the captured values are restored below.
-            let name = k.as_os_str();
-            if name == "LISTEN_FDS" || name == "LISTEN_PID" || name == "LISTEN_FDNAMES" {
-                continue;
-            }
-            let mut pair = k.as_bytes().to_vec();
-            pair.push(b'=');
-            pair.extend_from_slice(v.as_bytes());
-            out.push(osstring_bytes_to_cstring(&pair)?);
-        }
-        for (name, value) in [
-            ("LISTEN_FDS", &self.listen_fds),
-            ("LISTEN_PID", &self.listen_pid),
-            ("LISTEN_FDNAMES", &self.listen_fdnames),
-        ] {
-            if let Some(value) = value {
-                let mut pair = name.as_bytes().to_vec();
-                pair.push(b'=');
-                pair.extend_from_slice(value.as_bytes());
-                out.push(osstring_bytes_to_cstring(&pair)?);
-            }
-        }
-        Ok(out)
-    }
-}
-
 /// Turn raw bytes (an `OsStr` or a `NAME=value` pair) into a
 /// NUL-terminated `CString`. The NUL is appended here; the input must
 /// not contain any. (Note the std asymmetry: `CString::new` rejects a
@@ -1457,8 +1400,8 @@ fn osstring_bytes_to_cstring(bytes: &[u8]) -> io::Result<CString> {
     })
 }
 
-/// Re-exec the running binary with its original argv and (restored)
-/// environment.
+/// Re-exec the running binary with its original argv and the current
+/// process environment.
 ///
 /// The target is `/proc/self/exe` — the very image that is running,
 /// independent of how it was launched (the quadlet container path
@@ -1466,7 +1409,12 @@ fn osstring_bytes_to_cstring(bytes: &[u8]) -> io::Result<CString> {
 /// it returns an error so the caller can exit with a distinguishable
 /// status rather than carry on in the stale state the HUP asked to
 /// rebuild.
-pub fn re_exec(activation: &ActivationEnv) -> io::Result<()> {
+///
+/// This is only called in `--listen` path mode: in a socket-activated
+/// run the caller exits instead (the activated fd may not survive an
+/// `execve`), so no `LISTEN_*` restoration is needed — there the
+/// variables are not in the environment at all.
+pub fn re_exec() -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let os_argv: Vec<OsString> = std::env::args_os().collect();
@@ -1480,7 +1428,14 @@ pub fn re_exec(activation: &ActivationEnv) -> io::Result<()> {
         .iter()
         .map(|a| osstring_bytes_to_cstring(a.as_bytes()))
         .collect::<io::Result<_>>()?;
-    let env = activation.env()?;
+    let env: Vec<CString> = std::env::vars_os()
+        .map(|(k, v)| {
+            let mut pair = k.as_bytes().to_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(v.as_bytes());
+            osstring_bytes_to_cstring(&pair)
+        })
+        .collect::<io::Result<_>>()?;
     let exe = c"/proc/self/exe";
     nix::unistd::execve(exe, &argv, &env)
         .map_err(|e| io::Error::other(format!("re-exec (execve of /proc/self/exe) failed: {e}")))?;
@@ -1488,14 +1443,15 @@ pub fn re_exec(activation: &ActivationEnv) -> io::Result<()> {
     unreachable!("execve succeeded, but it never returns")
 }
 
-/// Block on a signalfd until the process should stop or re-exec.
+/// Block on a signalfd until the process should stop or rebuild.
 ///
 /// This is the "tag-and-park" main loop. SIGTERM/SIGINT end it with
 /// [`LoopEnd::Stopped`]; SIGHUP ends it with [`LoopEnd::ReExec`] —
-/// the caller (the binary) releases its state and re-execs, so the
-/// same pid comes back with a fresh compositor connection, a fresh
-/// tag on the listen socket, and (in a socket-activated run) the
-/// same listener fd.
+/// the caller (the binary) releases its state and rebuilds: an
+/// in-place re-exec in `--listen` mode (the same pid comes back with
+/// a fresh compositor connection and a fresh tag on the re-bound
+/// listen socket), or a clean exit in a socket-activated run
+/// (systemd restarts and re-passes a fresh socket).
 ///
 /// This signal handler is inspired by the implementation in catatonit:
 /// <https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b3ce/catatonit.c#L538-L588>
@@ -1544,68 +1500,5 @@ mod tests {
         let c = osstring_bytes_to_cstring(b"LISTEN_FDS=3").unwrap();
         assert_eq!(c.to_bytes_with_nul(), b"LISTEN_FDS=3\0");
         assert!(osstring_bytes_to_cstring(b"has\0nul").is_err());
-    }
-
-    fn env_strings(env: Vec<CString>) -> Vec<String> {
-        env.into_iter()
-            .map(|c| c.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    #[test]
-    fn activation_env_restores_only_what_was_captured() {
-        let activation = ActivationEnv {
-            listen_fds: Some("3".into()),
-            listen_pid: Some("12345".into()),
-            listen_fdnames: None,
-        };
-        let env = env_strings(activation.env().unwrap());
-        let names: Vec<String> = env
-            .iter()
-            .map(|v| v.split('=').next().unwrap().to_string())
-            .collect();
-        let count = |name: &str| names.iter().filter(|n| *n == name).count();
-        assert_eq!(count("LISTEN_FDS"), 1);
-        assert_eq!(count("LISTEN_PID"), 1);
-        assert_eq!(count("LISTEN_FDNAMES"), 0);
-        assert!(env.contains(&"LISTEN_FDS=3".to_string()));
-        assert!(env.contains(&"LISTEN_PID=12345".to_string()));
-        // The current environment (whatever the test runner set) is
-        // otherwise untouched: exactly the non-LISTEN entries plus
-        // the two restored ones.
-        let count = std::env::vars_os()
-            .filter(|(k, _)| {
-                let n = k.as_os_str();
-                !(n == "LISTEN_FDS" || n == "LISTEN_PID" || n == "LISTEN_FDNAMES")
-            })
-            .count();
-        assert_eq!(env.len(), count + 2);
-    }
-
-    #[test]
-    fn activation_env_default_adds_nothing() {
-        let env = env_strings(ActivationEnv::default().env().unwrap());
-        let names: Vec<&str> = env.iter().map(|v| v.split('=').next().unwrap()).collect();
-        assert!(!names.contains(&"LISTEN_FDS"));
-        assert!(!names.contains(&"LISTEN_PID"));
-        assert!(!names.contains(&"LISTEN_FDNAMES"));
-    }
-
-    #[test]
-    fn activation_env_capture_reads_the_real_env() {
-        // Whatever the test runner's environment is, capture() must
-        // round-trip through env(): the variables it found (if any)
-        // must be exactly the ones env() restores.
-        let cap = ActivationEnv::capture();
-        let env = env_strings(cap.env().unwrap());
-        if let Some(v) = &cap.listen_fds {
-            assert!(env.contains(&format!("LISTEN_FDS={v}")));
-        }
-        if let Some(v) = &cap.listen_pid {
-            assert!(env.contains(&format!("LISTEN_PID={v}")));
-        }
-        if let Some(v) = &cap.listen_fdnames {
-            assert!(env.contains(&format!("LISTEN_FDNAMES={v}")));
-        }
     }
 }
