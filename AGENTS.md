@@ -12,7 +12,9 @@ host-side broker (`--broker`) that serves both a consent prompt (dropped
 `--notify-copy-out`). **README.md is the full architecture/threat-model
 doc — read it before non-trivial changes. TASKS.md tracks deferred
 work (next up: rate-limit the Phase 6 copy-out notification; the
-selection-audit log, Phase 9, is done).**
+selection-audit log, Phase 9, is done). LESSONS.md is a short, living
+record of hard-won lessons — skim it before non-trivial changes; the
+full write-ups live in `docs/postmortems/`.**
 
 ## Layout
 
@@ -35,6 +37,12 @@ selection-audit log, Phase 9, is done).**
 - `TASKS.md` — deferred / follow-up tasks (next: rate-limit the Phase
   6 copy-out notification; the gate already records writes via
   `ClipboardGate::set_selection`)
+- `LESSONS.md` — a short, living record of hard-won lessons from past
+  work; add a line whenever a change teaches something durable, and
+  promote long entries to `docs/postmortems/`
+- `docs/postmortems/` — full write-ups of significant bugs/fixes (one
+  per incident), referenced from `LESSONS.md`; currently the
+  fd-misrouting post-mortem
 - `scripts/gen_interface_table.py` — generates
   `src/proxy/interfaces.rs` and `src/proxy/wlr_tables.rs` from the
   protocol XMLs; do not hand-edit the generated files
