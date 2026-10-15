@@ -33,12 +33,10 @@ struct Cli {
     /// --broker/--decide mode)
     #[arg(long, env = "WLSCTX_SANDBOX_ENGINE")]
     sandbox_engine: Option<String>,
-    /// Listen on Unix socket
-    #[arg(
-        long,
-        env = "WLSCTX_SOCKET_PATH",
-        required_unless_present = "socket_activation"
-    )]
+    /// Listen on Unix socket (required in tag-and-park and proxy
+    /// mode unless --socket-activation is set; the broker needs it
+    /// too in non-activated runs; --decide never listens)
+    #[arg(long, env = "WLSCTX_SOCKET_PATH")]
     listen: Option<path::PathBuf>,
     /// Receive socket via systemd socket activation (LISTEN_FDS)
     #[arg(long, conflicts_with = "listen")]
@@ -206,6 +204,12 @@ fn validate(cli: &Cli) -> Result<()> {
         bail!(
             "--tagged-socket ({p:?}) is only valid together with --proxy; \
              in tag-and-park mode the --listen socket itself is the tagged one"
+        );
+    }
+    if !cli.broker && !cli.decide && cli.listen.is_none() && !cli.socket_activation {
+        bail!(
+            "--listen <SOCKET> is required (or set WLSCTX_SOCKET_PATH, or use \
+             --socket-activation) in tag-and-park and proxy modes"
         );
     }
     if !cli.proxy && !cli.allow_globals.is_empty() {
@@ -698,7 +702,10 @@ mod tests {
     #[test]
     fn requires_listen_without_socket_activation() {
         without_wlsctx_env(|| {
-            let err = Cli::try_parse_from([
+            // --listen is optional at parse time so that --decide (which
+            // never listens) can parse; validate() rejects its absence
+            // in tag-and-park and proxy modes.
+            let cli = Cli::try_parse_from([
                 "wlsctx",
                 "--app-id",
                 "a",
@@ -707,8 +714,25 @@ mod tests {
                 "--sandbox-engine",
                 "podman",
             ])
-            .expect_err("--listen is required unless --socket-activation is set");
-            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            .expect("listen is optional at parse time");
+            let err = validate(&cli).unwrap_err();
+            assert!(
+                err.to_string().contains("--listen <SOCKET> is required"),
+                "{err}"
+            );
+        });
+    }
+
+    #[test]
+    fn decide_parses_without_listen() {
+        without_wlsctx_env(|| {
+            // The decider is a one-shot client of the broker's decision
+            // socket: it never binds one, so --listen must not be
+            // required in this mode (clap used to demand it in every
+            // mode, which made `wlsctx --decide` need a fake path).
+            let cli =
+                Cli::try_parse_from(["wlsctx", "--decide"]).expect("decide needs no listen socket");
+            validate(&cli).expect("decide mode validates without a listen socket");
         });
     }
 
