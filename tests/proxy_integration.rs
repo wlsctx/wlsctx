@@ -1174,6 +1174,76 @@ no_events!(
     wl_data_offer::Event
 );
 
+/// The burst app for the copy-out rate-limit test (Phase 6
+/// follow-up): a *rapid copier* — two back-to-back `set_selection`s
+/// in one flush — then it destroys its objects and leaves. It never
+/// reads: the compositor's echoes (the `selection` events) prove the
+/// writes were forwarded, and the assertion is on the notification
+/// count.
+struct BurstApp {
+    /// `(global name, interface, version)` from `wl_registry.global`.
+    globals: Vec<(u32, String, u32)>,
+    /// How many `selection` events with a non-NULL offer arrived.
+    selections: u32,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for BurstApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            state.globals.push((name, interface, version));
+        }
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for BurstApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // data_offer / enter / leave / motion / drop: unused here.
+        if let wl_data_device::Event::Selection { id: Some(offer) } = event {
+            state.selections += 1;
+            offer.destroy();
+        }
+    }
+
+    // The `data_offer` event creates a `wl_data_offer` child; the
+    // macro above only handles events, so the user-data
+    // specialization has to be given explicitly.
+    wayland_client::event_created_child!(BurstApp, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+
+no_events!(
+    BurstApp,
+    wl_data_device_manager::WlDataDeviceManager,
+    wl_data_device_manager::Event
+);
+no_events!(
+    BurstApp,
+    wl_data_source::WlDataSource,
+    wl_data_source::Event
+);
+no_events!(BurstApp, wl_seat::WlSeat, wl_seat::Event);
+no_events!(BurstApp, wl_data_offer::WlDataOffer, wl_data_offer::Event);
+
 /// One clipboard session through the proxy: the app copies (its own
 /// selection) and then reads a foreign one. Returns the contents of
 /// the two memfds after the session.
@@ -2976,6 +3046,236 @@ fn copy_out_write_fires_a_notification() {
 #[test]
 fn copy_out_fail_open_when_no_broker() {
     run_copy_out_session(false);
+}
+
+/// One burst session through the proxy: the app issues two
+/// back-to-back `set_selection`s (two sources, one flush — the
+/// relay's pump pass sees both writes microseconds apart, well
+/// inside the rate-limit window) and waits for the compositor to
+/// echo both (two `selection` events). No reads: the echo itself
+/// proves each write was forwarded, unaltered.
+fn one_copy_out_burst_session(
+    public_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let stream = UnixStream::connect(public_path)?;
+    let conn = Connection::from_socket(stream)?;
+    let mut app = BurstApp {
+        globals: Vec::new(),
+        selections: 0,
+    };
+    let mut eq = conn.new_event_queue::<BurstApp>();
+    let qh = eq.handle();
+    let display = conn.display();
+    let registry = display.get_registry(&qh, ());
+    eq.roundtrip(&mut app)?;
+
+    let ddm_name = app
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_data_device_manager")
+        .ok_or("no wl_data_device_manager global in the registry")?
+        .0;
+    let seat_name = app
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_seat")
+        .ok_or("no wl_seat global in the registry")?
+        .0;
+
+    let ddm = registry.bind::<wl_data_device_manager::WlDataDeviceManager, (), BurstApp>(
+        ddm_name,
+        3,
+        &qh,
+        (),
+    );
+    let seat = registry.bind::<wl_seat::WlSeat, (), BurstApp>(seat_name, 10, &qh, ());
+    let device = ddm.get_data_device(&seat, &qh, ());
+
+    // The rapid copier: two sources, two back-to-back
+    // `set_selection`s, all flushed in one go — one datagram, so the
+    // relay processes the two writes in the same pump pass (the
+    // window the rate limit collapses).
+    let source1 = ddm.create_data_source(&qh, ());
+    source1.offer("text/plain".into());
+    let source2 = ddm.create_data_source(&qh, ());
+    source2.offer("text/plain".into());
+    device.set_selection(Some(&source1), 0);
+    device.set_selection(Some(&source2), 0);
+    eq.flush()?;
+
+    // Pump until the compositor has echoed both writes, with a
+    // deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        eq.blocking_dispatch(&mut app)?;
+        if app.selections == 2 {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(format!("timed out: selections={}", app.selections).into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    eq.flush()?;
+
+    // Tear down (each destructor is answered by a `delete_id`, so the
+    // blocking read also surfaces any pending protocol error; the
+    // stable `wl_data_device` is released, not destroyed).
+    source1.destroy();
+    source2.destroy();
+    device.release();
+    seat.release();
+    eq.blocking_dispatch(&mut app)?;
+    eq.dispatch_pending(&mut app)?;
+    assert!(
+        conn.protocol_error().is_none(),
+        "protocol error: {:?}",
+        conn.protocol_error()
+    );
+    Ok(())
+}
+
+/// Phase 6 follow-up: the copy-out rate limit. The same three-party
+/// session as the single-write test above, but the app is a rapid
+/// copier (two back-to-back `set_selection`s). With a reachable
+/// stand-in broker the burst fires *exactly one* notification
+/// (per selection, per app: at most one per window); with none,
+/// nothing is recorded and both writes still go through (fail-open).
+fn run_copy_out_burst_session(broker_reachable: bool) {
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+    let broker_path = dir.path().join("broker.sock");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let notifications: Arc<Mutex<Vec<(String, String, String)>>> = Arc::default();
+
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let broker_for_proxy = broker_path.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            let broker_cfg = wlsctx::proxy::BrokerConfig {
+                socket: broker_for_proxy,
+                app: "testapp".into(),
+                instance: "inst".into(),
+                notify_copy_out: true,
+                ..Default::default()
+            };
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                wlsctx::proxy::ClipboardPolicy::Allow,
+                wlsctx::proxy::AuditConfig::default(),
+                Some(broker_cfg),
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
+    let stop_comp = stop.clone();
+    let comp = thread::Builder::new()
+        .name("fake-compositor".into())
+        .spawn(move || {
+            run_fake_data_device_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c)
+        })
+        .unwrap();
+
+    // The stand-in broker: a non-blocking accept loop that reads each
+    // notification line, records it, and never answers (fire-and-forget
+    // — the daemon's `handle_write` behaves the same way).
+    let (notifs_c, broker_c, stop_b) = (notifications.clone(), broker_path.clone(), stop.clone());
+    let broker = thread::Builder::new()
+        .name("broker".into())
+        .spawn(move || {
+            if !broker_reachable {
+                // No listener is bound: the socket file never exists,
+                // so the proxy's connect fails (the fail-open path).
+                thread::sleep(Duration::from_secs(1));
+                return;
+            }
+            let listener = wlsctx::broker::bind_listener(&broker_c).unwrap();
+            let _ = listener.set_nonblocking(true);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut line = String::new();
+                        if wlsctx::broker::read_line(&mut stream, &mut line).is_ok()
+                            && !line.is_empty()
+                            && let Ok(note) = wlsctx::broker::decode_notification(&line)
+                        {
+                            notifs_c.lock().unwrap().push((
+                                note.app,
+                                note.instance,
+                                note.selection,
+                            ));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop_b.load(Ordering::SeqCst) || Instant::now() > deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    one_copy_out_burst_session(&public_path).expect("copy-out burst session failed");
+
+    // The app disconnected; let the compositor's view settle.
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = broker.join();
+    let _ = proxy.join();
+
+    if broker_reachable {
+        let n = notifications.lock().unwrap();
+        assert_eq!(
+            *n,
+            vec![(
+                "testapp".to_string(),
+                "inst".to_string(),
+                "clipboard".to_string()
+            )],
+            "two back-to-back set_selections fired exactly one copy-out notification (the rate limit)"
+        );
+    } else {
+        assert!(
+            notifications.lock().unwrap().is_empty(),
+            "no broker means no recorded notification — but both writes still went through"
+        );
+    }
+
+    drop(dir);
+}
+
+#[test]
+fn copy_out_burst_fires_one_notification() {
+    run_copy_out_burst_session(true);
+}
+
+#[test]
+fn copy_out_burst_fail_open_when_no_broker() {
+    run_copy_out_burst_session(false);
 }
 
 fn wait_until(pred: impl Fn() -> bool, secs: u64) {
