@@ -2739,13 +2739,18 @@ fn run_broker_session(
                     // The daemon's real per-connection path, minus
                     // its accept loop: decode the request, auto-
                     // decide, answer. (The interactive announce and
-                    // decision socket are not on this path.)
+                    // decision socket are not on this path; the core
+                    // is inert in auto mode.)
                     let args = wlsctx::broker::BrokerArgs {
                         runtime_dir: std::env::temp_dir().join("wlsctx-broker-test"),
                         auto_decide: Some(wlsctx::broker::AutoDecide::Allow),
                         timeout: Duration::from_secs(5),
                     };
-                    wlsctx::broker::handle_connection(stream, &args);
+                    wlsctx::broker::handle_connection(
+                        stream,
+                        &args,
+                        &wlsctx::broker::BrokerCore::new(),
+                    );
                 }
                 BrokerOutcome::AutoDeny => {
                     let line = wlsctx::broker::encode_decision(&wlsctx::broker::Decision::Deny {

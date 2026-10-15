@@ -1,6 +1,6 @@
 //! The wlsctx binary: tag-and-park (the default), transparent Wayland
 //! proxy (`--proxy`), the clipboard prompt broker (`--broker`), or
-//! sending a decision to a pending broker prompt (`--decide`).
+//! listing/deciding the broker's pending prompts (`--decide`).
 
 use std::io::Write as _;
 use std::os::fd::FromRawFd;
@@ -108,7 +108,7 @@ struct Cli {
     /// outside the sandbox): each denied foreign clipboard read
     /// arrives as a JSON request on the listen socket, is announced
     /// with a desktop notification, and is allowed or denied by the
-    /// user on a private decision socket (see src/broker.rs)
+    /// user on the session decision socket (see src/broker.rs)
     #[arg(long, conflicts_with = "proxy", conflicts_with = "decide")]
     broker: bool,
     /// (Broker mode) decide every request automatically without
@@ -125,14 +125,21 @@ struct Cli {
         value_name = "MS"
     )]
     broker_timeout_millis: u64,
-    /// Send a decision to the pending broker prompt (the most recent
-    /// one, via the `latest` pointer in the runtime directory) —
-    /// normally invoked by a keybinding or a notification action
+    /// List the broker's pending prompts, or send a decision to one
+    /// of them (the oldest, or the one `--prompt` names) on the
+    /// broker's session decision socket — normally invoked by a
+    /// keybinding or a notification action
     #[arg(long, conflicts_with = "proxy", conflicts_with = "broker")]
     decide: bool,
-    /// (Decide mode) the decision to send: allow or deny
+    /// (Decide mode, optional) the decision to send: allow or deny.
+    /// Without it, `--decide` lists the pending prompts.
     #[arg(long, requires = "decide", value_name = "DECISION")]
     decision: Option<String>,
+    /// (Decide mode) the id of the pending prompt to decide (from
+    /// the `--decide` listing). Omitted: the oldest pending prompt.
+    /// (`--decision` itself requires `--decide`.)
+    #[arg(long, requires = "decision", value_name = "ID")]
+    prompt: Option<u32>,
 }
 
 /// Validate the argument combinations clap cannot express
@@ -165,11 +172,8 @@ fn validate(cli: &Cli) -> Result<()> {
         bail!("{e}");
     }
     if cli.decide
-        && let Err(e) = wlsctx::broker::parse_decision(
-            cli.decision
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--decide needs --decision (allow or deny)"))?,
-        )
+        && let Some(d) = cli.decision.as_deref()
+        && let Err(e) = wlsctx::broker::parse_decision(d)
     {
         bail!("{e}");
     }
@@ -245,7 +249,7 @@ fn main() -> Result<()> {
 fn run_broker(cli: &Cli) -> Result<()> {
     let xdg = std::env::var("XDG_RUNTIME_DIR").context(
         "XDG_RUNTIME_DIR must be set: the broker keeps its decision \
-         sockets and the `latest` pointer in $XDG_RUNTIME_DIR/wlsctx",
+         socket in $XDG_RUNTIME_DIR/wlsctx",
     )?;
     let listener = if cli.socket_activation {
         wlsctx::broker::take_activated_socket().with_context(|| {
@@ -282,37 +286,116 @@ fn run_broker(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Decide mode: send the user's decision to the most recent pending
-/// broker prompt (the one whose decision socket the `latest` pointer
-/// names).
+/// Decide mode: talk to the broker's session decision socket.
+/// Without `--decision`: list the pending prompts (oldest first).
+/// With it: resolve the oldest pending prompt, or the one `--prompt`
+/// names.
 fn run_decide(cli: &Cli) -> Result<()> {
-    let decision = wlsctx::broker::parse_decision(
-        cli.decision
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--decide needs --decision (allow or deny)"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let xdg = std::env::var("XDG_RUNTIME_DIR").context(
-        "XDG_RUNTIME_DIR must be set: the broker's `latest` pointer \
+        "XDG_RUNTIME_DIR must be set: the broker's decision socket \
          lives in $XDG_RUNTIME_DIR/wlsctx",
     )?;
-    let latest = path::PathBuf::from(xdg).join("wlsctx").join("latest");
-    let target = std::fs::read_to_string(&latest)
-        .with_context(|| {
-            format!(
-                "no pending broker prompt ({latest:?} is missing); is a sandboxed app \
-                 waiting for consent right now?"
-            )
-        })?
-        .trim()
-        .to_string();
-    let mut stream = std::os::unix::net::UnixStream::connect(&target)
-        .with_context(|| format!("connecting to the broker decision socket {target:?} failed"))?;
+    let socket = path::PathBuf::from(xdg)
+        .join("wlsctx")
+        .join(wlsctx::broker::DECISION_SOCKET);
+
+    let listing = cli.decision.is_none();
+    let request = if listing {
+        wlsctx::broker::encode_list_request()?
+    } else {
+        let d =
+            wlsctx::broker::parse_decision(cli.decision.as_deref().expect("checked by validate()"))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        wlsctx::broker::encode_decide_request(&d, cli.prompt)?
+    };
+    info!(
+        "decide: {} on the decision socket {socket:?}",
+        if listing {
+            "listing pending prompts"
+        } else {
+            "deciding"
+        }
+    );
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "connecting to the broker decision socket {socket:?} failed (is the broker \
+             running — an --auto-decide broker never binds one?)"
+        )
+    })?;
+    let _ = stream.set_read_timeout(Some(wlsctx::broker::DECIDER_READ_TIMEOUT));
     stream
-        .write_all(wlsctx::broker::encode_user_decision(&decision)?.as_bytes())
-        .context("writing the decision to the broker failed")?;
-    info!("sent {decision:?} to the broker prompt at {target:?}");
-    Ok(())
+        .write_all(request.as_bytes())
+        .context("writing to the broker decision socket failed")?;
+
+    let mut line = String::new();
+    wlsctx::broker::read_line(&mut stream, &mut line)
+        .context("reading the broker's reply on the decision socket failed")?;
+    if line.is_empty() {
+        bail!("the broker decision socket closed without a reply");
+    }
+
+    // The reply is one of three known kinds; each decoder validates
+    // the version and its own kind, so trying them in order
+    // dispatches.
+    match (
+        wlsctx::broker::decode_pending_list(&line),
+        wlsctx::broker::decode_resolution(&line),
+        wlsctx::broker::decode_error_reply(&line),
+    ) {
+        (Ok(list), _, _) => {
+            if list.prompts.is_empty() {
+                println!("no pending broker prompts");
+            } else {
+                for p in &list.prompts {
+                    println!(
+                        "#{:<4} {}/{}  {:<8}  {:<24} ({} left)",
+                        p.id,
+                        p.app,
+                        p.instance,
+                        p.selection,
+                        p.mime,
+                        format_secs(p.expires_in_ms)
+                    );
+                }
+            }
+            Ok(())
+        }
+        (_, Ok(resolved), _) => {
+            info!(
+                "decide: prompt #{} resolved ({})",
+                resolved.prompt, resolved.decision
+            );
+            println!("prompt #{}: {}", resolved.prompt, resolved.decision);
+            Ok(())
+        }
+        (_, _, Ok(err)) => {
+            let msg = match err.reason.as_str() {
+                wlsctx::broker::REASON_NO_PENDING => {
+                    "no pending broker prompt (it may have timed out already)"
+                }
+                wlsctx::broker::REASON_UNKNOWN_PROMPT => {
+                    "unknown prompt (already resolved or expired)"
+                }
+                other => other,
+            };
+            let msg = match err.prompt {
+                Some(id) => format!("prompt #{id}: {msg}"),
+                None => msg.to_string(),
+            };
+            bail!("{msg}")
+        }
+        _ => bail!("malformed reply from the broker decision socket: {line:?}"),
+    }
+}
+
+/// A millisecond count as a short human duration (for the listing).
+fn format_secs(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
 }
 
 /// Tag-and-park (the current/default behaviour): tag the listen socket
