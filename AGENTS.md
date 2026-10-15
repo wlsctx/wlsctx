@@ -11,7 +11,11 @@ host-side broker (`--broker`) that serves both a consent prompt (dropped
 *reads*) and a fire-and-forget copy-out notification (app *writes*,
 `--notify-copy-out`). **README.md is the full architecture/threat-model
 doc — read it before non-trivial changes. TASKS.md tracks deferred work
-(the next item is the selection-audit log).**
+(next up: rate-limit the Phase 6 copy-out notification; the
+selection-audit log, Phase 9, is done). One critical defect is open —
+fd misrouting in `proxy/mod.rs::forward()` when a datagram carries
+more than one fd; the handoff plan is
+`docs/fd-swap-fix-plan.md`.**
 
 ## Layout
 
@@ -19,17 +23,21 @@ doc — read it before non-trivial changes. TASKS.md tracks deferred work
   lifecycle, and the `--broker` / `--decide` entry points
 - `src/lib.rs` — library modules: `proxy/` (the `--proxy` relay: wire
   parser, object bookkeeping, interface tables, global allowlist
-  policy, the selection receive-gate — which also *detects* app writes
-  via `ClipboardGate::writes_selection` — and the broker client),
+  policy, the selection receive-gate — which also *detects* app
+  writes/clears via `ClipboardGate::set_selection` — the broker client,
+  and `audit.rs`, the Phase 9 selection-audit sink: one size-only
+  `key=value` record per `set`/`read`/`clear`/`serve` under the
+  `audit` log target),
   `broker.rs` (the broker daemon: N-D-JSON, one consent
   `clipboard-read` request/response *and* one one-way
   `clipboard-write` notification per connection)
 - `tests/proxy_integration.rs` — three-party integration tests (fake
   compositor, real wayland-client, the relay): pass-through,
-  allowlist, clipboard, primary selection, broker consent, copy-out
-  notification
-- `TASKS.md` — deferred / follow-up tasks (next: the selection-audit
-  log; hooks are already in `forward`)
+  allowlist, clipboard (incl. the selection-audit records), primary
+  selection, broker consent, copy-out notification
+- `TASKS.md` — deferred / follow-up tasks (next: rate-limit the Phase
+  6 copy-out notification; the gate already records writes via
+  `ClipboardGate::set_selection`)
 - `scripts/gen_interface_table.py` — generates
   `src/proxy/interfaces.rs` and `src/proxy/wlr_tables.rs` from the
   protocol XMLs; do not hand-edit the generated files
