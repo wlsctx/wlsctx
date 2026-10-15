@@ -11,8 +11,9 @@ host-side broker (`--broker`) that serves both a consent prompt (dropped
 *reads*) and a fire-and-forget copy-out notification (app *writes*,
 `--notify-copy-out`). **README.md is the full architecture/threat-model
 doc — read it before non-trivial changes. TASKS.md tracks deferred
-work (next up: rate-limit the Phase 6 copy-out notification; the
-selection-audit log, Phase 9, is done). LESSONS.md is a short, living
+work (next up: a single decision socket for the life of a broker
+session; the Phase 9 audit log and the Phase 6 copy-out rate limit
+are done). LESSONS.md is a short, living
 record of hard-won lessons — skim it before non-trivial changes; the
 full write-ups live in `docs/postmortems/`.**
 
@@ -23,7 +24,9 @@ full write-ups live in `docs/postmortems/`.**
 - `src/lib.rs` — library modules: `proxy/` (the `--proxy` relay: wire
   parser, object bookkeeping, interface tables, global allowlist
   policy, the selection receive-gate — which also *detects* app
-  writes/clears via `ClipboardGate::set_selection` — the broker client,
+  writes/clears via `ClipboardGate::set_selection` and rate-limits the
+  Phase 6 copy-out notification (`note_copy_out`, at most one per
+  selection per second) — the broker client,
   and `audit.rs`, the Phase 9 selection-audit sink: one size-only
   `key=value` record per `set`/`read`/`clear`/`serve` under the
   `audit` log target),
@@ -34,9 +37,9 @@ full write-ups live in `docs/postmortems/`.**
   compositor, real wayland-client, the relay): pass-through,
   allowlist, clipboard (incl. the selection-audit records), primary
   selection, broker consent, copy-out notification
-- `TASKS.md` — deferred / follow-up tasks (next: rate-limit the Phase
-  6 copy-out notification; the gate already records writes via
-  `ClipboardGate::set_selection`)
+- `TASKS.md` — deferred / follow-up tasks (next: a single decision
+  socket for the life of a broker session; the Phase 9 audit log and
+  the Phase 6 copy-out rate limit are done)
 - `LESSONS.md` — a short, living record of hard-won lessons from past
   work; add a line whenever a change teaches something durable, and
   promote long entries to `docs/postmortems/`

@@ -35,6 +35,17 @@ write-up.
    post-mortem as a starting point; verify the lines the fix depends on.
    — *post-mortem §2, §9.*
 
+10. **Anchor a rate-limit window on the last *emitted* event, not on every
+    suppressed one.** If every event — including the suppressed ones — reset
+    the window, a continuous stream would suppress itself forever: the first
+    event fires, and each subsequent event keeps the window fresh so nothing
+    ever fires again. Anchoring on the emission instead gives a steady stream
+    exactly one event per window, and re-notifies as soon as the stream pauses
+    for a window. The copy-out notification rate limit
+    (`ClipboardGate::note_copy_out`) does this; the audit log (one record per
+    event, no limit) is what keeps the suppressed ones on the record.
+    — *commit `3931f52` (the Phase 6 follow-up).*
+
 ## Writing tests
 
 4. **Write the test, watch it fail, then fix (red → green).** Don't add a

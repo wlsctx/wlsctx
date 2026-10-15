@@ -7,13 +7,38 @@ design.
 
 ---
 
-## Next up: Phase 6 follow-up — rate-limit the copy-out notification
+## Next up: broker — a single decision socket for the life of the session
 
-**Status:** not started. One `notify-send` per `set_selection` is
-noisy for a rapid copier. A per-app, per-selection debounce (at most
-one notification per N seconds) would need a small per-relay timer;
-the gate already tracks writes (`ClipboardGate::set_selection`), so
-the state is there.
+**Status:** not started. `decide_interactive` (src/broker.rs) binds a
+fresh decision socket per prompt (`broker-<pid>.sock` in the runtime
+dir; the path is announced in the consent notification) and the
+`--decide` path (src/main.rs) reaches only the most recent prompt via
+the `latest` pointer. A single decision socket bound for the life of
+the session, with a `wlsctx --decide` that lists the pending prompts,
+would make multi-prompt sessions serviceable; the per-prompt bind and
+the `latest` pointer are the hook points.
+
+---
+
+## Done: Phase 6 follow-up — rate-limit the copy-out notification
+
+**Status:** implemented (see the commits). At most one notification
+per selection per second, per app: the gate tracks the last *fired*
+notification per selection (`ClipboardGate::note_copy_out`, default
+window `COPY_OUT_NOTIFY_INTERVAL` = 1 s; the two selections keep
+independent windows), so a rapid copier's burst of `set_selection`s
+collapses to one per window. Design decisions taken: the window is
+anchored on the *fired* notification, not on the suppressed writes (a
+continuous stream re-arms once per window and never starves); the
+limit lives on the relay side (one thread per app connection — the
+per-app, per-selection state; the broker daemon stays a dumb
+fire-and-forget announcer); a write is never blocked or delayed
+(fail-open unchanged) and a suppression is a `debug!` line; every
+write still lands in the audit log (Phase 9), which remains the
+persistent record. A `#[cfg(test)]` constructor overrides the window
+so the unit tests don't sleep a second; the integration burst tests
+(`copy_out_burst_*`) drive two back-to-back `set_selection`s in one
+datagram and assert exactly one notification.
 
 ---
 
@@ -40,9 +65,6 @@ selections).
 
 ## Deferred refinements (no fixed phase)
 
-* **Broker: a single decision socket for the life of the session**
-  instead of re-binding per prompt; and a `wlsctx --decide` that lists
-  pending prompts rather than relying on the `latest` pointer.
 * **`wlr_tables.rs` / `interfaces.rs` regeneration** currently depends
   on `scripts/gen_interface_table.py`; wire it into CI so a protocol
   XML change can't silently desync the tables.

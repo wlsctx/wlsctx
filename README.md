@@ -151,12 +151,15 @@ The binary has four operating modes (the relay logic lives in
      whose fd is not an in-memory channel (memfd/pipe/socket) is a
      fatal protocol error in both policies.
    - `--notify-copy-out` (requires `--broker-socket=<path>`) fires a
-     one-way desktop notification to the broker each time the app
+     one-way desktop notification to the broker when the app
      *writes* to the clipboard or primary selection (a `set_selection`)
      — the copy-*out* signal, since that data is now reachable by every
-     client on the desktop. Independent of the policy above (a write is
-     always forwarded); fire-and-forget and fail-open (a missing broker
-     only loses the notice, it never blocks or alters the write).
+     client on the desktop. Rate-limited per selection: at most one
+     notification per second per app (a rapid copier's burst of
+     writes collapses to that; every write still lands in the audit
+     log below). Independent of the policy above (a write is always
+     forwarded); fire-and-forget and fail-open (a missing broker only
+     loses the notice, it never blocks or alters the write).
    - **The selection audit log** (always on, no flag; Phase 9) writes
      one structured line per selection event the relay is on the path
      of: `set` (the app places data on a selection — the copy-out
@@ -330,16 +333,18 @@ broker is wired, explicitly approved by the user first.
   channel into the selection, which anyone on the host can see.
   Blocking it would break the app's own copy-and-paste, so the write is
   **not blocked**; instead it is made *visible*: with
-  `--notify-copy-out` (Phase 6) each write fires a desktop notification
-  naming the app and the selection, and — always on, in both
-  deployment modes — every selection event the relay sees is recorded
-  in the **selection audit log** (Phase 9): one structured line per
-  `set`/`read`/`clear`/`serve` with the app/instance identity, the
-  gate's decision, and the payload *size* (never content), written to
-  the host journal (`audit` log target) — see "The selection audit
-  log" in the binary section above. The clipboard is treated as shared
-  scratch space, not a secret boundary: the notification is a tripwire
-  (opt-in, fail-open), the audit log is the persistent record.
+  `--notify-copy-out` (Phase 6) a write fires a desktop notification
+  naming the app and the selection — rate-limited per selection, at
+  most one per second per app (a rapid copier's burst collapses to
+  that) — and, always on, in both deployment modes, every selection
+  event the relay sees is recorded in the **selection audit log**
+  (Phase 9): one structured line per `set`/`read`/`clear`/`serve` with
+  the app/instance identity, the gate's decision, and the payload
+  *size* (never content), written to the host journal (`audit` log
+  target) — see "The selection audit log" in the binary section above.
+  The clipboard is treated as shared scratch space, not a secret
+  boundary: the notification is a tripwire (opt-in, fail-open,
+  rate-limited), the audit log is the persistent record.
 - **The shared `downloads` volume.** Every app pod mounts the *same*
   `downloads` volume at `~/Downloads` (`noexec`). A compromised app can
   tamper with files another app will open or download later — apps in
