@@ -154,7 +154,7 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags, recvmsg, send, sendmsg,
 };
 use std::collections::HashSet;
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::time::{Duration, Instant};
 
 use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message, MessageDesc};
@@ -1180,11 +1180,12 @@ fn spawn_relay(
 /// relay per connection (each upstream-connects to `tagged_path`).
 ///
 /// If `stop` is `None` the loop is the process's signal handler: the
-/// signalfd-bound mask is blocked on this thread and SIGTERM/SIGINT
-/// make it return `Ok` (SIGHUP exits with status 129, like
-/// [`run_signal_loop`]). If `stop` is `Some`, no signals are handled:
-/// the loop polls with a 200 ms timeout and returns as soon as the flag
-/// is set (the test hook).
+/// signalfd-bound mask is blocked on this thread; SIGTERM/SIGINT make
+/// it return [`LoopEnd::Stopped`] and SIGHUP makes it return
+/// [`LoopEnd::ReExec`] (the caller re-execs; in-flight relays are
+/// severed by the exec). If `stop` is `Some`, no signals are handled:
+/// the loop polls with a 200 ms timeout and returns
+/// [`LoopEnd::Stopped`] as soon as the flag is set (the test hook).
 pub fn event_loop(
     public: &UnixListener,
     tagged_path: &Path,
@@ -1193,7 +1194,7 @@ pub fn event_loop(
     audit: AuditConfig,
     broker: Option<BrokerConfig>,
     stop: Option<Arc<AtomicBool>>,
-) -> io::Result<()> {
+) -> io::Result<LoopEnd> {
     let policy = Arc::new(policy.clone());
     let sigfd = match stop {
         None => Some(setup_signalfd()?),
@@ -1224,8 +1225,10 @@ pub fn event_loop(
             // Index 0 is the signalfd when present; the last entry is
             // always the public listener.
             if let Some(sf) = sigfd.as_ref().filter(|_| idx == 0) {
-                if handle_signal(sf)? {
-                    return Ok(());
+                match handle_signal(sf)? {
+                    SignalAction::Exit => return Ok(LoopEnd::Stopped),
+                    SignalAction::ReExec => return Ok(LoopEnd::ReExec),
+                    SignalAction::Continue => {}
                 }
             } else {
                 match public.accept() {
@@ -1249,7 +1252,7 @@ pub fn event_loop(
         // Test hook: the stop flag is checked on every 200 ms tick.
         let stopped = stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst));
         if stopped {
-            return Ok(());
+            return Ok(LoopEnd::Stopped);
         }
     }
 }
@@ -1278,30 +1281,58 @@ fn setup_signalfd() -> io::Result<SignalFd> {
     SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC).map_err(io::Error::other)
 }
 
-/// Read one signal from the signalfd and act on it.
+/// What a signal asks the loops to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAction {
+    /// Keep serving: SIGCHLD (reap), the stop-signal trio, and every
+    /// other (ignored) signal.
+    Continue,
+    /// Exit cleanly: SIGTERM/SIGINT.
+    Exit,
+    /// Re-exec: SIGHUP. The loop returns; the caller releases its
+    /// state and re-execs (see [`re_exec`]).
+    ReExec,
+}
+
+/// Why a loop returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopEnd {
+    /// Asked to stop: SIGTERM/SIGINT, or the test stop flag.
+    Stopped,
+    /// SIGHUP: the caller must re-exec the binary with its original
+    /// argv/env after releasing its state.
+    ReExec,
+}
+
+/// Map one signal to the loop's action.
 ///
-/// Returns `true` when the process should exit (SIGTERM/SIGINT).
-/// SIGHUP exits with status 129 directly (no restart is implemented);
-/// SIGCHLD reaps children; the rest is ignored.
-fn handle_signal(sigfd: &SignalFd) -> io::Result<bool> {
-    let siginfo = sigfd
-        .read_signal()
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "signalfd closed"))?;
-    let signal = Signal::try_from(siginfo.ssi_signo as i32).map_err(|e| {
-        io::Error::other(format!("unknown signal number {}: {e}", siginfo.ssi_signo))
-    })?;
+/// SIGHUP is a **re-exec**, not an exit: wlsctx has no config file to
+/// reload (everything is a CLI argument fixed at spawn), so "reload"
+/// means rebuilding the whole state — the compositor connection, the
+/// security context on the tagged listener, the listeners themselves.
+/// A re-exec with the original argv does exactly that: `execve`
+/// keeps the pid (systemd sees a continuous service), the fd table
+/// (an activated listener survives this way), and the blocked-signal
+/// mask (the signalfd contract survives), and the socket-activation
+/// environment is restored from [`ActivationEnv`] so the re-exec'd
+/// process re-takes the same listeners.
+///
+/// In proxy mode the re-exec severs in-flight app connections (the
+/// relay is per-connection); tag-and-park is unaffected — apps talk
+/// to the socket directly and a re-tag is transparent to them.
+pub fn interpret_signal(signal: Signal) -> SignalAction {
     debug!("Signal: {signal:?}");
-    Ok(match signal {
+    match signal {
         SIGTERM | SIGINT => {
             debug!("Stopping");
-            true
+            SignalAction::Exit
         }
         SIGHUP => {
-            // No restart is implemented: exit with 129 (128+SIGHUP),
-            // like a process killed by the signal.
-            info!("SIGHUP received; exiting with status 129 (no restart is implemented)");
-            std::process::exit(129);
+            info!(
+                "SIGHUP received: the process will re-exec with its original arguments \
+                 (fresh compositor connection, fresh security context, re-bound listeners)"
+            );
+            SignalAction::ReExec
         }
         SIGCHLD => {
             debug!("Reap zombies");
@@ -1316,35 +1347,265 @@ fn handle_signal(sigfd: &SignalFd) -> io::Result<bool> {
                     _ => break,
                 }
             }
-            false
+            SignalAction::Continue
         }
         SIGTSTP | SIGTTOU | SIGTTIN => {
             debug!("ignoring {signal:?} (the kernel tried to stop us: tty has TOSTOP set)");
-            false
+            SignalAction::Continue
         }
         sig => {
             warn!("Unexpected signal ignored ({sig:#?})");
-            false
+            SignalAction::Continue
         }
+    }
+}
+
+/// Read one signal from the signalfd and interpret it.
+fn handle_signal(sigfd: &SignalFd) -> io::Result<SignalAction> {
+    let siginfo = sigfd
+        .read_signal()
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "signalfd closed"))?;
+    let signal = Signal::try_from(siginfo.ssi_signo as i32).map_err(|e| {
+        io::Error::other(format!("unknown signal number {}: {e}", siginfo.ssi_signo))
+    })?;
+    Ok(interpret_signal(signal))
+}
+
+/// The systemd socket-activation environment, captured **before**
+/// `listen_fds_with_names(true)` consumes it.
+///
+/// The consumption unsets the variables, but the fd numbers they
+/// describe survive `execve` (the fd table is inherited) and the pid
+/// does not change either, so restoring the captured values is
+/// exactly what the re-exec'd process needs to re-take the same
+/// listeners. A non-activated run captures nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivationEnv {
+    pub listen_fds: Option<String>,
+    pub listen_pid: Option<String>,
+    pub listen_fdnames: Option<String>,
+}
+
+impl ActivationEnv {
+    /// Capture the current activation environment (call this before
+    /// anything consumes the variables).
+    pub fn capture() -> Self {
+        Self {
+            listen_fds: std::env::var("LISTEN_FDS").ok(),
+            listen_pid: std::env::var("LISTEN_PID").ok(),
+            listen_fdnames: std::env::var("LISTEN_FDNAMES").ok(),
+        }
+    }
+
+    /// The current process environment with the captured variables
+    /// restored (they are unset after the first consumption), as
+    /// `execve`'s `env` argument: `NAME=value` strings, NUL-terminated.
+    ///
+    /// # Errors
+    /// An `InvalidInput` error if an environment variable contains an
+    /// interior NUL (impossible in a process that started correctly —
+    /// `execve` itself rejects them).
+    pub fn env(&self) -> io::Result<Vec<CString>> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut out = Vec::new();
+        for (k, v) in std::env::vars_os() {
+            // Robust against a stale consumer: skip any present;
+            // the captured values are restored below.
+            let name = k.as_os_str();
+            if name == "LISTEN_FDS" || name == "LISTEN_PID" || name == "LISTEN_FDNAMES" {
+                continue;
+            }
+            let mut pair = k.as_bytes().to_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(v.as_bytes());
+            out.push(osstring_bytes_to_cstring(&pair)?);
+        }
+        for (name, value) in [
+            ("LISTEN_FDS", &self.listen_fds),
+            ("LISTEN_PID", &self.listen_pid),
+            ("LISTEN_FDNAMES", &self.listen_fdnames),
+        ] {
+            if let Some(value) = value {
+                let mut pair = name.as_bytes().to_vec();
+                pair.push(b'=');
+                pair.extend_from_slice(value.as_bytes());
+                out.push(osstring_bytes_to_cstring(&pair)?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Turn raw bytes (an `OsStr` or a `NAME=value` pair) into a
+/// NUL-terminated `CString`. The NUL is appended here; the input must
+/// not contain any. (Note the std asymmetry: `CString::new` rejects a
+/// trailing NUL as "interior", while `from_vec_with_nul` requires the
+/// last byte to already be NUL and does not append one — so append
+/// first, then convert.) Valid `execve` arguments never contain
+/// interior NULs; if one is found that is a caller bug, not a
+/// recoverable condition, so it surfaces as `InvalidInput`.
+fn osstring_bytes_to_cstring(bytes: &[u8]) -> io::Result<CString> {
+    let mut nul = bytes.to_vec();
+    nul.push(0);
+    CString::from_vec_with_nul(nul).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a re-exec argument or environment variable contains an interior NUL",
+        )
     })
 }
 
-/// Block on a signalfd until the process should exit (SIGTERM/SIGINT).
+/// Re-exec the running binary with its original argv and (restored)
+/// environment.
 ///
-/// This is the "tag-and-park" main loop. SIGHUP is not treated as a
-/// restart (none is implemented); the process exits with status 129
-/// (128+SIGHUP), like a process killed by the signal, so the cause is
-/// distinguishable in the journal.
+/// The target is `/proc/self/exe` — the very image that is running,
+/// independent of how it was launched (the quadlet container path
+/// need not be on `PATH`). On success this never returns; on failure
+/// it returns an error so the caller can exit with a distinguishable
+/// status rather than carry on in the stale state the HUP asked to
+/// rebuild.
+pub fn re_exec(activation: &ActivationEnv) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let os_argv: Vec<OsString> = std::env::args_os().collect();
+    if os_argv.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no argv to re-exec with",
+        ));
+    }
+    let argv: Vec<CString> = os_argv
+        .iter()
+        .map(|a| osstring_bytes_to_cstring(a.as_bytes()))
+        .collect::<io::Result<_>>()?;
+    let env = activation.env()?;
+    let exe = c"/proc/self/exe";
+    nix::unistd::execve(exe, &argv, &env)
+        .map_err(|e| io::Error::other(format!("re-exec (execve of /proc/self/exe) failed: {e}")))?;
+    // execve returns Result<Infallible>: success never returns.
+    unreachable!("execve succeeded, but it never returns")
+}
+
+/// Block on a signalfd until the process should stop or re-exec.
+///
+/// This is the "tag-and-park" main loop. SIGTERM/SIGINT end it with
+/// [`LoopEnd::Stopped`]; SIGHUP ends it with [`LoopEnd::ReExec`] —
+/// the caller (the binary) releases its state and re-execs, so the
+/// same pid comes back with a fresh compositor connection, a fresh
+/// tag on the listen socket, and (in a socket-activated run) the
+/// same listener fd.
 ///
 /// This signal handler is inspired by the implementation in catatonit:
-/// <https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b37b3ce/catatonit.c#L538-L588>
-pub fn run_signal_loop() -> anyhow::Result<()> {
+/// <https://github.com/openSUSE/catatonit/blob/56579adbb42c0c7ad94fc12d844b38fc5b3ce/catatonit.c#L538-L588>
+pub fn run_signal_loop() -> anyhow::Result<LoopEnd> {
     let sigfd =
         setup_signalfd().map_err(|e| anyhow::anyhow!("setting up the signalfd failed: {e}"))?;
     loop {
-        if handle_signal(&sigfd)? {
-            break;
+        match handle_signal(&sigfd)? {
+            SignalAction::Continue => {}
+            SignalAction::Exit => return Ok(LoopEnd::Stopped),
+            SignalAction::ReExec => return Ok(LoopEnd::ReExec),
         }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpret_term_and_int_exit() {
+        assert_eq!(interpret_signal(SIGTERM), SignalAction::Exit);
+        assert_eq!(interpret_signal(SIGINT), SignalAction::Exit);
+    }
+
+    #[test]
+    fn interpret_hup_reexecs() {
+        assert_eq!(interpret_signal(SIGHUP), SignalAction::ReExec);
+    }
+
+    #[test]
+    fn interpret_others_continue() {
+        // SIGCHLD: this test process has no children, so the reap
+        // loop finds nothing; the action is Continue regardless.
+        assert_eq!(interpret_signal(SIGCHLD), SignalAction::Continue);
+        assert_eq!(interpret_signal(SIGTSTP), SignalAction::Continue);
+        assert_eq!(interpret_signal(SIGUSR1), SignalAction::Continue);
+    }
+
+    #[test]
+    fn osstring_bytes_to_cstring_appends_the_single_nul() {
+        // The std conversion pair is easy to get wrong: `CString::new`
+        // rejects a trailing NUL as "interior", and
+        // `from_vec_with_nul` requires the last byte to already be
+        // NUL. This helper appends, then converts.
+        let c = osstring_bytes_to_cstring(b"LISTEN_FDS=3").unwrap();
+        assert_eq!(c.to_bytes_with_nul(), b"LISTEN_FDS=3\0");
+        assert!(osstring_bytes_to_cstring(b"has\0nul").is_err());
+    }
+
+    fn env_strings(env: Vec<CString>) -> Vec<String> {
+        env.into_iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn activation_env_restores_only_what_was_captured() {
+        let activation = ActivationEnv {
+            listen_fds: Some("3".into()),
+            listen_pid: Some("12345".into()),
+            listen_fdnames: None,
+        };
+        let env = env_strings(activation.env().unwrap());
+        let names: Vec<String> = env
+            .iter()
+            .map(|v| v.split('=').next().unwrap().to_string())
+            .collect();
+        let count = |name: &str| names.iter().filter(|n| *n == name).count();
+        assert_eq!(count("LISTEN_FDS"), 1);
+        assert_eq!(count("LISTEN_PID"), 1);
+        assert_eq!(count("LISTEN_FDNAMES"), 0);
+        assert!(env.contains(&"LISTEN_FDS=3".to_string()));
+        assert!(env.contains(&"LISTEN_PID=12345".to_string()));
+        // The current environment (whatever the test runner set) is
+        // otherwise untouched: exactly the non-LISTEN entries plus
+        // the two restored ones.
+        let count = std::env::vars_os()
+            .filter(|(k, _)| {
+                let n = k.as_os_str();
+                !(n == "LISTEN_FDS" || n == "LISTEN_PID" || n == "LISTEN_FDNAMES")
+            })
+            .count();
+        assert_eq!(env.len(), count + 2);
+    }
+
+    #[test]
+    fn activation_env_default_adds_nothing() {
+        let env = env_strings(ActivationEnv::default().env().unwrap());
+        let names: Vec<&str> = env.iter().map(|v| v.split('=').next().unwrap()).collect();
+        assert!(!names.contains(&"LISTEN_FDS"));
+        assert!(!names.contains(&"LISTEN_PID"));
+        assert!(!names.contains(&"LISTEN_FDNAMES"));
+    }
+
+    #[test]
+    fn activation_env_capture_reads_the_real_env() {
+        // Whatever the test runner's environment is, capture() must
+        // round-trip through env(): the variables it found (if any)
+        // must be exactly the ones env() restores.
+        let cap = ActivationEnv::capture();
+        let env = env_strings(cap.env().unwrap());
+        if let Some(v) = &cap.listen_fds {
+            assert!(env.contains(&format!("LISTEN_FDS={v}")));
+        }
+        if let Some(v) = &cap.listen_pid {
+            assert!(env.contains(&format!("LISTEN_PID={v}")));
+        }
+        if let Some(v) = &cap.listen_fdnames {
+            assert!(env.contains(&format!("LISTEN_FDNAMES={v}")));
+        }
+    }
 }

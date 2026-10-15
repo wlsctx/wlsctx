@@ -406,6 +406,10 @@ fn format_secs(ms: u64) -> String {
 /// with the security context, hold the reference pipe, park until
 /// killed. Apps connect to the tagged socket directly.
 fn run_tag_and_park(cli: &Cli) -> Result<()> {
+    // Capture before obtain_listener(): in a socket-activated run it
+    // consumes (unsets) the LISTEN_* environment, and the SIGHUP
+    // re-exec must restore it for the new process.
+    let activation = wlsctx::proxy::ActivationEnv::capture();
     let (app_id, instance_id, listener) = obtain_listener(cli)?;
 
     if log_enabled!(Level::Info)
@@ -427,7 +431,23 @@ fn run_tag_and_park(cli: &Cli) -> Result<()> {
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
 
-    wlsctx::proxy::run_signal_loop()?;
+    match wlsctx::proxy::run_signal_loop()? {
+        wlsctx::proxy::LoopEnd::Stopped => {
+            info!("Shutting down.");
+        }
+        wlsctx::proxy::LoopEnd::ReExec => {
+            // SIGHUP: release everything the tag depends on. Closing
+            // the reference pipe invalidates the old tag; dropping the
+            // listener frees the socket path for the new process to
+            // re-bind (the socket-activated fd, if any, survives the
+            // exec and is re-taken from the restored LISTEN_* env).
+            // (The setup connection was already consumed by the
+            // tagging exchange.)
+            drop(close_fd);
+            drop(listener);
+            wlsctx::proxy::re_exec(&activation).with_context(|| "SIGHUP re-exec failed")?;
+        }
+    }
     info!("Shutting down.");
     Ok(())
 }
@@ -436,6 +456,8 @@ fn run_tag_and_park(cli: &Cli) -> Result<()> {
 /// to the public socket is relayed to the compositor through a fresh
 /// security-context connection to it.
 fn run_proxy(cli: &Cli) -> Result<()> {
+    // Capture before obtain_listener(): see run_tag_and_park.
+    let activation = wlsctx::proxy::ActivationEnv::capture();
     let (app_id, instance_id, public) = obtain_listener(cli)?;
     let tagged_path = resolve_listener_path(cli.tagged_socket.as_deref().unwrap())?;
     let tagged = wlsctx::proxy::bind_listener(&tagged_path)
@@ -519,7 +541,7 @@ fn run_proxy(cli: &Cli) -> Result<()> {
         }
         None => None,
     };
-    wlsctx::proxy::event_loop(
+    match wlsctx::proxy::event_loop(
         &public,
         &tagged_path,
         &policy,
@@ -527,7 +549,25 @@ fn run_proxy(cli: &Cli) -> Result<()> {
         audit,
         broker,
         None,
-    )?;
+    )? {
+        wlsctx::proxy::LoopEnd::Stopped => {
+            info!("Shutting down.");
+        }
+        wlsctx::proxy::LoopEnd::ReExec => {
+            // SIGHUP: close the reference pipe (invalidating the old
+            // tag — the compositor keeps its copy of the old tagged
+            // socket until the hangup) and close the public listener
+            // so the new process re-binds the path. In-flight app
+            // connections are severed by the exec (the relay is
+            // per-connection); the new process re-binds both
+            // listeners and creates a fresh context on the fresh
+            // tagged socket. (The setup connection was already
+            // consumed by the tagging exchange.)
+            drop(close_fd);
+            drop(public);
+            wlsctx::proxy::re_exec(&activation).with_context(|| "SIGHUP re-exec failed")?;
+        }
+    }
     info!("Shutting down.");
     Ok(())
 }
