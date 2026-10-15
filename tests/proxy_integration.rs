@@ -1525,6 +1525,508 @@ fn clipboard_deny_is_audited_with_a_drop() {
 }
 
 // ------------------------------------------------------------------------
+// Two fd-bearing messages in one datagram
+// ------------------------------------------------------------------------
+//
+// Regression test for the Phase 1 fd-misrouting defect in
+// `Relay::forward()`. A wayland client (or compositor) batches every
+// buffered message *and* every buffered fd into a single `sendmsg` on
+// flush; a multi-mime paste is therefore two `receive` requests with
+// two fds in one datagram, and `forward()` must hand the i-th message
+// of the batch the i-th fd in arrival order (it once peeled the
+// *tail* of the queue while the parse consumed the *front* — two fds,
+// a full swap).
+//
+// This drives the real three-party path: a fake compositor (`Srv4`)
+// announces two `wl_data_offer` objects — one per mime, each with its
+// own sentinel payload — and a real `wayland-client` app issues the
+// two `receive` requests back to back, inside one dispatch pass and
+// with no flush in between, so wayland-client's next flush carries
+// both requests and both fds in one `sendmsg`. The fake writes its
+// own sentinel into whichever fd each `receive` is handed; the
+// assertion is per-fd content — each app memfd must hold the payload
+// of the offer *it* asked about. Under the tail-slice defect the
+// two sentinels come back swapped.
+
+/// One sentinel per offer, distinct (even in length), so a
+/// cross-wired pairing is unambiguous.
+const PLAIN_SENTINEL: &[u8] = b"PLAIN-SENTINEL";
+const HTML_SENTINEL: &[u8] = b"HTML-SENTINEL";
+
+/// The two-offer fake compositor. As soon as the app gets a
+/// `wl_data_device`, it announces two `wl_data_offer` objects in one
+/// flush, each standing in for a selection with a different mime and
+/// a different payload. Each `receive` is served by writing the
+/// offer's own sentinel into the fd it is handed; once both are
+/// served it sends one `wl_data_device.selection` — a synchronization
+/// ack the app waits on before reading its fds (the write happens
+/// before the event on this thread, and the socket preserves order,
+/// so the fd is fully written by the time the ack arrives).
+struct Srv4 {
+    /// `(origin tag, mime)` for every `wl_data_offer.receive` served.
+    received: Arc<Mutex<Vec<(String, String)>>>,
+    /// The offers, in announcement order (kept alive for the
+    /// session: the app's `receive` requests address them).
+    offers: Vec<srv_wl_data_offer::WlDataOffer>,
+    /// The device the offers are announced on (for the ack).
+    device: Option<srv_wl_data_device::WlDataDevice>,
+    /// How many `receive` requests have been served.
+    served: u32,
+    /// The post-serve ack has been sent.
+    ack_sent: bool,
+}
+
+impl GlobalDispatch<srv_wl_data_device_manager::WlDataDeviceManager, ()> for Srv4 {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_wl_data_device_manager::WlDataDeviceManager>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl GlobalDispatch<srv_wl_seat::WlSeat, ()> for Srv4 {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_wl_seat::WlSeat>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl ServerDispatch<srv_wl_data_device_manager::WlDataDeviceManager, ()> for Srv4 {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        _resource: &srv_wl_data_device_manager::WlDataDeviceManager,
+        request: srv_wl_data_device_manager::Request,
+        _data: &(),
+        dhandle: &DisplayHandle,
+        data_init: &mut DataInit<Self>,
+    ) {
+        // The app's one request here: it gets a device, and the
+        // fake immediately announces the two offers on it — in one
+        // flush, the same shape as a real compositor announcing a
+        // new selection. (The app never creates a data source here:
+        // a `create_data_source` is a no-op.)
+        if let srv_wl_data_device_manager::Request::GetDataDevice { seat: _, id } = request {
+            let device = data_init.init::<srv_wl_data_device::WlDataDevice, _>(id, ());
+            state.device = Some(device.clone());
+            let offer_a = client
+                .create_resource::<srv_wl_data_offer::WlDataOffer, OfferState, Srv4>(
+                    dhandle,
+                    3,
+                    OfferState {
+                        data: PLAIN_SENTINEL.to_vec(),
+                        foreign: true,
+                        source: None,
+                    },
+                )
+                .expect("create the first offer");
+            let offer_b = client
+                .create_resource::<srv_wl_data_offer::WlDataOffer, OfferState, Srv4>(
+                    dhandle,
+                    3,
+                    OfferState {
+                        data: HTML_SENTINEL.to_vec(),
+                        foreign: true,
+                        source: None,
+                    },
+                )
+                .expect("create the second offer");
+            state.offers = vec![offer_a.clone(), offer_b];
+            device.data_offer(&state.offers[0]);
+            device.data_offer(&state.offers[1]);
+        }
+    }
+}
+
+impl ServerDispatch<srv_wl_seat::WlSeat, ()> for Srv4 {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_seat::WlSeat,
+        _request: srv_wl_seat::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<Self>,
+    ) {
+    }
+}
+
+impl ServerDispatch<srv_wl_data_device::WlDataDevice, ()> for Srv4 {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_data_device::WlDataDevice,
+        _request: srv_wl_data_device::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<Self>,
+    ) {
+        // The app sends no requests on the device.
+    }
+}
+
+impl ServerDispatch<srv_wl_data_offer::WlDataOffer, OfferState> for Srv4 {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_data_offer::WlDataOffer,
+        request: srv_wl_data_offer::Request,
+        data: &OfferState,
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<Self>,
+    ) {
+        // The only request that matters: the app handed us an fd to
+        // write the selection into. Write this offer's own sentinel
+        // into whatever fd arrived with the request — if the relay
+        // mispaired the batch, that is the wrong fd, and the
+        // app's per-fd assertion catches it.
+        if let srv_wl_data_offer::Request::Receive { mime_type, fd } = request {
+            state.received.lock().unwrap().push((
+                if data.foreign { "foreign" } else { "own" }.to_string(),
+                mime_type.clone(),
+            ));
+            let mut f = std::fs::File::from(fd);
+            f.write_all(&data.data).expect("write the selection data");
+            drop(f);
+            state.served += 1;
+            // Both serves done: send the app its ack.
+            if state.served == 2
+                && !state.ack_sent
+                && let Some(device) = &state.device
+            {
+                state.ack_sent = true;
+                if let Some(offer) = state.offers.first() {
+                    device.selection(Some(offer));
+                }
+            }
+        }
+        // accept / finish / set_actions / destroy: no-ops.
+    }
+}
+
+/// The two-offer fake compositor: the
+/// [`run_fake_data_device_compositor`] harness with [`Srv4`].
+fn run_fake_two_offer_compositor(
+    tagged_path: PathBuf,
+    ready: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
+    received: Arc<Mutex<Vec<(String, String)>>>,
+) -> std::io::Result<()> {
+    let tagged = ListeningSocket::bind_absolute(tagged_path)
+        .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
+    let mut display =
+        Display::<Srv4>::new().map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
+    let mut handle = display.handle();
+    handle.create_global::<Srv4, srv_wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
+    handle.create_global::<Srv4, srv_wl_seat::WlSeat, ()>(10, ());
+    let mut state = Srv4 {
+        received,
+        offers: Vec::new(),
+        device: None,
+        served: 0,
+        ack_sent: false,
+    };
+    ready.store(true, Ordering::SeqCst);
+
+    loop {
+        while let Ok(Some(stream)) = tagged.accept() {
+            let data = Arc::new(ClientDataImpl { live: live.clone() });
+            handle.insert_client(stream, data)?;
+        }
+        display.dispatch_clients(&mut state)?;
+        display.flush_clients()?;
+        if stop.load(Ordering::SeqCst) && live.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The sandboxed app for the two-fd test: it binds the data-device
+/// stack, and — once the (fake) compositor has announced both offers
+/// — issues the two `receive` requests back to back, inside one
+/// dispatch pass and with no flush in between: wayland-client's next
+/// flush sends both requests, with their two fds, in one `sendmsg`,
+/// the exact shape of a real multi-mime paste. Each read goes into
+/// its own memfd, which the test inspects after the fake's ack.
+struct TwoOfferApp {
+    /// `(global name, interface, version)` from `wl_registry.global`.
+    globals: Vec<(u32, String, u32)>,
+    /// The announced offers, in announcement order.
+    offers: Vec<wl_data_offer::WlDataOffer>,
+    /// The app's read target for the first offer's read.
+    fd_a: OwnedFd,
+    /// The app's read target for the second offer's read.
+    fd_b: OwnedFd,
+    /// Set when the fake's post-serve ack arrives.
+    acked: Arc<AtomicBool>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for TwoOfferApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            state.globals.push((name, interface, version));
+        }
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for TwoOfferApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { id } => {
+                state.offers.push(id);
+                if state.offers.len() == 2 {
+                    // Two back-to-back `receive`s, inside one
+                    // dispatch pass: the queue is not flushed
+                    // between them, so the next flush carries both
+                    // requests — and both fds — in one `sendmsg`.
+                    state.offers[0].receive("text/plain".into(), state.fd_a.as_fd());
+                    state.offers[1].receive("text/html".into(), state.fd_b.as_fd());
+                }
+            }
+            // The fake's post-serve ack: by the time it arrives both
+            // memfds have been written (see the Srv4 docs).
+            wl_data_device::Event::Selection { id: Some(_) } => {
+                state.acked.store(true, Ordering::SeqCst);
+            }
+            // data_offer(NULL) / enter / leave / motion / drop:
+            // unused here.
+            _ => {}
+        }
+    }
+
+    // The `data_offer` event creates a `wl_data_offer` child; the
+    // macro above only handles events, so the user-data
+    // specialization has to be given explicitly.
+    wayland_client::event_created_child!(TwoOfferApp, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+
+no_events!(
+    TwoOfferApp,
+    wl_data_device_manager::WlDataDeviceManager,
+    wl_data_device_manager::Event
+);
+no_events!(
+    TwoOfferApp,
+    wl_data_offer::WlDataOffer,
+    wl_data_offer::Event
+);
+no_events!(TwoOfferApp, wl_seat::WlSeat, wl_seat::Event);
+
+/// One two-fd session through the proxy. Returns the contents of
+/// the app's two memfds after the fake has served both reads.
+fn one_two_offer_session(
+    public_path: &Path,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let memfd = |name: &str| -> std::io::Result<OwnedFd> {
+        Ok(rustix::fs::memfd_create(
+            name,
+            rustix::fs::MemfdFlags::empty(),
+        )?)
+    };
+    let fd_a = memfd("wlsctx-test-fd-a")?;
+    let fd_b = memfd("wlsctx-test-fd-b")?;
+    let acked = Arc::new(AtomicBool::new(false));
+
+    let stream = UnixStream::connect(public_path)?;
+    let conn = Connection::from_socket(stream)?;
+    let mut app = TwoOfferApp {
+        globals: Vec::new(),
+        offers: Vec::new(),
+        fd_a,
+        fd_b,
+        acked: acked.clone(),
+    };
+    let mut eq = conn.new_event_queue::<TwoOfferApp>();
+    let qh = eq.handle();
+    let display = conn.display();
+    let registry = display.get_registry(&qh, ());
+    eq.roundtrip(&mut app)?;
+
+    let ddm_name = app
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_data_device_manager")
+        .ok_or("no wl_data_device_manager global in the registry")?
+        .0;
+    let seat_name = app
+        .globals
+        .iter()
+        .find(|(_, iface, _)| iface == "wl_seat")
+        .ok_or("no wl_seat global in the registry")?
+        .0;
+
+    let ddm = registry.bind::<wl_data_device_manager::WlDataDeviceManager, (), TwoOfferApp>(
+        ddm_name,
+        3,
+        &qh,
+        (),
+    );
+    let seat = registry.bind::<wl_seat::WlSeat, (), TwoOfferApp>(seat_name, 10, &qh, ());
+    ddm.get_data_device(&seat, &qh, ());
+
+    // Wait for the fake to announce both offers and serve both
+    // receives; the break is on the fake's ack (its `selection`
+    // after the second serve), which — see Srv4 — arrives only
+    // after both memfds are written.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        eq.blocking_dispatch(&mut app)?;
+        if app.acked.load(Ordering::SeqCst) {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "timed out: offers={} acked={}",
+                app.offers.len(),
+                app.acked.load(Ordering::SeqCst)
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(
+        conn.protocol_error().is_none(),
+        "protocol error: {:?}",
+        conn.protocol_error()
+    );
+
+    let read = |fd: OwnedFd| -> std::io::Result<Vec<u8>> {
+        let mut f = std::fs::File::from(fd);
+        f.seek(SeekFrom::Start(0))?;
+        let mut v = Vec::new();
+        f.read_to_end(&mut v)?;
+        Ok(v)
+    };
+    let a = read(app.fd_a)?;
+    let b = read(app.fd_b)?;
+    Ok((a, b))
+}
+
+#[test]
+fn two_fd_messages_in_one_datagram_keep_their_fds() {
+    // The proxy (and the fake compositor) log via `log`; without a
+    // logger in this test process the relay's fail-closed warnings
+    // would be silent.
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+
+    // The proxy: `Allow` (pure pass-through) — the gate's
+    // forward/drop decision is keyed on the sender id, not the fd,
+    // so the defect is visible on the forwarded path.
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                wlsctx::proxy::ClipboardPolicy::Allow,
+                wlsctx::proxy::AuditConfig::default(),
+                None,
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    // The fake two-offer compositor on the tagged socket.
+    let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
+    let stop_comp = stop.clone();
+    let comp = thread::Builder::new()
+        .name("fake-compositor".into())
+        .spawn(move || {
+            run_fake_two_offer_compositor(tagged_path, ready_c, stop_comp, live_c, recv_c)
+        })
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    let (fd_a, fd_b) = one_two_offer_session(&public_path).expect("two-fd session failed");
+
+    // The app disconnected before the shutdown, so the compositor's
+    // view must settle to zero live clients before it exits.
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = proxy.join();
+
+    // The heart of it: each app fd holds the payload of the offer
+    // *its own* `receive` asked about — not the other offer's. The
+    // Phase 1 tail-slice defect paired the first message with the
+    // second fd (and vice versa), and these come back swapped.
+    assert_eq!(
+        fd_a,
+        PLAIN_SENTINEL.to_vec(),
+        "the first fd must hold the first offer's payload"
+    );
+    assert_eq!(
+        fd_b,
+        HTML_SENTINEL.to_vec(),
+        "the second fd must hold the second offer's payload"
+    );
+    // Sanity: both reads reached the compositor, in message order
+    // (the relay forwards messages in order even when it mispairs
+    // their fds, so this holds pre-fix as well).
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![
+            ("foreign".to_string(), "text/plain".to_string()),
+            ("foreign".to_string(), "text/html".to_string()),
+        ],
+        "both reads reached the compositor, in order"
+    );
+
+    drop(dir);
+}
+
+// ------------------------------------------------------------------------
 // Phase 5: primary selection (wp_primary_selection_unstable_v1)
 // ------------------------------------------------------------------------
 //

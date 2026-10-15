@@ -626,14 +626,21 @@ impl Relay {
         let desc = match_desc(dir, sender, opcode)?;
 
         // The parse validates the message against the signature and
-        // consumes the fds that belong to it (in order).
+        // consumes the fds that belong to it. A datagram can carry
+        // several complete messages, each with its own fds (a
+        // client's or compositor's flush batches all buffered
+        // messages and all buffered fds into one `sendmsg`; `recv`
+        // collected them in arrival order, ahead of this loop):
+        // this message takes the next `take` fds from the *front*
+        // of the queue — the ones it sent first — and the remainder
+        // is left for the messages after it.
         let n_fds = desc
             .signature
             .iter()
             .filter(|t| matches!(t, ArgumentType::Fd))
             .count();
         let take = src_fds.len().min(n_fds);
-        let mut scratch = src_fds.split_off(src_fds.len() - take);
+        let mut scratch: VecDeque<OwnedFd> = src_fds.drain(0..take).collect();
         let (msg, rest) = wire::parse_message(raw, desc.signature, &mut scratch)
             .map_err(|e| RelayEnd::Protocol(e.to_string()))?;
         if !rest.is_empty() {
