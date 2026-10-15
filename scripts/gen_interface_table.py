@@ -40,7 +40,7 @@ def parse_modules(src_text: str, crate_root: Path, file_mod: str):
     #[cfg(feature = "...")] gates. `file_mod` is the module this file is
     (the files live inside the crate's lib.rs mod tree)."""
     lines = src_text.splitlines()
-    stack = [(file_mod, set())]  # (name, features)
+    stack: list[tuple[str, set[str]]] = [(file_mod, set())]  # (name, features)
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -82,9 +82,8 @@ def parse_modules(src_text: str, crate_root: Path, file_mod: str):
             yield modpath, xml_abs, feats
             i += 1
             continue
-        if line.strip() == "}":
-            if stack:
-                stack.pop()
+        if line.strip() == "}" and stack:
+            stack.pop()
         i += 1
 
 
