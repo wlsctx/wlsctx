@@ -19,10 +19,13 @@
 //!
 //! A second, one-way use (Phase 6): when `notify_copy_out` is set, the
 //! relay also sends a *copy-out* notification (`BrokerConfig::notify_write`)
-//! to the same socket each time the app writes to the clipboard or the
-//! primary selection. That line gets a desktop notification and no
-//! reply; it is fire-and-forget and fails open (a missing broker simply
-//! loses the notice, the write is never altered).
+//! to the same socket when the app writes to the clipboard or the
+//! primary selection — rate-limited per selection by the relay (at
+//! most one per second: a rapid copier's burst of writes collapses to
+//! one per window, while every write still lands in the audit log).
+//! That line gets a desktop notification and no reply; it is
+//! fire-and-forget and fails open (a missing broker simply loses the
+//! notice, the write is never altered).
 
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
@@ -56,11 +59,13 @@ pub struct BrokerConfig {
     /// [`ClipboardGate::unlock`](super::clipboard::ClipboardGate::unlock).
     pub window: Duration,
     /// Phase 6: when set, the relay also fires a one-way *copy-out*
-    /// notification ([`Self::notify_write`]) to this broker each time
-    /// the app writes to the clipboard or primary selection. Independent
-    /// of the consent flow above (which only fires on a *dropped*
-    /// read): a write is always forwarded, the notice is fire-and-forget
-    /// and fails open.
+    /// notification ([`Self::notify_write`]) to this broker when the
+    /// app writes to the clipboard or primary selection — rate-limited
+    /// per selection (at most one per second, decided by the relay's
+    /// gate; every write is still audited). Independent of the
+    /// consent flow above (which only fires on a *dropped* read): a
+    /// write is always forwarded, the notice is fire-and-forget and
+    /// fails open.
     pub notify_copy_out: bool,
 }
 

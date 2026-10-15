@@ -681,6 +681,10 @@ impl Relay {
         //   `set` only — a `clear` places nothing, so there is nothing
         //   to warn about. Fail-open: a missing/unreachable broker
         //   only loses the notice; the write is forwarded regardless.
+        //   Rate-limited (Phase 6 follow-up): the gate fires at most
+        //   one per selection per window (one second by default) — a
+        //   rapid copier's burst of writes collapses to that; the
+        //   audit record above still lands for every write.
         if let Some((selection, write)) = ClipboardGate::set_selection(dir, sender, desc, &msg) {
             match write {
                 SelectionWrite::Set => {
@@ -693,12 +697,19 @@ impl Relay {
                         fd_kind: None,
                         payload_bytes: None,
                     });
-                    if let Some(broker) = broker.filter(|b| b.notify_copy_out)
-                        && let Err(e) = broker.notify_write(selection)
-                    {
-                        warn!(
-                            "{selection} copy-out note: broker unreachable ({e}); the write is forwarded regardless"
-                        );
+                    if let Some(broker) = broker.filter(|b| b.notify_copy_out) {
+                        if clipboard.note_copy_out(selection) {
+                            if let Err(e) = broker.notify_write(selection) {
+                                warn!(
+                                    "{selection} copy-out note: broker unreachable ({e}); the write is forwarded regardless"
+                                );
+                            }
+                        } else {
+                            debug!(
+                                "{selection} copy-out note suppressed (a notification for \
+                                 this selection is still fresh)"
+                            );
+                        }
                     }
                 }
                 SelectionWrite::Clear => {

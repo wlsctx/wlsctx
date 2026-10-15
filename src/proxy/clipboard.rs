@@ -105,7 +105,7 @@
 
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::info;
 use wayland_backend::protocol::{Argument, Interface, Message, MessageDesc};
@@ -261,6 +261,16 @@ pub struct ClipboardGate {
     /// (either protocol) are allowed (the user's approved intent
     /// window).
     unlocked_until: Option<Instant>,
+    /// The rate-limit window for the Phase 6 copy-out notification
+    /// ([`Self::note_copy_out`]): at most one notification per
+    /// selection in this window.
+    copy_out_interval: Duration,
+    /// The last *fired* copy-out notification for the clipboard
+    /// selection (Phase 6 follow-up): the window is anchored here,
+    /// not on the suppressed writes (see [`Self::note_copy_out`]).
+    copy_out_clipboard: Option<Instant>,
+    /// The same, for the primary selection (independent window).
+    copy_out_primary: Option<Instant>,
 }
 
 /// The gate's decision on one `receive`, with the facts the
@@ -292,6 +302,13 @@ pub(crate) enum SelectionWrite {
 }
 
 impl ClipboardGate {
+    /// The default rate-limit window for the Phase 6 copy-out
+    /// notification: at most one notification per selection per
+    /// second (per app connection). A rapid copier's burst of
+    /// writes collapses to one per window; every write still lands
+    /// in the audit log (Phase 9), so nothing is lost on the record.
+    pub(crate) const COPY_OUT_NOTIFY_INTERVAL: Duration = Duration::from_secs(1);
+
     pub fn new(policy: ClipboardPolicy) -> Self {
         Self {
             policy,
@@ -303,6 +320,19 @@ impl ClipboardGate {
             primary_selection: None,
             own_offers: HashSet::new(),
             unlocked_until: None,
+            copy_out_interval: Self::COPY_OUT_NOTIFY_INTERVAL,
+            copy_out_clipboard: None,
+            copy_out_primary: None,
+        }
+    }
+
+    /// A gate with a custom copy-out rate-limit window (the unit
+    /// tests use a short one so they don't sleep a second).
+    #[cfg(test)]
+    pub(crate) fn new_with_copy_out_interval(policy: ClipboardPolicy, interval: Duration) -> Self {
+        Self {
+            copy_out_interval: interval,
+            ..Self::new(policy)
         }
     }
 
@@ -615,6 +645,35 @@ impl ClipboardGate {
             _ => return None,
         };
         Some((selection, write))
+    }
+
+    /// Phase 6 follow-up: rate-limit the copy-out notification.
+    ///
+    /// Record a write to `selection` (`"clipboard"` or `"primary"`)
+    /// and return whether a notification should fire now: the first
+    /// write for that selection, or one at least
+    /// [`Self::copy_out_interval`] after the last *fired* one.
+    /// Suppressed writes do **not** extend the window — it is
+    /// anchored on the fired notification — so a continuous burst
+    /// (a rapid copier) notifies once per window and never
+    /// starves. The state is per-connection (each relay is one app
+    /// connection), which makes this the per-app, per-selection
+    /// limit; the two selections keep independent windows.
+    pub(crate) fn note_copy_out(&mut self, selection: &str) -> bool {
+        let interval = self.copy_out_interval;
+        let slot = match selection {
+            "clipboard" => &mut self.copy_out_clipboard,
+            "primary" => &mut self.copy_out_primary,
+            // Unknown selections never notify (defensive: the parser
+            // returns only the two above).
+            _ => return false,
+        };
+        let now = Instant::now();
+        if slot.is_some_and(|t| now.duration_since(t) < interval) {
+            return false;
+        }
+        *slot = Some(now);
+        true
     }
 }
 
@@ -1020,6 +1079,60 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The Phase 6 follow-up rate limit: the first write for a
+    /// selection notifies; a burst within the window is suppressed;
+    /// the two selections keep independent windows; an unknown
+    /// selection never notifies. A long (test-only) window makes the
+    /// suppression assertions independent of machine timing.
+    #[test]
+    fn note_copy_out_suppresses_bursts_within_the_window() {
+        let mut g = ClipboardGate::new_with_copy_out_interval(
+            ClipboardPolicy::Allow,
+            Duration::from_secs(3600),
+        );
+        assert!(g.note_copy_out("clipboard"), "the first write notifies");
+        assert!(
+            !g.note_copy_out("clipboard"),
+            "a write within the window is suppressed"
+        );
+        assert!(!g.note_copy_out("clipboard"), "…and so is the next");
+        // The primary selection keeps its own window: its first
+        // write notifies, independent of the clipboard's.
+        assert!(
+            g.note_copy_out("primary"),
+            "the primary window is independent"
+        );
+        assert!(!g.note_copy_out("primary"));
+        assert!(
+            !g.note_copy_out("clipboard"),
+            "the clipboard's window is untouched by the primary note"
+        );
+        assert!(
+            !g.note_copy_out("drag"),
+            "an unknown selection never notifies"
+        );
+    }
+
+    /// The window re-arms: a write after the interval notifies again
+    /// (the anchor is the last *fired* notification), and then
+    /// suppresses again.
+    #[test]
+    fn note_copy_out_notifies_again_after_the_interval() {
+        let mut g = ClipboardGate::new_with_copy_out_interval(
+            ClipboardPolicy::Allow,
+            Duration::from_millis(50),
+        );
+        assert!(g.note_copy_out("clipboard"));
+        assert!(!g.note_copy_out("clipboard"));
+        // Wait out the (short, test-only) window.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            g.note_copy_out("clipboard"),
+            "the window re-arms after the interval"
+        );
+        assert!(!g.note_copy_out("clipboard"), "…and then suppresses again");
     }
 
     /// The fd classification (Phase 9): each in-memory channel class
