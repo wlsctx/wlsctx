@@ -7,22 +7,6 @@ design.
 
 ---
 
-## Critical (open defect) — fd misrouting in the relay's `forward()`
-
-**Status:** unfixed (found in the Phase 1–9 code review, 2026-10-15,
-HEAD `fa4eee8`). When a single datagram carries more than one
-fd-bearing message — the multi-mime `receive`/`send` batch, i.e. the
-common paste case — `Relay::forward()` peels the *tail* of the fd
-queue (`split_off(len - take)`) while `wire::parse_message` consumes
-from the *front*: the i-th message in the batch ends up with the
-(n−1−i)-th fd (two fds: a full swap), so multi-mime pastes get their
-payloads cross-wired. Data integrity only — the gate's per-message
-forward/drop decision is keyed on the sender id, not the fd, so no
-denied data crosses the boundary. Full handoff plan (root cause,
-exact fix, regression test, scope): `docs/fd-swap-fix-plan.md`.
-
----
-
 ## Next up: Phase 6 follow-up — rate-limit the copy-out notification
 
 **Status:** not started. One `notify-send` per `set_selection` is

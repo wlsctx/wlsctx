@@ -1,4 +1,16 @@
-# Handoff plan — fd misrouting in `Relay::forward()` (critical, open)
+# Handoff plan — fd misrouting in `Relay::forward()` (critical,
+# LANDED — kept as a post-mortem)
+
+**Status: fixed.** Landed in commit `88d237e`
+(`wlsctx: fix fd misrouting when a datagram carries several
+fd-bearing messages`): the `drain(0..take)` front-slice fix in
+`forward()` plus the regression test
+`two_fd_messages_in_one_datagram_keep_their_fds` (verified to fail
+with swapped sentinels pre-fix, to pass with it). The
+`TASKS.md` "Critical (open defect)" section and the `AGENTS.md`
+pointer are removed; this file is kept as the post-mortem record.
+
+---
 
 Found in the Phase 1–9 clipboard-feature code review (2026-10-15, HEAD
 `fa4eee8`). Severity: **data integrity, not a security bypass**. The

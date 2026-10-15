@@ -10,12 +10,9 @@ and a clipboard/primary-selection receive-gate, plus an optional
 host-side broker (`--broker`) that serves both a consent prompt (dropped
 *reads*) and a fire-and-forget copy-out notification (app *writes*,
 `--notify-copy-out`). **README.md is the full architecture/threat-model
-doc — read it before non-trivial changes. TASKS.md tracks deferred work
-(next up: rate-limit the Phase 6 copy-out notification; the
-selection-audit log, Phase 9, is done). One critical defect is open —
-fd misrouting in `proxy/mod.rs::forward()` when a datagram carries
-more than one fd; the handoff plan is
-`docs/fd-swap-fix-plan.md`.**
+doc — read it before non-trivial changes. TASKS.md tracks deferred
+work (next up: rate-limit the Phase 6 copy-out notification; the
+selection-audit log, Phase 9, is done).**
 
 ## Layout
 
