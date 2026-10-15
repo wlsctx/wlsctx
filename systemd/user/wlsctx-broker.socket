@@ -15,12 +15,13 @@
 # scratch wlsctx image has no bus and no notify-send, so the prompt
 # could never actually reach the user.
 #
-# The decision socket the broker binds while it waits for the user
-# (and the `latest` pointer naming it) live in $XDG_RUNTIME_DIR/wlsctx,
-# the same user-private directory the mode-A socket unit owns. A
-# keybinding / notification action / any program answers with:
-#   wlsctx --decide --decision allow
-#   wlsctx --decide --decision deny
+# The session decision socket the broker binds at startup (while it
+# waits for the user) lives in $XDG_RUNTIME_DIR/wlsctx, the same
+# user-private directory the mode-A socket unit owns. A keybinding /
+# notification action / any program answers with:
+#   wlsctx --decide                     # list the pending prompts
+#   wlsctx --decide --decision allow    # (or =deny; --prompt <id>
+#                                       # targets a named one)
 # A timeout (default 30 s) is a deny. Every failure path fails closed.
 [Unit]
 Description=wlsctx prompt broker socket
@@ -31,9 +32,9 @@ Before=wayland-session-shutdown.target
 PropagatesStopTo=%N.service
 
 [Socket]
-# The socket file itself. (The *decision* sockets and the `latest`
-# pointer the broker creates while waiting go under wlsctx/, which the
-# broker process creates and chmods 0700 itself — see wlsctx::broker.)
+# The socket file itself. (The *decision* socket the broker binds at
+# startup goes under wlsctx/, which the broker process creates and
+# chmods 0700 itself — see wlsctx::broker.)
 ListenStream=%t/wlsctx-broker
 SocketMode=0600
 

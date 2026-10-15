@@ -11,9 +11,10 @@ host-side broker (`--broker`) that serves both a consent prompt (dropped
 *reads*) and a fire-and-forget copy-out notification (app *writes*,
 `--notify-copy-out`). **README.md is the full architecture/threat-model
 doc — read it before non-trivial changes. TASKS.md tracks deferred
-work (next up: a single decision socket for the life of a broker
-session; the Phase 9 audit log and the Phase 6 copy-out rate limit
-are done). LESSONS.md is a short, living
+work (next up: the deferred refinements — CI regeneration of the
+protocol tables, the SIGHUP reload stub; the broker's session
+decision socket, the Phase 9 audit log, and the Phase 6 copy-out
+rate limit are done). LESSONS.md is a short, living
 record of hard-won lessons — skim it before non-trivial changes; the
 full write-ups live in `docs/postmortems/`.**
 
@@ -32,14 +33,22 @@ full write-ups live in `docs/postmortems/`.**
   `audit` log target),
   `broker.rs` (the broker daemon: N-D-JSON, one consent
   `clipboard-read` request/response *and* one one-way
-  `clipboard-write` notification per connection)
+  `clipboard-write` notification per connection; in interactive mode
+  a session decision socket — `decision.sock`, bound once for the
+  life of the session — carries `wlsctx --decide`'s
+  list/decide requests over a poll(2) main loop, with one thread per
+  proxy connection)
 - `tests/proxy_integration.rs` — three-party integration tests (fake
   compositor, real wayland-client, the relay): pass-through,
   allowlist, clipboard (incl. the selection-audit records), primary
   selection, broker consent, copy-out notification
-- `TASKS.md` — deferred / follow-up tasks (next: a single decision
-  socket for the life of a broker session; the Phase 9 audit log and
-  the Phase 6 copy-out rate limit are done)
+- `tests/broker_integration.rs` — end-to-end tests of the broker
+  daemon as a subprocess: multiple pending prompts on the session
+  decision socket (list/resolve by id, timeout, refused decides)
+- `TASKS.md` — deferred / follow-up tasks (next: the deferred
+  refinements — CI table regeneration, the SIGHUP stub; the broker's
+  session decision socket, the Phase 9 audit log, and the Phase 6
+  copy-out rate limit are done)
 - `LESSONS.md` — a short, living record of hard-won lessons from past
   work; add a line whenever a change teaches something durable, and
   promote long entries to `docs/postmortems/`
@@ -94,7 +103,14 @@ full write-ups live in `docs/postmortems/`.**
   user decides) and `clipboard-write` (one-way, Phase 6 — the daemon
   fires `notify-send` and closes with no reply). The write notification
   is fire-and-forget and fails open: the relay's `notify_write` uses a
-  2 s deadline and never blocks or alters the write.
+  2 s deadline and never blocks or alters the write. The *user's*
+  answer travels over a second, session-scoped socket
+  (`$XDG_RUNTIME_DIR/wlsctx/decision.sock`): `wlsctx --decide` lists
+  the pending prompts (oldest first, each with an id) or resolves the
+  oldest — or the one `--prompt <id>` names. A decided prompt leaves
+  the queue atomically with its decision; an unbound decision socket
+  degrades the broker (prompts deny at once, `no-decision-socket`),
+  and `--auto-decide` mode never binds it.
 - Rust edition 2024; deps in Cargo.toml are pinned in Cargo.lock.
   wayland-backend 0.31.11, wayland-scanner 0.31.7,
   wayland-protocols 0.32.9 (features `client, staging, unstable`),

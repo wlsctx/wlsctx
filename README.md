@@ -182,16 +182,25 @@ The binary has four operating modes (the relay logic lives in
 3. **Prompt broker** (host user service, not a container):
    `--broker --socket-activation` (the `wlsctx-broker.socket` /
    `.service` units): each dropped read arrives as one JSON
-   `{"kind":"clipboard-read",…}` line; the broker announces it with a
-   desktop notification, binds a private decision socket, and waits
-   (default 30 s; `--broker-timeout-millis`) for the user's answer — a
-   timeout is a deny. It also serves one-way
-   `{"kind":"clipboard-write",…}` notifications (Phase 6, from
-   `--notify-copy-out`): it fires a desktop notification and closes
-   without replying.
-4. **One-shot decider**: `--decide --decision allow|deny` sends the
-   answer to the most recent pending prompt (the broker's `latest`
-   pointer); intended for a keybinding or a notification action.
+   `{"kind":"clipboard-read",…}` line on its own connection, so
+   several can be pending at once. In interactive mode the broker
+   also binds **one decision socket for the life of the session**
+   (`$XDG_RUNTIME_DIR/wlsctx/decision.sock`) at startup, announces
+   each pending prompt with a desktop notification carrying its
+   prompt id, and waits (default 30 s; `--broker-timeout-millis`)
+   for the user's decision on that socket — a timeout is a deny. It
+   also serves one-way `{"kind":"clipboard-write",…}` notifications
+   (Phase 6, from `--notify-copy-out`): it fires a desktop
+   notification and closes without replying. If the decision socket
+   cannot be bound, the broker degrades: interactive prompts are
+   denied at once (`no-decision-socket`) instead of waited on, and
+   `--auto-decide` mode never binds the socket at all.
+4. **One-shot decider**: `--decide` talks to that decision socket:
+   without `--decision` it lists the pending prompts (id, app,
+   instance, selection, mime, time left — oldest first); with
+   `--decision allow|deny` it resolves the oldest pending prompt, or
+   the one `--prompt <id>` names; intended for a keybinding or a
+   notification action.
 
 In the tag-and-park and relay modes it runs its signal loop on
 `signalfd(2)` (catatonit-style): `SIGTERM`/`SIGINT` exit cleanly

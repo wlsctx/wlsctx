@@ -19,14 +19,16 @@
 # (or override ExecStart in a drop-in) if yours lives elsewhere.
 #
 # What one request does: the broker decodes the proxy's JSON request
-# line (app, instance, mime), announces it with notify-send, binds a
-# one-shot decision socket under $XDG_RUNTIME_DIR/wlsctx (recording it
-# in the `latest` pointer), and waits for the user —
+# line (app, instance, mime), announces it with notify-send (the
+# prompt's id and a ready-made reply command in the body), and waits
+# for the user. The user's answer goes to the broker's session
+# decision socket ($XDG_RUNTIME_DIR/wlsctx/decision.sock) — bound
+# once, for the life of the session, at startup — so several prompts
+# can be pending at once and any of them can be targeted by id:
 #
-#   wlsctx --decide --decision allow    # one-shot sender for a
-#   wlsctx --decide --decision deny     # keybinding / notification action
-#
-# or any writer that reaches the decision socket with one JSON line.
+#   wlsctx --decide                          # list the pending prompts
+#   wlsctx --decide --decision allow         # resolve the oldest (or =deny)
+#   wlsctx --decide --prompt 3 --decision allow  # resolve a named one
 # Allow answers the proxy with a 1500 ms intent window (the proxy
 # opens the gate for that burst); deny and every failure (missing
 # binary, lost bus, unreadable answer, timeout) answer a deny or are

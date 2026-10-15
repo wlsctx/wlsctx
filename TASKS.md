@@ -7,16 +7,44 @@ design.
 
 ---
 
-## Next up: broker — a single decision socket for the life of the session
+## Next up
 
-**Status:** not started. `decide_interactive` (src/broker.rs) binds a
-fresh decision socket per prompt (`broker-<pid>.sock` in the runtime
-dir; the path is announced in the consent notification) and the
-`--decide` path (src/main.rs) reaches only the most recent prompt via
-the `latest` pointer. A single decision socket bound for the life of
-the session, with a `wlsctx --decide` that lists the pending prompts,
-would make multi-prompt sessions serviceable; the per-prompt bind and
-the `latest` pointer are the hook points.
+No single next phase is queued: the remaining work is the deferred
+refinements below (no fixed phase) — CI regeneration of the protocol
+tables, and the SIGHUP reload stub. Most recently done: the broker's
+session decision socket, the Phase 9 audit log, and the Phase 6
+copy-out rate limit.
+
+---
+
+## Done: broker — a single decision socket for the life of the session
+
+**Status:** implemented (see the commits). The interactive broker
+binds one decision socket for the life of the session
+(`$XDG_RUNTIME_DIR/wlsctx/decision.sock`, at startup, chmod 0600)
+instead of a fresh `broker-<pid>.sock` per prompt; the `latest`
+pointer is gone. The run loop is now `poll(2)`-driven over both
+listeners: each proxy connection gets its own thread (a prompt
+waiting on the user parks that thread on a per-prompt condvar — the
+old serial loop parked on the first consent for up to the timeout
+and could not even accept the next request), and the main thread
+services the decision socket (a short read timeout bounds a stuck
+decider). `wlsctx --decide` (no `--decision`) lists the pending
+prompts (id, app/instance, selection, mime, time left — oldest
+first); `--decide --decision allow|deny` resolves the **oldest**
+pending prompt, and `--prompt <id>` targets a specific one (the
+consent notification carries the id and a ready-made reply
+command). Design decisions taken: the queue is FIFO — an untargeted
+decision resolves the oldest, not the most recent, as the old
+`latest` pointer implied (with the id in the notification, targeting
+is explicit either way); a decided prompt leaves the queue
+atomically with its decision (one lock), so a double decide for the
+same id is a clean `unknown-prompt` rather than a double resolution,
+and an expired prompt is removed by its own waiting thread; a
+failed decision-socket bind degrades the broker (interactive prompts
+deny at once with `no-decision-socket`, no hang; copy-out
+notifications keep working) instead of failing the service;
+`--auto-decide` never binds the socket at all.
 
 ---
 

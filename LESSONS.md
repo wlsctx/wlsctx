@@ -46,6 +46,22 @@ write-up.
     event, no limit) is what keeps the suppressed ones on the record.
     — *commit `3931f52` (the Phase 6 follow-up).*
 
+11. **A daemon that serves a long-lived control channel plus many
+    short-lived clients: run the control channel in the main thread and
+    the client work on spawned threads — never the reverse.** The
+    broker's old per-prompt design parked the *main* loop in the
+    30-second consent wait, so a second pending prompt was
+    structurally impossible (the accept loop never even got to run).
+    The fix inverted it: the main thread owns the session decision
+    socket on a `poll(2)` over both listeners (a short read timeout
+    bounds a misbehaving decider), and each connection — including a
+    prompt waiting for the user — parks on a per-prompt condvar in its
+    own thread, so the decision wakes exactly the waiting thread.
+    Keeping the decision *and* the queue removal under one lock is
+    what makes a double-decide a clean `unknown-prompt` instead of a
+    double resolution. — *commits `6365ae5`, `b186c13` (the session
+    decision socket).*
+
 ## Writing tests
 
 4. **Write the test, watch it fail, then fix (red → green).** Don't add a
