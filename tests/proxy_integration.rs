@@ -801,12 +801,18 @@ struct SourceState {
 }
 
 /// Per-`wl_data_offer` state: the payload the (fake) selection owner
-/// writes when the app receives on it, and whether the selection
-/// behind it is the app's own or a foreign (host) one.
+/// writes when the app receives on it, whether the selection behind
+/// it is the app's own or a foreign (host) one, and — for an own
+/// offer — the source the data belongs to: a real compositor serves
+/// an own read by asking the *owner* (the app) to write the data
+/// (a `send` event), which is what the fake does for own offers; a
+/// foreign offer has no app-side source, and the fake stands in for
+/// the (host) owner there.
 #[derive(Clone)]
 struct OfferState {
     data: Vec<u8>,
     foreign: bool,
+    source: Option<srv_wl_data_source::WlDataSource>,
 }
 
 /// The clipboard fake compositor. Like [`Srv`], it answers everything
@@ -914,7 +920,6 @@ impl ServerDispatch<srv_wl_data_device::WlDataDevice, ()> for Srv2 {
                 source: Some(src), ..
             } => {
                 state.device = Some(resource.clone());
-                let _ = src; // the offered mime is recorded, not needed here
                 let offer = client
                     .create_resource::<srv_wl_data_offer::WlDataOffer, OfferState, Srv2>(
                         dhandle,
@@ -922,6 +927,7 @@ impl ServerDispatch<srv_wl_data_device::WlDataDevice, ()> for Srv2 {
                         OfferState {
                             data: OWN_DATA.as_bytes().to_vec(),
                             foreign: false,
+                            source: Some(src.clone()),
                         },
                     )
                     .expect("create the offer for the app's own source");
@@ -971,15 +977,24 @@ impl ServerDispatch<srv_wl_data_offer::WlDataOffer, OfferState> for Srv2 {
         // the data — or nothing, if the request was never served),
         // and log who the selection belongs to.
         if let srv_wl_data_offer::Request::Receive { mime_type, fd } = request {
-            let payload = data.data.clone();
             let foreign = data.foreign;
-            let mut f = std::fs::File::from(fd);
-            f.write_all(&payload).expect("write the selection data");
-            drop(f);
             state.received.lock().unwrap().push((
                 if foreign { "foreign" } else { "own" }.to_string(),
-                mime_type,
+                mime_type.clone(),
             ));
+            if let Some(source) = &data.source {
+                // The app's own selection: like a real compositor,
+                // ask the owner (the app) to write the data into the
+                // requester's fd — the app does that on the `send`
+                // event (its `wl_data_source` handler below).
+                source.send(mime_type, fd.as_fd());
+            } else {
+                // A foreign selection: the fake stands in for the
+                // (host) owner and writes directly.
+                let mut f = std::fs::File::from(fd);
+                f.write_all(&data.data).expect("write the selection data");
+                drop(f);
+            }
             // Having served the app's read-back, simulate the host
             // desktop changing the clipboard: a new selection owned
             // by a source the app never created.
@@ -995,6 +1010,7 @@ impl ServerDispatch<srv_wl_data_offer::WlDataOffer, OfferState> for Srv2 {
                         OfferState {
                             data: FOREIGN_DATA.as_bytes().to_vec(),
                             foreign: true,
+                            source: None,
                         },
                     )
                     .expect("create the foreign offer");
@@ -1129,11 +1145,28 @@ no_events!(
     wl_data_device_manager::WlDataDeviceManager,
     wl_data_device_manager::Event
 );
-no_events!(
-    ClipboardApp,
-    wl_data_source::WlDataSource,
-    wl_data_source::Event
-);
+impl Dispatch<wl_data_source::WlDataSource, ()> for ClipboardApp {
+    fn event(
+        _state: &mut Self,
+        _resource: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // The (fake) compositor asks the app — the selection owner —
+        // to write its own data into the requester's fd, exactly like
+        // a real compositor would (the per-mime byte flow behind a
+        // set; the relay audits it as a `serve`).
+        if let wl_data_source::Event::Send { mime_type, fd } = event
+            && mime_type == "text/plain"
+        {
+            let mut f = std::fs::File::from(fd);
+            f.write_all(OWN_DATA.as_bytes())
+                .expect("write the offered data");
+        }
+    }
+}
 no_events!(ClipboardApp, wl_seat::WlSeat, wl_seat::Event);
 no_events!(
     ClipboardApp,
@@ -1144,8 +1177,19 @@ no_events!(
 /// One clipboard session through the proxy: the app copies (its own
 /// selection) and then reads a foreign one. Returns the contents of
 /// the two memfds after the session.
+/// One clipboard session through the proxy: the app copies (its own
+/// selection) and then reads a foreign one. `settle` is a quiet
+/// window after both reads, before the teardown — the audit tests
+/// use it to let the relay's size probes settle (two 250 ms ticks).
+/// `clear_selection` makes the app clear the (now foreign)
+/// selection *after* that window — the audit tests use it for the
+/// `clear` record, which is emitted immediately (no probe), so it
+/// comes last. Returns the contents of the two memfds after the
+/// session.
 fn one_clipboard_session(
     public_path: &Path,
+    settle: Duration,
+    clear_selection: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let memfd = |name: &str| -> std::io::Result<OwnedFd> {
         Ok(rustix::fs::memfd_create(
@@ -1229,6 +1273,26 @@ fn one_clipboard_session(
         thread::sleep(Duration::from_millis(1));
     }
 
+    // The app may hold unflushed requests: wayland-client's
+    // `blocking_dispatch` only flushes when it had to block, so the
+    // last `receive` can still be sitting in the queue here. Flush
+    // before the settle window, so the relay's probes measure from
+    // a settled state (and nothing is released in a burst at the
+    // end of the window).
+    eq.flush()?;
+    if !settle.is_zero() {
+        thread::sleep(settle);
+    }
+    if clear_selection {
+        // The app clears the (now foreign) selection: a
+        // `set_selection` with a NULL source. The relay audits the
+        // `clear`; the compositor echoes the empty selection. A
+        // short tail lets the clear round-trip before the teardown.
+        device.set_selection(None, 0);
+        eq.flush()?;
+        thread::sleep(Duration::from_millis(100));
+    }
+
     // Tear down (the compositor confirms with delete_id); no
     // protocol error may be pending on either end of the session.
     source.destroy();
@@ -1257,8 +1321,14 @@ fn one_clipboard_session(
 }
 
 /// Run the whole three-party scenario (compositor, proxy with
-/// `policy`, one app session) and assert the outcome for that policy.
-fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
+/// `policy` and `audit`, one app session) and assert the outcome for
+/// that policy.
+fn run_clipboard_session(
+    policy: wlsctx::proxy::ClipboardPolicy,
+    audit: wlsctx::proxy::AuditConfig,
+    settle: Duration,
+    clear_selection: bool,
+) {
     let _ = env_logger::Builder::new()
         .filter_level(::log::LevelFilter::Info)
         .try_init();
@@ -1283,7 +1353,7 @@ fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 policy,
-                wlsctx::proxy::AuditConfig::default(),
+                audit,
                 None,
                 Some(stop_proxy),
             );
@@ -1301,7 +1371,8 @@ fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
 
     wait_until(|| ready.load(Ordering::SeqCst), 10);
 
-    let (own, foreign) = one_clipboard_session(&public_path).expect("clipboard session failed");
+    let (own, foreign) = one_clipboard_session(&public_path, settle, clear_selection)
+        .expect("clipboard session failed");
 
     // The app disconnected before the shutdown, so the compositor's
     // view must settle to zero live clients before it exits.
@@ -1344,12 +1415,113 @@ fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
 
 #[test]
 fn clipboard_allow_is_a_passthrough() {
-    run_clipboard_session(wlsctx::proxy::ClipboardPolicy::Allow);
+    run_clipboard_session(
+        wlsctx::proxy::ClipboardPolicy::Allow,
+        wlsctx::proxy::AuditConfig::default(),
+        Duration::ZERO,
+        false,
+    );
 }
 
 #[test]
 fn clipboard_deny_allows_own_readback_and_drops_foreign() {
-    run_clipboard_session(wlsctx::proxy::ClipboardPolicy::Deny);
+    run_clipboard_session(
+        wlsctx::proxy::ClipboardPolicy::Deny,
+        wlsctx::proxy::AuditConfig::default(),
+        Duration::ZERO,
+        false,
+    );
+}
+
+/// The audit capture sink (Phase 9): records the rendered lines in
+/// emission order, for assertion after the session.
+struct CaptureSink {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl wlsctx::proxy::AuditSink for CaptureSink {
+    fn audit(&self, app: &str, instance: &str, record: &wlsctx::proxy::AuditRecord) {
+        self.lines
+            .lock()
+            .unwrap()
+            .push(wlsctx::proxy::format_audit(app, instance, record));
+    }
+}
+
+/// Phase 9: the audit log of an allow-policy clipboard session. The
+/// session (copy, read-back, foreign read, clear) produces exactly
+/// five records — one per selection event the relay saw — each
+/// saying only what a record is allowed to say: names, decisions,
+/// sizes; never the data. The read/serve sizes settle in the settle
+/// window (the probes see the final size before the teardown).
+#[test]
+fn clipboard_session_is_audited() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let audit = wlsctx::proxy::AuditConfig::with_sink(
+        "testapp".into(),
+        "inst".into(),
+        Arc::new(CaptureSink {
+            lines: lines.clone(),
+        }),
+    );
+    run_clipboard_session(
+        wlsctx::proxy::ClipboardPolicy::Allow,
+        audit,
+        Duration::from_millis(700),
+        true,
+    );
+
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        *lines,
+        vec![
+            "app=testapp instance=inst selection=clipboard action=set origin=own",
+            "app=testapp instance=inst selection=clipboard action=read origin=own mime=text/plain gate=forward fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=clipboard action=serve origin=own mime=text/plain fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=clipboard action=read origin=foreign mime=text/plain gate=forward fd_kind=memfd payload_bytes=11",
+            "app=testapp instance=inst selection=clipboard action=clear origin=foreign",
+        ],
+        "the session's five selection events, in order"
+    );
+}
+
+/// Phase 9: the audit log of a deny-policy clipboard session. The
+/// own read-back goes through (the gate's exemption) and settles to
+/// its size; the foreign read is consumed by the gate and audited
+/// as `dropped` with 0 bytes *at once* (the fd was never handed
+/// over, so there is nothing to probe — the record precedes the
+/// deferred probe records); the clear records the origin of the
+/// selection that was removed (the foreign one the compositor
+/// switched to).
+#[test]
+fn clipboard_deny_is_audited_with_a_drop() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let audit = wlsctx::proxy::AuditConfig::with_sink(
+        "testapp".into(),
+        "inst".into(),
+        Arc::new(CaptureSink {
+            lines: lines.clone(),
+        }),
+    );
+    run_clipboard_session(
+        wlsctx::proxy::ClipboardPolicy::Deny,
+        audit,
+        Duration::from_millis(700),
+        true,
+    );
+
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        *lines,
+        vec![
+            "app=testapp instance=inst selection=clipboard action=set origin=own",
+            "app=testapp instance=inst selection=clipboard action=read origin=foreign mime=text/plain gate=dropped fd_kind=memfd payload_bytes=0",
+            "app=testapp instance=inst selection=clipboard action=read origin=own mime=text/plain gate=forward fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=clipboard action=serve origin=own mime=text/plain fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=clipboard action=clear origin=foreign",
+        ],
+        "the session's five selection events: the drop is immediate, the probes settle in the window"
+    );
 }
 
 // ------------------------------------------------------------------------
@@ -1483,6 +1655,7 @@ impl ServerDispatch<srv_zps_device::ZwpPrimarySelectionDeviceV1, ()> for Srv3 {
                         OfferState {
                             data: OWN_DATA.as_bytes().to_vec(),
                             foreign: false,
+                            source: None,
                         },
                     )
                     .expect("create the offer for the app's own primary selection");
@@ -1548,6 +1721,7 @@ impl ServerDispatch<srv_zps_offer::ZwpPrimarySelectionOfferV1, OfferState> for S
                         OfferState {
                             data: FOREIGN_DATA.as_bytes().to_vec(),
                             foreign: true,
+                            source: None,
                         },
                     )
                     .expect("create the foreign primary offer");
@@ -1916,7 +2090,12 @@ enum BrokerOutcome {
     Timeout,
 }
 
-fn run_broker_session(outcome: BrokerOutcome) {
+fn run_broker_session(
+    outcome: BrokerOutcome,
+    audit: wlsctx::proxy::AuditConfig,
+    settle: Duration,
+    clear_selection: bool,
+) {
     let _ = env_logger::Builder::new()
         .filter_level(::log::LevelFilter::Info)
         .try_init();
@@ -1959,7 +2138,7 @@ fn run_broker_session(outcome: BrokerOutcome) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 wlsctx::proxy::ClipboardPolicy::Deny,
-                wlsctx::proxy::AuditConfig::default(),
+                audit,
                 Some(broker_cfg),
                 Some(stop_proxy),
             );
@@ -2021,8 +2200,8 @@ fn run_broker_session(outcome: BrokerOutcome) {
 
     wait_until(|| ready.load(Ordering::SeqCst), 10);
 
-    let (own, foreign) =
-        one_clipboard_session(&public_path).expect("clipboard session with the broker failed");
+    let (own, foreign) = one_clipboard_session(&public_path, settle, clear_selection)
+        .expect("clipboard session with the broker failed");
 
     // The app disconnected before the shutdown, so the compositor's
     // view must settle to zero live clients before it exits.
@@ -2077,17 +2256,69 @@ fn run_broker_session(outcome: BrokerOutcome) {
 
 #[test]
 fn broker_auto_allow_opens_the_intent_window() {
-    run_broker_session(BrokerOutcome::AutoAllow);
+    run_broker_session(
+        BrokerOutcome::AutoAllow,
+        wlsctx::proxy::AuditConfig::default(),
+        Duration::ZERO,
+        false,
+    );
 }
 
 #[test]
 fn broker_auto_deny_stays_dropped_and_is_consulted() {
-    run_broker_session(BrokerOutcome::AutoDeny);
+    run_broker_session(
+        BrokerOutcome::AutoDeny,
+        wlsctx::proxy::AuditConfig::default(),
+        Duration::ZERO,
+        false,
+    );
 }
 
 #[test]
 fn broker_timeout_fails_closed() {
-    run_broker_session(BrokerOutcome::Timeout);
+    run_broker_session(
+        BrokerOutcome::Timeout,
+        wlsctx::proxy::AuditConfig::default(),
+        Duration::ZERO,
+        false,
+    );
+}
+
+/// Phase 9: the audit log of a broker-approved foreign read. The
+/// same session shape as the deny audit test, but the stand-in
+/// broker answers `allow`: the foreign read is forwarded and audited
+/// as `approved`, and its size settles like any forwarded read (the
+/// consent window opened the gate, but the audit does not record
+/// *who* approved — the decision's gate is the fact it records).
+#[test]
+fn broker_approval_is_audited() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let audit = wlsctx::proxy::AuditConfig::with_sink(
+        "testapp".into(),
+        "inst".into(),
+        Arc::new(CaptureSink {
+            lines: lines.clone(),
+        }),
+    );
+    run_broker_session(
+        BrokerOutcome::AutoAllow,
+        audit,
+        Duration::from_millis(700),
+        true,
+    );
+
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        *lines,
+        vec![
+            "app=testapp instance=inst selection=clipboard action=set origin=own",
+            "app=testapp instance=inst selection=clipboard action=read origin=own mime=text/plain gate=forward fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=clipboard action=serve origin=own mime=text/plain fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=clipboard action=read origin=foreign mime=text/plain gate=approved fd_kind=memfd payload_bytes=11",
+            "app=testapp instance=inst selection=clipboard action=clear origin=foreign",
+        ],
+        "the session's five selection events: the foreign read is approved and settled"
+    );
 }
 
 /// Phase 6: the copy-out notification. The same three-party clipboard
@@ -2200,8 +2431,8 @@ fn run_copy_out_session(broker_reachable: bool) {
 
     wait_until(|| ready.load(Ordering::SeqCst), 10);
 
-    let (own, _foreign) =
-        one_clipboard_session(&public_path).expect("clipboard session (copy-out) failed");
+    let (own, _foreign) = one_clipboard_session(&public_path, Duration::ZERO, false)
+        .expect("clipboard session (copy-out) failed");
 
     // The app disconnected; let the compositor's view settle.
     wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
