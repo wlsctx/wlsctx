@@ -662,6 +662,7 @@ fn relay_passes_messages_and_fds() {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 wlsctx::proxy::ClipboardPolicy::Allow,
+                wlsctx::proxy::AuditConfig::default(),
                 None,
                 Some(stop_proxy),
             );
@@ -729,6 +730,7 @@ fn allowlist_hides_globals_and_rejects_their_binds() {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::from_csv("wl_compositor"),
                 wlsctx::proxy::ClipboardPolicy::Allow,
+                wlsctx::proxy::AuditConfig::default(),
                 None,
                 Some(stop_proxy),
             );
@@ -1281,6 +1283,7 @@ fn run_clipboard_session(policy: wlsctx::proxy::ClipboardPolicy) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 policy,
+                wlsctx::proxy::AuditConfig::default(),
                 None,
                 Some(stop_proxy),
             );
@@ -1822,6 +1825,7 @@ fn run_primary_session(policy: wlsctx::proxy::ClipboardPolicy) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 policy,
+                wlsctx::proxy::AuditConfig::default(),
                 None,
                 Some(stop_proxy),
             );
@@ -1955,6 +1959,7 @@ fn run_broker_session(outcome: BrokerOutcome) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 wlsctx::proxy::ClipboardPolicy::Deny,
+                wlsctx::proxy::AuditConfig::default(),
                 Some(broker_cfg),
                 Some(stop_proxy),
             );
@@ -2133,6 +2138,7 @@ fn run_copy_out_session(broker_reachable: bool) {
                 &tagged_for_proxy,
                 &wlsctx::proxy::Policy::all(),
                 wlsctx::proxy::ClipboardPolicy::Allow,
+                wlsctx::proxy::AuditConfig::default(),
                 Some(broker_cfg),
                 Some(stop_proxy),
             );

@@ -82,6 +82,30 @@
 //! closed again. A missing broker, a timeout, or a malformed answer
 //! keeps the drop — the broker is optional and fails closed.
 //!
+//! ## The selection audit log (Phase 9)
+//!
+//! Every selection event the relay observes becomes one record under
+//! the `audit` log target (see [`audit`]): a **write** (`set_selection`
+//! with a non-NULL source), a **clear** (a NULL source), a **read**
+//! (`receive`, with the gate's decision), and a **serve** (a `send`
+//! event on one of the app's source objects — the per-mime byte flow
+//! behind a write). The record carries app, instance, selection,
+//! action, origin, mime, the gate's decision, the fd's class, and the
+//! payload *size* — never the contents. The default sink writes one
+//! line per record, which in deployment reaches the host journal
+//! (mode B via the pod's passthrough logging, mode A via the unit's
+//! `StandardError=journal`): the persistent, cross-pod record, as
+//! opposed to the Phase 6 notification (visible in the moment only).
+//! The audit is always on while the relay runs (one line per event;
+//! `RUST_LOG=warn` suppresses the stream).
+//!
+//! A payload size is only measurable where a size is reported: a
+//! memfd grows as its writer writes, so the relay keeps a duplicate
+//! of the relevant fd and re-measures it (an `fstat`, never a read)
+//! at a short poll tick until the size settles; a pipe or socket
+//! reports no size (the record omits the field). A dropped read
+//! records 0 bytes — the app's fd stayed empty, which is the truth.
+//!
 //! ## Fail-closed
 //!
 //! Every error path drops both ends of the affected connection (the
@@ -95,6 +119,7 @@
 //! One OS thread per app connection; the main thread runs the accept
 //! loop on a signalfd (production) or a stop flag (tests).
 
+pub mod audit;
 pub mod broker;
 pub mod clipboard;
 pub mod interfaces;
@@ -130,13 +155,15 @@ use rustix::net::{
 };
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wayland_backend::protocol::{Argument, ArgumentType, Interface, Message, MessageDesc};
 use wayland_client::protocol::__interfaces::WL_DISPLAY_INTERFACE;
 
+pub use self::audit::{AuditConfig, AuditRecord, AuditSink, JournalAuditSink, format_audit};
 pub use self::broker::BrokerConfig;
 pub use self::clipboard::{ClipboardGate, ClipboardPolicy};
+use self::clipboard::{FdKind, SelectionWrite, fd_class};
 use self::objects::{BookkeepingError, Dir, ObjectTables};
 pub use self::policy::Policy;
 
@@ -262,6 +289,79 @@ struct GlobalInterceptor {
     hidden: HashSet<u32>,
 }
 
+/// How often a pending size probe is re-measured (and the relay's
+/// poll tick while one is pending): long enough that a settled size
+/// is caught in one or two ticks, short enough that the record
+/// lags the transfer by well under a second.
+const PROBE_TICK: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 250_000_000,
+};
+/// A probe is resolved (its record emitted) after this long even if
+/// the size never settles (the writer wrote nothing, or is pathologically
+/// slow): the record carries whatever was measured (0 if nothing).
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+/// Consecutive measurements at the same non-zero size before the
+/// size is considered settled.
+const PROBE_STABLE: u32 = 2;
+
+/// A pending payload-size measurement (Phase 9): a retained duplicate
+/// of an fd that will carry selection payload across this
+/// connection.
+///
+/// The size is not known at the moment the fd crosses the boundary —
+/// the writer (the selection owner, for a forwarded `read`; the app
+/// itself, for a `send` on one of its sources) fills it *after* the
+/// message, out of band — so the relay keeps a duplicate and
+/// re-measures it (`fstat`, never a read: the data is the app's or
+/// the owner's, and the audit must not touch it) at each tick until
+/// it settles. A memfd reports a size; a pipe/socket does not (such
+/// a probe is resolved at once, without a size), and a writer that
+/// never writes leaves 0 (the record says so).
+struct SizeProbe {
+    /// The retained duplicate (closed when the probe resolves).
+    fd: OwnedFd,
+    /// Whether the size is measurable at all (a memfd: yes).
+    measurable: bool,
+    /// The audit fields captured at the decision point; the
+    /// `payload_bytes` is filled in as the probe settles.
+    record: AuditRecord,
+    /// The last measured size.
+    last_size: u64,
+    /// Consecutive measurements at the current non-zero size.
+    stable: u32,
+    /// Resolve by this instant at the latest (whatever was measured).
+    deadline: Instant,
+}
+
+impl SizeProbe {
+    /// Retain a duplicate of `fd` and start measuring it. The first
+    /// measurement is taken now (the writer may have already written
+    /// some); the relay re-measures on every tick until it settles.
+    /// A `dup` failure is surfaced to the caller, which then emits
+    /// the record without a size (the audit must never break the
+    /// relay over a measurement).
+    fn new(fd: &OwnedFd, record: AuditRecord) -> io::Result<Self> {
+        let probe_fd = fd.try_clone()?;
+        let measurable = matches!(fd_class(fd), Some(FdKind::Memfd));
+        let last_size = if measurable {
+            rustix::fs::fstat(&probe_fd)
+                .map(|st| st.st_size as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Self {
+            fd: probe_fd,
+            measurable,
+            record,
+            last_size,
+            stable: 0,
+            deadline: Instant::now() + PROBE_DEADLINE,
+        })
+    }
+}
+
 /// One app connection and its tagged upstream, relayed bidirectionally
 /// on the calling thread.
 struct Relay {
@@ -283,6 +383,13 @@ struct Relay {
     /// infers from the protocol traffic, deciding `wl_data_offer.
     /// receive` requests.
     clipboard: ClipboardGate,
+    /// The audit identity and sink (Phase 9): every selection event
+    /// the relay observes becomes one record under the `audit` target
+    /// (the host journal in deployment).
+    audit: AuditConfig,
+    /// Pending payload-size probes (Phase 9): retained duplicates of
+    /// fds that will carry selection payload, measured as they settle.
+    probes: Vec<SizeProbe>,
     /// The optional prompt broker (Phase 4): consulted before a
     /// dropped foreign read is consumed; an approved answer unlocks
     /// the gate for its intent window.
@@ -295,6 +402,7 @@ impl Relay {
         up: UnixStream,
         policy: Arc<Policy>,
         clipboard: ClipboardPolicy,
+        audit: AuditConfig,
         broker: Option<BrokerConfig>,
     ) -> Self {
         Self {
@@ -311,24 +419,39 @@ impl Relay {
                 hidden: HashSet::new(),
             },
             clipboard: ClipboardGate::new(clipboard),
+            audit,
+            probes: Vec::new(),
             broker,
         }
     }
 
     /// Run until the relay ends; the caller drops both sockets.
     fn run(&mut self) -> RelayEnd {
-        loop {
+        let end = loop {
             let mut polls = [
                 PollFd::new(&self.down.fd, PollFlags::IN),
                 PollFd::new(&self.up.fd, PollFlags::IN),
             ];
-            match poll(&mut polls, None) {
-                Ok(0) => continue,
+            // A tick only while a size probe is pending (Phase 9):
+            // the writer fills the fd out of band, *after* the event,
+            // so a fully blocked relay would never wake to measure
+            // it — and an idle relay pays no tick cost.
+            let timeout = if self.probes.is_empty() {
+                None
+            } else {
+                Some(&PROBE_TICK)
+            };
+            match poll(&mut polls, timeout) {
+                // `Ok(0)` is a tick (no socket ready): it falls
+                // straight to the probe re-measure below, which is
+                // all that happened.
                 Ok(_) => {}
                 // EINTR cannot happen here: this thread has the
                 // signalfd-bound mask blocked (see [`spawn_relay`]).
                 Err(Errno::INTR) => continue,
-                Err(e) => return RelayEnd::Io(e.into()),
+                // Any other poll error is terminal: break to the
+                // teardown (which flushes any pending size probes).
+                Err(e) => break RelayEnd::Io(e.into()),
             }
             let client_ready = polls[0]
                 .revents()
@@ -343,16 +466,86 @@ impl Relay {
             #[allow(clippy::collapsible_if)]
             if client_ready {
                 if let Err(end) = self.pump(Dir::ClientToServer) {
-                    return end;
+                    break end;
                 }
             }
             #[allow(clippy::collapsible_if)]
             if server_ready {
                 if let Err(end) = self.pump(Dir::ServerToClient) {
-                    return end;
+                    break end;
                 }
             }
+            // Re-measure the probes on every wake: a size change
+            // usually arrives with traffic, and the tick catches the
+            // quiet ones.
+            self.poll_probes();
+        };
+        // Teardown: emit whatever probe is still pending, with the
+        // size measured so far (the record exists either way).
+        self.flush_probes();
+        end
+    }
+
+    /// Re-measure the pending size probes (Phase 9). A memfd that
+    /// reported the same non-zero size [`PROBE_STABLE`] times in a
+    /// row has settled — its record is emitted. A stream (pipe/
+    /// socket) is emitted at once, without a size (a stream reports
+    /// none). A probe past its deadline is emitted with whatever it
+    /// measured (0 if the writer wrote nothing).
+    fn poll_probes(&mut self) {
+        if self.probes.is_empty() {
+            return;
         }
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.probes.len() {
+            let resolved = {
+                let p = &mut self.probes[i];
+                if !p.measurable {
+                    p.record.payload_bytes = None;
+                    true
+                } else if now >= p.deadline {
+                    p.record.payload_bytes = Some(p.last_size);
+                    true
+                } else {
+                    let size = rustix::fs::fstat(&p.fd)
+                        .map(|st| st.st_size as u64)
+                        .unwrap_or(p.last_size);
+                    if size != 0 && size == p.last_size {
+                        p.stable += 1;
+                        p.last_size = size;
+                        p.record.payload_bytes = Some(size);
+                        p.stable >= PROBE_STABLE
+                    } else {
+                        p.stable = 1;
+                        p.last_size = size;
+                        p.record.payload_bytes = Some(size);
+                        false
+                    }
+                }
+            };
+            if resolved {
+                self.audit.audit(&self.probes[i].record);
+                self.probes.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Emit every still-pending probe (the relay is ending; the
+    /// sizes are whatever was measured — an under-estimate at worst,
+    /// the record itself is exact about what happened).
+    fn flush_probes(&mut self) {
+        for p in &mut self.probes {
+            p.record.payload_bytes = if p.measurable {
+                Some(p.last_size)
+            } else {
+                None
+            };
+            self.audit.audit(&p.record);
+        }
+        self.probes.clear();
     }
 
     /// Read one chunk from the given direction and relay every complete
@@ -379,6 +572,8 @@ impl Relay {
                 &mut self.g,
                 &mut self.clipboard,
                 self.broker.as_ref(),
+                &self.audit,
+                &mut self.probes,
                 dir,
                 raw,
                 fds,
@@ -406,6 +601,8 @@ impl Relay {
         g: &mut GlobalInterceptor,
         clipboard: &mut ClipboardGate,
         broker: Option<&BrokerConfig>,
+        audit: &AuditConfig,
+        probes: &mut Vec<SizeProbe>,
         dir: Dir,
         raw: &[u8],
         src_fds: &mut VecDeque<OwnedFd>,
@@ -458,28 +655,69 @@ impl Relay {
         // `receive` request below.
         clipboard.observe(dir, sender, desc, &msg);
 
-        // ---- Phase 6: the copy-out notification (fire-and-forget). ----
+        // ---- Phase 6 + 9: a selection write or clear (the app's
+        // `set_selection`). ----
         // A client `set_selection` with a non-NULL source is the app
         // placing data on that selection — the one direction that
         // moves data *out* of the sandbox (the read-gate below covers
-        // the reverse). If a copy-out notifier is configured, tell the
-        // host. Fail-open: a missing/unreachable broker only loses the
-        // notice; the write itself is always forwarded (it was decided
-        // as a straight pass-through before this, and no interceptor
-        // touches `set_selection`).
+        // the reverse); a NULL source clears it. No interceptor
+        // touches `set_selection`: the request is always forwarded.
+        // But two things happen here:
         //
-        // TODO(audit-log): this hook — and the `receive` decision
-        // below — are also where a structured audit entry per
-        // selection write/read should be emitted (app, instance,
-        // selection, own-vs-foreign, mime, action). See TASKS.md.
-        if let (Some(broker), Some(selection)) = (
-            broker.filter(|b| b.notify_copy_out),
-            ClipboardGate::writes_selection(dir, sender, desc, &msg),
-        ) && let Err(e) = broker.notify_write(selection)
-        {
-            warn!(
-                "{selection} copy-out note: broker unreachable ({e}); the write is forwarded regardless"
-            );
+        // * Phase 9: one audit record per event (`set` or `clear`).
+        //   The `set` records the *declaration* — the data itself is
+        //   served later, per mime, as the `serve` records (a `send`
+        //   event on the app's source objects), which is where the
+        //   payload size is measured. A `set` is always `own` (the
+        //   source is one this client created).
+        // * Phase 6: a copy-out *notification* (fire-and-forget) for a
+        //   `set` only — a `clear` places nothing, so there is nothing
+        //   to warn about. Fail-open: a missing/unreachable broker
+        //   only loses the notice; the write is forwarded regardless.
+        if let Some((selection, write)) = ClipboardGate::set_selection(dir, sender, desc, &msg) {
+            match write {
+                SelectionWrite::Set => {
+                    audit.audit(&AuditRecord {
+                        selection,
+                        action: "set",
+                        origin: Some("own"),
+                        mime: None,
+                        gate: None,
+                        fd_kind: None,
+                        payload_bytes: None,
+                    });
+                    if let Some(broker) = broker.filter(|b| b.notify_copy_out)
+                        && let Err(e) = broker.notify_write(selection)
+                    {
+                        warn!(
+                            "{selection} copy-out note: broker unreachable ({e}); the write is forwarded regardless"
+                        );
+                    }
+                }
+                SelectionWrite::Clear => {
+                    // The origin removed is whatever the gate last
+                    // attributed to this selection. `observe` (run
+                    // before this) leaves that state untouched by the
+                    // clear request itself — it is updated later, by
+                    // the compositor's confirming `selection` echo —
+                    // so this is the origin of the selection that is
+                    // about to be cleared.
+                    let origin = if selection == "primary" {
+                        clipboard.primary_selection_origin()
+                    } else {
+                        clipboard.selection_origin()
+                    };
+                    audit.audit(&AuditRecord {
+                        selection,
+                        action: "clear",
+                        origin: origin.map(|o| o.as_str()),
+                        mime: None,
+                        gate: None,
+                        fd_kind: None,
+                        payload_bytes: None,
+                    });
+                }
+            }
         }
 
         // ---- Phase 2 + 3 (+ 5): the interceptors. ----
@@ -513,14 +751,43 @@ impl Relay {
                 "wl_data_offer" | "zwp_primary_selection_offer_v1"
             ) {
             // Which selection the read is about (for the broker
-            // prompt; both protocols read identically from here).
-            let selection = if sender.name == "zwp_primary_selection_offer_v1" {
-                "primary"
-            } else {
-                "clipboard"
-            };
-            match clipboard.on_receive(&msg).map_err(RelayEnd::Protocol)? {
-                ForwardAction::Forward => ForwardAction::Forward,
+            // prompt and the audit; both protocols read identically
+            // from here).
+            let primary = sender.name == "zwp_primary_selection_offer_v1";
+            let selection = if primary { "primary" } else { "clipboard" };
+            // The request is `receive(mime, fd)`: the mime names the
+            // data, the fd is the app's in-memory channel the
+            // selection owner will fill.
+            let mime = msg
+                .args
+                .iter()
+                .find_map(|a| {
+                    if let Argument::Str(Some(s)) = a {
+                        Some(s.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            let recv_fd = msg.args.iter().find_map(|a| {
+                if let Argument::Fd(f) = a {
+                    Some(f)
+                } else {
+                    None
+                }
+            });
+
+            let decision = clipboard
+                .on_receive(&msg, primary)
+                .map_err(RelayEnd::Protocol)?;
+
+            // The gate's decision as the audit spells it. A forward
+            // is either the policy's own allow (`forward`) or a
+            // broker approval (`approved`); a drop is a policy deny,
+            // a broker deny, a timeout, or an unreachable broker
+            // (`dropped` — fail closed).
+            let (final_action, gate) = match (decision.action, broker) {
+                (ForwardAction::Forward, _) => (ForwardAction::Forward, "forward"),
                 // The gate dropped a read of a foreign selection (the
                 // `deny` policy with no active consent window). If a
                 // prompt broker is configured, ask the user before
@@ -529,41 +796,133 @@ impl Relay {
                 // it, go through) and the read is forwarded; a deny,
                 // a timeout, or an unreachable broker keeps the drop
                 // (fail closed).
-                ForwardAction::Drop => match broker {
-                    Some(broker) => {
-                        let mime = msg
-                            .args
-                            .first()
-                            .and_then(|a| {
-                                if let Argument::Str(Some(s)) = a {
-                                    Some(s.to_string_lossy().into_owned())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-                        match broker.ask(selection, &mime) {
-                            Ok(true) => {
-                                clipboard.unlock(Instant::now() + broker.window);
-                                info!(
-                                    "{selection} gate: the user approved the read; \
-                                     the intent window ({} ms) opens foreign reads",
-                                    broker.window.as_millis()
-                                );
-                                ForwardAction::Forward
-                            }
-                            Ok(false) => ForwardAction::Drop,
-                            Err(e) => {
-                                warn!(
-                                    "{selection} gate: the broker is unreachable ({e}); dropping the read"
-                                );
-                                ForwardAction::Drop
-                            }
+                (ForwardAction::Drop, Some(broker)) => match broker.ask(selection, &mime) {
+                    Ok(true) => {
+                        clipboard.unlock(Instant::now() + broker.window);
+                        info!(
+                            "{selection} gate: the user approved the read; \
+                             the intent window ({} ms) opens foreign reads",
+                            broker.window.as_millis()
+                        );
+                        (ForwardAction::Forward, "approved")
+                    }
+                    Ok(false) => (ForwardAction::Drop, "dropped"),
+                    Err(e) => {
+                        warn!(
+                            "{selection} gate: the broker is unreachable ({e}); dropping the read"
+                        );
+                        (ForwardAction::Drop, "dropped")
+                    }
+                },
+                (ForwardAction::Drop, None) => (ForwardAction::Drop, "dropped"),
+            };
+
+            // Phase 9: audit the read, and arrange to measure the
+            // payload. The size is only known after the (possibly
+            // never) write: a dropped read's fd stays empty (0
+            // bytes, emitted now); a forwarded/approved read's fd is
+            // filled out-of-band by the selection owner — a memfd is
+            // probed for its size, a stream (pipe/socket) reports
+            // none (the field is then omitted).
+            let mut record = AuditRecord {
+                selection,
+                action: "read",
+                origin: Some(decision.origin.as_str()),
+                mime: Some(mime),
+                gate: Some(gate),
+                fd_kind: Some(decision.fd_kind.as_str()),
+                payload_bytes: None,
+            };
+            if final_action == ForwardAction::Drop {
+                // The fd was never handed to the compositor: it
+                // stayed empty, which is the truth the record keeps.
+                record.payload_bytes = Some(0);
+                audit.audit(&record);
+            } else {
+                let measurable = decision.fd_kind == FdKind::Memfd;
+                if let (true, Some(fd)) = (measurable, recv_fd) {
+                    match SizeProbe::new(fd, record.clone()) {
+                        Ok(p) => probes.push(p),
+                        Err(e) => {
+                            // A dup failure does not break the relay
+                            // (the read still goes through); the
+                            // record is emitted without a size.
+                            warn!(
+                                "read audit: dup of the receive fd failed ({e}); emitting without a size"
+                            );
+                            audit.audit(&record);
                         }
                     }
-                    None => ForwardAction::Drop,
-                },
+                } else {
+                    audit.audit(&record);
+                }
             }
+
+            final_action
+        } else if dir == Dir::ServerToClient
+            && desc.name == "send"
+            && matches!(
+                sender.name,
+                "wl_data_source" | "zwp_primary_selection_source_v1"
+            )
+        {
+            // Phase 9: audit the serve. A `send(mime, fd)` on the
+            // app's source object is the compositor telling the app
+            // to write its own data for a requester's read — the
+            // per-mime byte flow behind a `set`/`start_drag`. The
+            // data is the app's (a copy-out), so the origin is `own`
+            // and there is no gate; we record the mime, the fd's
+            // class, and (when measurable) the size the app writes.
+            // The event is always forwarded (the app is entitled to
+            // it; no interceptor drops a `send`).
+            let selection = if sender.name == "zwp_primary_selection_source_v1" {
+                "primary"
+            } else {
+                "clipboard"
+            };
+            let mime = msg
+                .args
+                .iter()
+                .find_map(|a| {
+                    if let Argument::Str(Some(s)) = a {
+                        Some(s.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            let send_fd = msg.args.iter().find_map(|a| {
+                if let Argument::Fd(f) = a {
+                    Some(f)
+                } else {
+                    None
+                }
+            });
+            let fd_kind: Option<FdKind> = send_fd.and_then(fd_class);
+            let record = AuditRecord {
+                selection,
+                action: "serve",
+                origin: Some("own"),
+                mime: Some(mime),
+                gate: None,
+                fd_kind: fd_kind.map(|k| k.as_str()),
+                payload_bytes: None,
+            };
+            let measurable = matches!(fd_kind, Some(FdKind::Memfd));
+            if let (true, Some(fd)) = (measurable, send_fd) {
+                match SizeProbe::new(fd, record.clone()) {
+                    Ok(p) => probes.push(p),
+                    Err(e) => {
+                        warn!(
+                            "serve audit: dup of the send fd failed ({e}); emitting without a size"
+                        );
+                        audit.audit(&record);
+                    }
+                }
+            } else {
+                audit.audit(&record);
+            }
+            ForwardAction::Forward
         } else if sender.name == "wl_registry" {
             match (dir, desc.name) {
                 (Dir::ServerToClient, "global") => {
@@ -772,6 +1131,7 @@ fn spawn_relay(
     tagged_path: &Path,
     policy: Arc<Policy>,
     clipboard: ClipboardPolicy,
+    audit: AuditConfig,
     broker: Option<BrokerConfig>,
 ) -> io::Result<()> {
     let up = UnixStream::connect(tagged_path).map_err(|e| {
@@ -785,7 +1145,7 @@ fn spawn_relay(
             // Block the signalfd-bound mask so SIGTERM/SIGINT/SIGHUP
             // reach the main thread's signalfd, not this thread.
             let _ = proxy_signal_mask().thread_block();
-            let mut relay = Relay::new(app, up, policy, clipboard, broker);
+            let mut relay = Relay::new(app, up, policy, clipboard, audit, broker);
             let end = relay.run();
             match &end {
                 RelayEnd::Eof => debug!("relay closed: peer disconnected"),
@@ -812,6 +1172,7 @@ pub fn event_loop(
     tagged_path: &Path,
     policy: &Policy,
     clipboard: ClipboardPolicy,
+    audit: AuditConfig,
     broker: Option<BrokerConfig>,
     stop: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
@@ -856,6 +1217,7 @@ pub fn event_loop(
                             tagged_path,
                             policy.clone(),
                             clipboard,
+                            audit.clone(),
                             broker.clone(),
                         ) {
                             warn!("dropping app connection: {e}");

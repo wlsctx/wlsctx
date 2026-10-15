@@ -399,6 +399,11 @@ fn run_proxy(cli: &Cli) -> Result<()> {
     info!(
         "Clipboard fd sanity check is on in both policies (receive fds must be in-memory channels)"
     );
+    // The audit identity: every selection event the relay observes is
+    // recorded under the `audit` log target (the host journal in
+    // deployment). Always on; `RUST_LOG=warn` suppresses the stream.
+    let audit = wlsctx::proxy::AuditConfig::new(app_id.clone(), instance_id.clone());
+    info!("Selection audit log on (records under the `audit` target; RUST_LOG=warn to silence)");
     // The optional prompt broker: when a denied read lands, the
     // relay asks here (a fresh connection per ask) before dropping.
     let broker = match &cli.broker_socket {
@@ -427,7 +432,15 @@ fn run_proxy(cli: &Cli) -> Result<()> {
         }
         None => None,
     };
-    wlsctx::proxy::event_loop(&public, &tagged_path, &policy, clipboard, broker, None)?;
+    wlsctx::proxy::event_loop(
+        &public,
+        &tagged_path,
+        &policy,
+        clipboard,
+        audit,
+        broker,
+        None,
+    )?;
     info!("Shutting down.");
     Ok(())
 }

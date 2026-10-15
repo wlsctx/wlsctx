@@ -155,6 +155,65 @@ pub(crate) enum Origin {
     Foreign,
 }
 
+impl Origin {
+    /// The audit spelling (Phase 9).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Foreign => "foreign",
+        }
+    }
+}
+
+/// The gate's attribution of the data a `read` pulls in, with the
+/// audit's third state: `Unknown` (no attribution yet — the read
+/// arrived before the protocol told us who owns the selection).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OriginInfo {
+    /// The offer is one the gate attributed to this client (or the
+    /// current selection's owner is this client).
+    Own,
+    /// The data belongs to another client (the host desktop, or
+    /// another sandboxed app).
+    Foreign,
+    /// The gate has no attribution yet (a read before any
+    /// `selection` event, or of an offer it never saw announced).
+    Unknown,
+}
+
+impl OriginInfo {
+    /// The audit spelling (Phase 9).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Foreign => "foreign",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The class of an in-memory channel an fd refers to, per the
+/// kernel's `/proc/self/fd/<n>` symlink: `memfd` (an anonymous file
+/// — the only class that *reports a size*), `pipe` (an anonymous
+/// pipe), or `socket` (a unix socket).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FdKind {
+    Memfd,
+    Pipe,
+    Socket,
+}
+
+impl FdKind {
+    /// The audit spelling (Phase 9).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memfd => "memfd",
+            Self::Pipe => "pipe",
+            Self::Socket => "socket",
+        }
+    }
+}
+
 /// What a client request the gate is waiting to be echoed: the next
 /// `data_offer` event is attributed to the request of this kind,
 /// consumed by the matching confirming event (`selection` for a
@@ -204,6 +263,34 @@ pub struct ClipboardGate {
     unlocked_until: Option<Instant>,
 }
 
+/// The gate's decision on one `receive`, with the facts the
+/// audit record (Phase 9) needs alongside the action: the
+/// receive fd's class, and the attribution of the data the read
+/// pulls in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ReceiveDecision {
+    /// Relay the request as-is, or consume it (the app's fd
+    /// stays empty and the read comes back empty).
+    pub action: ForwardAction,
+    /// The receive fd's class (the always-on sanity check
+    /// guarantees it is an in-memory channel).
+    pub fd_kind: FdKind,
+    /// Who the data behind this read belongs to.
+    pub origin: OriginInfo,
+}
+
+/// What a client `set_selection` does to the selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SelectionWrite {
+    /// A non-NULL source: the app is placing data on the
+    /// selection — data now reachable by every client on the
+    /// desktop, i.e. a copy-*out* (the read-gate and the
+    /// broker's consent flow cover the copy-*in* direction).
+    Set,
+    /// A NULL source: the app is clearing the selection.
+    Clear,
+}
+
 impl ClipboardGate {
     pub fn new(policy: ClipboardPolicy) -> Self {
         Self {
@@ -222,15 +309,15 @@ impl ClipboardGate {
     /// The origin of the current clipboard selection, if any.
     ///
     /// Phase 4 hook: the prompt broker reports it to the user when
-    /// asking for consent to a foreign read.
-    #[allow(dead_code)]
+    /// asking for consent to a foreign read. Phase 9: the `clear`
+    /// audit record carries it (the origin of the selection that was
+    /// removed).
     pub(crate) fn selection_origin(&self) -> Option<Origin> {
         self.selection
     }
 
     /// The origin of the current primary selection, if any (Phase
     /// 5). Same use as [`Self::selection_origin`].
-    #[allow(dead_code)]
     pub(crate) fn primary_selection_origin(&self) -> Option<Origin> {
         self.primary_selection
     }
@@ -396,18 +483,18 @@ impl ClipboardGate {
     /// mime string and an fd argument), the same drop semantics, and
     /// the same attribution state (`own_offers` is shared, object
     /// IDs are unique per connection), so one implementation serves
-    /// both.
+    /// both; `primary` only selects *which* protocol's selection
+    /// state the audit attribution reads (the two echo sequences
+    /// are tracked separately).
     ///
-    /// Returns the action for the relay: [`ForwardAction::Forward`]
-    /// (relay the request as-is) or [`ForwardAction::Drop`] (consume
-    /// it silently — the app's fd stays empty and the read comes
-    /// back empty). An error is a protocol violation (the fd is not
-    /// an in-memory channel, or the message is malformed): the
-    /// caller must fail the connection closed.
+    /// An error is a protocol violation (the fd is not an in-memory
+    /// channel, or the message is malformed): the caller must fail
+    /// the connection closed.
     pub(crate) fn on_receive(
         &mut self,
         msg: &Message<u32, OwnedFd>,
-    ) -> Result<ForwardAction, String> {
+        primary: bool,
+    ) -> Result<ReceiveDecision, String> {
         // 1. The fd sanity check (always, both policies). The fd is
         // the last argument of the request in every version of the
         // interface; find it rather than assume a position.
@@ -420,102 +507,169 @@ impl ClipboardGate {
         }) else {
             return Err("wl_data_offer.receive without an fd argument".into());
         };
-        fd_is_memchannel(fd)?;
+        let fd_kind = fd_kind(fd)?;
+        let origin = Self::read_origin(self, msg.sender_id, primary);
 
         // 2. The policy.
         match self.policy {
-            ClipboardPolicy::Allow => Ok(ForwardAction::Forward),
+            ClipboardPolicy::Allow => Ok(ReceiveDecision {
+                action: ForwardAction::Forward,
+                fd_kind,
+                origin,
+            }),
             ClipboardPolicy::Deny => {
                 let consented = self
                     .unlocked_until
                     .is_some_and(|until| Instant::now() < until);
                 if consented || self.own_offers.contains(&msg.sender_id) {
-                    Ok(ForwardAction::Forward)
+                    Ok(ReceiveDecision {
+                        action: ForwardAction::Forward,
+                        fd_kind,
+                        origin,
+                    })
                 } else {
                     info!(
-                        "selection gate (deny): dropping a read of a foreign selection \
-                         (clipboard or primary; the app will see an empty read)"
+                        "selection gate (deny): dropping a read of a {} selection \
+                         (the app will see an empty read)",
+                        if primary { "primary" } else { "clipboard" }
                     );
-                    Ok(ForwardAction::Drop)
+                    Ok(ReceiveDecision {
+                        action: ForwardAction::Drop,
+                        fd_kind,
+                        origin,
+                    })
                 }
             }
         }
     }
 
-    /// The Phase 6 hook: which selection this message *writes*, if
-    /// any.
+    /// The audit attribution of the data a `read` on `offer_id`
+    /// pulls in (Phase 9): `own` when the gate attributed the offer
+    /// to this client (the precise per-offer proof), else the
+    /// current selection's origin for that protocol (the offer was
+    /// announced but never attributed own), else `unknown` (no
+    /// attribution yet).
+    fn read_origin(&self, offer_id: u32, primary: bool) -> OriginInfo {
+        if self.own_offers.contains(&offer_id) {
+            return OriginInfo::Own;
+        }
+        let selection = if primary {
+            self.primary_selection
+        } else {
+            self.selection
+        };
+        match selection {
+            Some(Origin::Own) => OriginInfo::Own,
+            Some(Origin::Foreign) => OriginInfo::Foreign,
+            None => OriginInfo::Unknown,
+        }
+    }
+
+    /// The selection this `set_selection` message acts on, and how
+    /// (Phase 6: the copy-out detector; Phase 9: the audit's
+    /// write/clear distinction).
     ///
     /// A client `set_selection` on either selection protocol whose
-    /// source argument is **not NULL** is the app placing data on that
-    /// selection — data now reachable by every client on the desktop,
-    /// i.e. a copy-*out* (the read-gate and the broker's consent flow
-    /// cover the copy-*in* direction). A NULL source is a *clear*, not
-    /// a write, and returns `None` as does every other message
-    /// (including the server's `selection` *event*, which only ever
-    /// echoes a prior write).
+    /// source argument is **not NULL** is the app placing data on
+    /// that selection (a `Set`); a NULL source is a `Clear` (not a
+    /// write: nothing is placed, the previous data is simply
+    /// removed). Every other message — including the server's
+    /// `selection` *event*, which only ever echoes a prior write —
+    /// returns `None`.
     ///
-    /// The source is guaranteed to be one *this* client created: the
-    /// relay's bookkeeping (run before this, in `forward`) rejects any
-    /// reference to an object the client does not own, and a client
-    /// can only set a selection with a source it created itself. So a
-    /// non-NULL source here is unambiguously the app writing — no
-    /// origin-tracking state is needed (nor wanted: a write must be
-    /// reported even for a source the read-gate later attributes
-    /// foreign, because the *write* is what matters).
+    /// The source of a `Set` is guaranteed to be one *this* client
+    /// created: the relay's bookkeeping (run before this, in
+    /// `forward`) rejects any reference to an object the client
+    /// does not own, and a client can only set a selection with a
+    /// source it created itself. So a `Set` is unambiguously the
+    /// app writing — no origin-tracking state is needed (nor wanted:
+    /// a write must be reported even for a source the read-gate
+    /// later attributes foreign, because the *write* is what
+    /// matters).
     ///
     /// Returns the human-facing name — `"clipboard"` (the stable
-    /// selection) or `"primary"` (the X-style primary selection) — so
-    /// the relay can notify the host; `None` otherwise.
-    pub(crate) fn writes_selection(
+    /// selection) or `"primary"` (the X-style primary selection) —
+    /// and the kind; `None` otherwise.
+    pub(crate) fn set_selection(
         dir: Dir,
         sender: &Interface,
         desc: &MessageDesc,
         msg: &Message<u32, OwnedFd>,
-    ) -> Option<&'static str> {
+    ) -> Option<(&'static str, SelectionWrite)> {
         if dir != Dir::ClientToServer || desc.name != "set_selection" {
             return None;
         }
-        // A NULL source (a clear) is not a write; neither is a
-        // malformed arg (the parse would have caught it).
-        let is_write = matches!(msg.args.first(), Some(Argument::Object(id)) if *id != 0);
-        if !is_write {
-            return None;
-        }
-        match sender.name {
-            "wl_data_device" => Some("clipboard"),
-            "zwp_primary_selection_device_v1" => Some("primary"),
-            _ => None,
-        }
+        // The source is the first argument (`allow-null`). A NULL
+        // source is a clear; any non-NULL object is a write (the
+        // bookkeeping guarantees the object is one this client
+        // created); a malformed arg is not possible (the parse
+        // would have caught it).
+        let write = match msg.args.first() {
+            Some(Argument::Object(0)) => SelectionWrite::Clear,
+            Some(Argument::Object(_)) => SelectionWrite::Set,
+            _ => return None,
+        };
+        let selection = match sender.name {
+            "wl_data_device" => "clipboard",
+            "zwp_primary_selection_device_v1" => "primary",
+            _ => return None,
+        };
+        Some((selection, write))
     }
 }
 
-/// Verify that `fd` is an ephemeral in-memory channel (memfd,
-/// anonymous pipe, or socket), not a path in the app's mount space.
-///
-/// The fd has been passed to this process (SCM_RIGHTS), so the
-/// kernel's own `/proc/self/fd/<n>` symlink tells us what it is:
-/// `memfd:…` (or, on newer kernels, `/memfd:… (deleted)`),
-/// `pipe:[inode]`, and `socket:[inode]` for the allowed kinds; a
-/// path for anything else (a regular file, a named fifo, a device —
-/// including `path (deleted)` for an unlinked regular file, which
-/// must not be admitted).
-fn fd_is_memchannel(fd: &OwnedFd) -> Result<(), String> {
+/// The kernel's own name for an fd: the `/proc/self/fd/<n>` symlink
+/// target (`memfd:…` — or, on newer kernels, `/memfd:… (deleted)` —
+/// for a memfd, `pipe:[inode]` for an anonymous pipe,
+/// `socket:[inode]` for a socket, a path for anything else —
+/// including `path (deleted)` for an unlinked regular file).
+fn proc_target(fd: &OwnedFd) -> Result<String, String> {
     let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
-    let target = std::fs::read_link(&path)
-        .map_err(|e| format!("inspecting the receive fd ({path}) failed: {e}"))?
+    std::fs::read_link(&path)
+        .map_err(|e| format!("inspecting the fd ({path}) failed: {e}"))?
         .into_os_string()
         .into_string()
-        .map_err(|t| format!("non-UTF8 /proc entry for the receive fd: {t:?}"))?;
-    let memfd = target.starts_with("memfd:") || target.starts_with("/memfd:");
-    let pipe = target.starts_with("pipe:[");
-    let socket = target.starts_with("socket:[");
-    if memfd || pipe || socket {
-        Ok(())
+        .map_err(|t| format!("non-UTF8 /proc entry for the fd: {t:?}"))
+}
+
+/// The class of an in-memory channel `fd` refers to — an error
+/// (the message the relay fails the connection with) for anything
+/// else.
+fn fd_kind(fd: &OwnedFd) -> Result<FdKind, String> {
+    let target = proc_target(fd)?;
+    if target.starts_with("memfd:") || target.starts_with("/memfd:") {
+        Ok(FdKind::Memfd)
+    } else if target.starts_with("pipe:[") {
+        Ok(FdKind::Pipe)
+    } else if target.starts_with("socket:[") {
+        Ok(FdKind::Socket)
     } else {
         Err(format!(
             "the receive fd ({target:?}) is not an in-memory channel (memfd/pipe/socket): \
              a sandboxed app must not direct clipboard data to a file"
         ))
+    }
+}
+
+/// Best-effort class of *any* fd (no error): `Some` of the class
+/// when it is an in-memory channel, `None` otherwise. Used for fds
+/// the relay *measures* but does not police — the requester's fd in
+/// a `send` event, which the (trusted) compositor handed over, not
+/// the app (Phase 9).
+pub(crate) fn fd_class(fd: &OwnedFd) -> Option<FdKind> {
+    match proc_target(fd) {
+        Ok(target) => {
+            if target.starts_with("memfd:") || target.starts_with("/memfd:") {
+                Some(FdKind::Memfd)
+            } else if target.starts_with("pipe:[") {
+                Some(FdKind::Pipe)
+            } else if target.starts_with("socket:[") {
+                Some(FdKind::Socket)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -674,7 +828,9 @@ mod tests {
         );
     }
 
-    /// One `zwp_primary_selection_offer_v1.receive` on `offer`.
+    /// One `zwp_primary_selection_offer_v1.receive` on `offer`
+    /// (the primary protocol — the gate's audit attribution reads
+    /// the primary selection state).
     fn ps_receive(g: &mut ClipboardGate, offer: u32) -> Result<ForwardAction, String> {
         let (op, d) = (
             opcode(&ZWP_PRIMARY_SELECTION_OFFER_V1_INTERFACE, "req", "receive"),
@@ -702,7 +858,7 @@ mod tests {
             d,
             &mk(),
         );
-        g.on_receive(&mk())
+        g.on_receive(&mk(), true).map(|d| d.action)
     }
 
     fn event(name: &str) -> (u16, &'static MessageDesc) {
@@ -789,60 +945,62 @@ mod tests {
         );
     }
 
-    /// The Phase 6 copy-out detector: a client `set_selection` with a
-    /// non-NULL source (either protocol) is a write; a clear (a NULL
-    /// source), a compositor `selection` echo, and any other request
-    /// are not.
+    /// The copy-out/clear detector: a client `set_selection` with a
+    /// non-NULL source (either protocol) is a `Set`; with a NULL
+    /// source a `Clear`; a compositor `selection` echo, and any
+    /// other request, is neither.
     #[test]
-    fn writes_selection_detects_writes_not_clears_or_echoes() {
-        // A stable `set_selection` with a non-NULL source is a write.
+    fn set_selection_detects_writes_and_clears() {
+        use SelectionWrite::{Clear, Set};
+        // A stable `set_selection` with a non-NULL source is a
+        // write (copy-out).
         let (op, d) = request("set_selection");
         assert_eq!(
-            ClipboardGate::writes_selection(
+            ClipboardGate::set_selection(
                 Dir::ClientToServer,
                 &WL_DATA_DEVICE_INTERFACE,
                 d,
                 &msg(DEVICE, op, vec![Argument::Object(SRC)]),
             ),
-            Some("clipboard")
+            Some(("clipboard", Set))
         );
         // The primary-selection twin.
         let (op, d) = ps_device_request("set_selection");
         assert_eq!(
-            ClipboardGate::writes_selection(
+            ClipboardGate::set_selection(
                 Dir::ClientToServer,
                 &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
                 d,
                 &msg(PS_DEVICE, op, vec![Argument::Object(PS_SRC)]),
             ),
-            Some("primary")
+            Some(("primary", Set))
         );
         // A NULL source is a clear, not a write (both protocols).
         let (op, d) = request("set_selection");
         assert_eq!(
-            ClipboardGate::writes_selection(
+            ClipboardGate::set_selection(
                 Dir::ClientToServer,
                 &WL_DATA_DEVICE_INTERFACE,
                 d,
                 &msg(DEVICE, op, vec![Argument::Object(0)]),
             ),
-            None
+            Some(("clipboard", Clear))
         );
         let (op, d) = ps_device_request("set_selection");
         assert_eq!(
-            ClipboardGate::writes_selection(
+            ClipboardGate::set_selection(
                 Dir::ClientToServer,
                 &ZWP_PRIMARY_SELECTION_DEVICE_V1_INTERFACE,
                 d,
                 &msg(PS_DEVICE, op, vec![Argument::Object(0)]),
             ),
-            None
+            Some(("primary", Clear))
         );
         // The compositor's `selection` *event* is an echo of a prior
         // write, not a write (server -> client).
         let (op, d) = event("selection");
         assert_eq!(
-            ClipboardGate::writes_selection(
+            ClipboardGate::set_selection(
                 Dir::ServerToClient,
                 &WL_DATA_DEVICE_INTERFACE,
                 d,
@@ -854,7 +1012,7 @@ mod tests {
         // `set_selection`.
         let (op, d) = request("start_drag");
         assert_eq!(
-            ClipboardGate::writes_selection(
+            ClipboardGate::set_selection(
                 Dir::ClientToServer,
                 &WL_DATA_DEVICE_INTERFACE,
                 d,
@@ -862,6 +1020,39 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The fd classification (Phase 9): each in-memory channel class
+    /// is recognized, and anything else is rejected with the message
+    /// the relay fails the connection with.
+    #[test]
+    fn fd_kind_classifies_each_channel() {
+        assert_eq!(fd_kind(&memfd()).unwrap(), FdKind::Memfd);
+
+        // Anonymous pipe.
+        let (pipe_read, _pipe_write) = std::io::pipe().unwrap();
+        let pipe_fd = unsafe { OwnedFd::from_raw_fd(pipe_read.into_raw_fd()) };
+        assert_eq!(fd_kind(&pipe_fd).unwrap(), FdKind::Pipe);
+        drop(pipe_fd);
+
+        // Unix socket pair end.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let socket_fd = unsafe { OwnedFd::from_raw_fd(a.into_raw_fd()) };
+        assert_eq!(fd_kind(&socket_fd).unwrap(), FdKind::Socket);
+        drop(socket_fd);
+
+        // A regular file must not pass (this is the whole point).
+        // Move the File out (into_raw_fd) so the OwnedFd below is
+        // the sole owner of the fd — a second owner would
+        // double-close on drop and abort the test process with an
+        // IO safety violation.
+        let path = std::env::temp_dir().join(format!("wlsctx-fdtest-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let file_fd = unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) };
+        let err = fd_kind(&file_fd).unwrap_err();
+        assert!(err.contains("not an in-memory channel"), "{err}");
+        drop(file_fd);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// One `wl_data_offer.receive` on `offer`, exactly as the relay
@@ -889,7 +1080,7 @@ mod tests {
             )
         };
         g.observe(Dir::ClientToServer, &WL_DATA_OFFER_INTERFACE, d, &mk());
-        g.on_receive(&mk())
+        g.on_receive(&mk(), false).map(|d| d.action)
     }
 
     #[test]
@@ -907,30 +1098,33 @@ mod tests {
     }
 
     #[test]
+    /// The best-effort classifier (Phase 9): in-memory channels map to
+    /// their class; anything else (a path in the app's mount space) is
+    /// `None`, so a `send` fd that is not a memfd simply records no
+    /// size rather than failing the connection.
     fn fd_classification() {
-        assert!(fd_is_memchannel(&memfd()).is_ok(), "memfd must pass");
+        assert_eq!(fd_class(&memfd()), Some(FdKind::Memfd));
 
         // Anonymous pipe.
         let (pipe_read, _pipe_write) = std::io::pipe().unwrap();
         let pipe_fd = unsafe { OwnedFd::from_raw_fd(pipe_read.into_raw_fd()) };
-        assert!(fd_is_memchannel(&pipe_fd).is_ok(), "pipe must pass");
+        assert_eq!(fd_class(&pipe_fd), Some(FdKind::Pipe));
         drop(pipe_fd);
 
         // Unix socket pair end.
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let socket_fd = unsafe { OwnedFd::from_raw_fd(a.into_raw_fd()) };
-        assert!(fd_is_memchannel(&socket_fd).is_ok(), "socket must pass");
+        assert_eq!(fd_class(&socket_fd), Some(FdKind::Socket));
+        drop(socket_fd);
 
-        // A regular file must not pass (this is the whole point).
+        // A regular file is not an in-memory channel: `None`.
         // Move the File out (into_raw_fd) so the OwnedFd below is the
         // sole owner of the fd — a second owner would double-close on
         // drop and abort the test process with an IO safety violation.
         let path = std::env::temp_dir().join(format!("wlsctx-fdtest-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         let file_fd = unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) };
-        let err = fd_is_memchannel(&file_fd).unwrap_err();
-        assert!(err.contains("not an in-memory channel"), "{err}");
-        assert!(err.contains("file"), "{err}");
+        assert_eq!(fd_class(&file_fd), None, "a path must not be classified");
         drop(file_fd);
         let _ = std::fs::remove_file(&path);
     }
@@ -1154,13 +1348,16 @@ mod tests {
         let mut g = ClipboardGate::new(ClipboardPolicy::Allow);
         let op = opcode(&WL_DATA_OFFER_INTERFACE, "req", "receive");
         let err = g
-            .on_receive(&msg(
-                OFFER_FOREIGN,
-                op,
-                vec![Argument::Str(Some(Box::new(
-                    std::ffi::CString::new("text/plain").unwrap(),
-                )))],
-            ))
+            .on_receive(
+                &msg(
+                    OFFER_FOREIGN,
+                    op,
+                    vec![Argument::Str(Some(Box::new(
+                        std::ffi::CString::new("text/plain").unwrap(),
+                    )))],
+                ),
+                false,
+            )
             .unwrap_err();
         assert!(err.contains("without an fd"), "{err}");
     }
@@ -1425,16 +1622,19 @@ mod tests {
         let file = std::fs::File::open("Cargo.toml").expect("open Cargo.toml");
         let fd = std::os::fd::OwnedFd::from(file);
         let err = g
-            .on_receive(&msg(
-                PS_OFFER_FOREIGN,
-                op,
-                vec![
-                    Argument::Str(Some(Box::new(
-                        std::ffi::CString::new("text/plain").unwrap(),
-                    ))),
-                    Argument::Fd(fd),
-                ],
-            ))
+            .on_receive(
+                &msg(
+                    PS_OFFER_FOREIGN,
+                    op,
+                    vec![
+                        Argument::Str(Some(Box::new(
+                            std::ffi::CString::new("text/plain").unwrap(),
+                        ))),
+                        Argument::Fd(fd),
+                    ],
+                ),
+                true,
+            )
             .unwrap_err();
         assert!(err.contains("not an in-memory channel"), "{err}");
     }
