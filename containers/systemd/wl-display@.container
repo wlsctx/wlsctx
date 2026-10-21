@@ -44,4 +44,8 @@ DropCapability=ALL
 Memory=128m
 User=%U
 Group=%G
+# wlsctx creates the security-tagged Wayland socket here; a restrictive
+# umask makes it owner-only at bind(2) time (before its own chmod 0600),
+# so the socket is never briefly group/other accessible inside the pod.
+Umask=0077
 WorkingDir=/

@@ -18,6 +18,10 @@ RuntimeDirectory=wlsctx/%i
 RuntimeDirectoryPreserve=yes
 RuntimeDirectoryMode=0700
 SocketMode=0600
+# Owner-only by default for anything the socket or its activated service
+# creates. Defense-in-depth on top of the explicit SocketMode=/
+# RuntimeDirectoryMode= above (and the wlsctx service's own --umask).
+UMask=0077
 ListenStream=%t/wlsctx/%i/wayland-1
 FileDescriptorName=%i
 PassCredentials=yes

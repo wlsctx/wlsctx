@@ -46,6 +46,10 @@ Group=%G
 ReadOnly=true
 DropCapability=ALL
 Memory=128m
+# Owner-only for any file the service creates; defense-in-depth so mode A
+# matches the mode B (wl-display@) umask. The tagged socket itself is
+# socket-activated by wlsctx@.socket (SocketMode=0600), not created here.
+Umask=0077
 Label=io.ghcr/wlsctx/instance=%i
 Mount=type=bind,ro,source=%t/${WAYLAND_DISPLAY},destination=%t/wayland-1
 ContainerName=systemd-wlsctx_${INVOCATION_ID}
