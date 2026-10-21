@@ -109,7 +109,9 @@ parser rejects it with a clear error. It runs its signal loop on
 exit cleanly (releasing the reference pipe, which invalidates the tagged
 socket); `SIGHUP` exits with status **129** (no restart is implemented —
 in mode A, `Restart=always` brings it back; in mode B the socket dies
-with it).
+with it). The compositor's answer to the commit is awaited with a 10s
+deadline: an unresponsive compositor fails the service with a clear
+error well before systemd's default `TimeoutStartSec` SIGKILL.
 
 ## Images
 

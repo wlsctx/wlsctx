@@ -10,11 +10,9 @@ env_logger = "0.11.11"
 log = "0.4.34"
 nix = { version = "0.31.3", features = ["signal", "process"] }
 sd-notify = "0.5.0"
+# Direct dependency (not just transitive): the bounded roundtrip polls
+# the upstream Wayland socket with poll(2) against a deadline.
+libc = "0.2"
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 xdg = "3.0.0"
-
-[dev-dependencies]
-# Only used by the tests to inspect the raw signal-mask bits for the
-# real-time range, which nix's Signal enum cannot name.
-libc = "0.2"
