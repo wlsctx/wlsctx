@@ -1,9 +1,0 @@
-[Unit]
-Description=Sandboxed Jetbrains IDE
-
-[Container]
-Exec=/opt/jetbrains/bin/%j
-Image=localhost/wayland-runtime:latest
-Pull=never
-Mount=type=image,source=ext-%j,destination=/opt
-#Secret=rustrover.key,target=%h/.config/JetBrains/RustRover2025.2/rustrover.key,uid=%U,gid=%G

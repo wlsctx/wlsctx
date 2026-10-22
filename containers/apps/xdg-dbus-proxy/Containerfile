@@ -1,2 +1,0 @@
-FROM alpine AS app
-RUN apk add --no-cache xdg-dbus-proxy

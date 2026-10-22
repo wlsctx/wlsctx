@@ -1,9 +1,0 @@
-FROM localhost/shell-base:latest AS base
-
-FROM base AS tools
-RUN --mount=type=cache,id=dnf5-fedora,dst=/var/cache/libdnf5 \
-  set -eufx; \
-  dnf install -y --setopt=install_weak_deps=false \
-    --setopt=keepcache=true \
-    rustup-init \
-  && rustup-init -y --profile default

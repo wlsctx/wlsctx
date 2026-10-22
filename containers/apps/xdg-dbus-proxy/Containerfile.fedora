@@ -1,9 +1,0 @@
-FROM localhost/app-base:latest AS base
-FROM base AS app
-RUN --mount=type=cache,id=dnf5-fedora,dst=/var/cache/libdnf5 \
-  set -euf; \
-  set -x; \
-  dnf install -y --setopt=install_weak_deps=false \
-    --setopt=keepcache=true \
-    xdg-dbus-proxy \
-  ;

@@ -1,4 +1,0 @@
-[Build]
-ImageTag=localhost/librewolf:latest
-Pull=missing
-File=Containerfile
