@@ -26,13 +26,18 @@ changes** (README.md is stale pending its phase-8 rewrite).
 
 ## Facts
 
-- Target: Fedora 43, user-level systemd, sway/wlroots desktop. No
-  containers: the sandbox is created by `wlsctx` itself (namespaces,
-  private rootfs, landlock+seccomp via `nono`) — see PLAN.md.
-- The app runs as its **real uid (non-root)** inside the user namespace:
-  the two-phase `uid_map` (map `0` for the mount phase, then narrow the
-  map to drop it) is load-bearing — do not "simplify" it away (PLAN
-  §3.1).
+- Target: Fedora 45 (upgrade in progress), user-level systemd,
+  sway/wlroots desktop. No containers: the sandbox is created by
+  `wlsctx` itself (namespaces, private rootfs, landlock+seccomp via
+  `nono`) — see PLAN.md.
+- The app runs as its **real uid (non-root)** inside the user namespace.
+  The `uid_map` maps both `0` (so the mount phase holds CAP_SYS_ADMIN)
+  and the real uid (so the app keeps its identity). Modern kernels
+  allow **exactly one write** to the map files — there is no
+  post-hoc narrowing (PLAN decision #9, pending confirmation).
+  Whatever the final design, the `0` entry must be kept inert:
+  nono's seccomp denies `setuid`/`setgid`/`setres*`/`sete*` so the app
+  can never become ns-0 again (PLAN §3.1).
 - The app only sees the **tagged** Wayland socket, never the host
   socket; the reference pipe ("close" fd) must stay open for the
   process lifetime (ownership note in `wayland/context.rs`).

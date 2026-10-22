@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2 — decisions incorporated, ready to implement Phase 0/1** (2026-10-22)
+Status: **v2.1 — target changed to Fedora 45; decision #9 (single-write uid_map) pending confirmation** (2026-10-22)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -60,7 +60,7 @@ the seccomp-notify fd belongs to.
 Checked against the published crate source before writing this plan.
 
 - **Linux backend = Landlock LSM** (ABI detection via `Sandbox::detect_abi()`;
-  network rules need ABI ≥ v4 → kernel ≥ 6.7; Fedora 43 is fine). Older
+  network rules need ABI ≥ v4 → kernel ≥ 6.7; Fedora 45 is fine). Older
   kernels fall back to seccomp-based network filtering
   (`apply_auto()` returns the fallback state).
 - **`CapabilitySet`** is the policy object:
@@ -88,6 +88,15 @@ Checked against the published crate source before writing this plan.
 ## 3. Sandbox construction (what the child does)
 
 ### 3.1 User namespace + the non-root credential sequence
+
+> **DRAFT — pending decision #9.** Modern kernels only permit a *single*
+> write to the map files, so the two-phase narrowing below is not
+> implementable as written. Proposed replacement: one write of
+> `0 self` + `self self` (the bwrap pattern), `setresuid(self)` after
+> the mount phase (the kernel then clears our ns capabilities), and the
+> leftover `0` entry made harmless because nono's seccomp (Phase 4)
+> auto-denies all of `setuid`/`setgid`/`setresuid`/`setresgid`/
+> `seteuid`/`setegid` — the app can never become ns-0 again.
 
 The kernel allows a **second write** to `/proc/self/uid_map` that *narrows*
 the previous mapping (entries may be removed/ranges shrunk; a previously
@@ -212,18 +221,20 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | # | Question | Decision |
 |---|---|---|
 | 1 | Network default | Shared host netns + nono filter; `--network=none` for air-gapped; veth/pasta later |
-| 2 | UID inside ns | **Non-root (1000)** via two-phase mapping (§3.1); subuid range as profile option |
+| 2 | UID inside ns | **Non-root (1000)** via a mapping that includes the real uid (§3.1, revised by #9); subuid range as profile option |
 | 3 | D-Bus proxy | **Deferred** to a later phase (after namespacing works) |
 | 4 | Xwayland | **Deferred** to a later phase |
 | 5 | App distribution | *Open* — run host-installed apps (`/opt/<app>` ro-bind) for now; GPG/fetch story undecided |
 | 6 | `wlsctx wayland` subcommand | Keep (already tested; no unit file in repo anymore) |
 | 7 | Cleanup | Delete `docker-bake.hcl`, `systemd/`, `selinux/` (done this round). **`Dockerfile` still to decide** — it only existed to build the container image; propose deleting it in favour of a plain static build recipe. |
 | 8 | systemd integration | In-process D-Bus `StartTransientUnit` scope + raw-cgroup fallback (§4) |
+| 9 | `uid_map` write-once | **Proposed, awaiting confirmation.** Decision 2's two-phase map-narrowing is not supported by modern kernels (write-once; verified in v7.2 source). Replace with a single `0 self` + `self self` write; `setresuid(self)` drops ns caps; nono seccomp locks the uid (denies setuid/setgid/setres*/sete*) so the `0` entry is inert. §3.1 to be rewritten accordingly. |
+| 10 | Target release | **Fedora 45** (release imminent; machine upgrade in progress). Kernel series 7.x; Landlock ABI ≥ v4 and unprivileged userns expected — Phase 1.4 verifies on the upgraded machine. |
 
 ## 7. Phases & task list
 
 > Each phase ends with a working, committed state. "Verify" items run on
-> the target machine (Fedora 43, sway, unprivileged user).
+> the target machine (Fedora 45, sway, unprivileged user).
 
 ### Phase 0 — Cleanup & skeleton
 - [x] 0.1 Delete `containers/` (`0c842cf`)
@@ -324,12 +335,16 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 
 ## 8. Risks / things to watch
 
-- **Kernel features on Fedora 43**: unprivileged user+mount+proc+devpts
+- **Kernel features on Fedora 45**: unprivileged user+mount+proc+devpts
   from a plain user session — Phase 1/2 verify tasks exist exactly for
   this (Fedora ships unprivileged userns enabled, but verify).
-- **`uid_map` narrowing rule**: the second-write restriction (no remapping
-  of already-mapped uids) is the load-bearing assumption of §3.1;
-  bwrap uses this pattern, but Phase 1.4 includes an explicit test.
+- **`uid_map` is write-once (decision #9)**: modern kernels permit
+  *exactly one* successful write to `uid_map`/`gid_map` — verified in the
+  v7.2 stable source (the target's kernel series) and current master
+  ("Any map is only ever written once"). The two-phase narrowing in §3.1
+  is **not supported**; the revised design (single write + seccomp-locked
+  uid) awaits confirmation. Phase 1.4 probes the rule empirically on the
+  target either way.
 - **seccomp friction with GUI apps**: JVMs and browsers do exotic
   syscalls; nono's default is allow-everything-except-notified, which
   should keep friction low — but `strace`-driven tuning is expected in
