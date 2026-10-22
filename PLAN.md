@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.3 — Phase 2 done (mount/pid/ipc/uts/cgroup/net; decisions #12–#17); Phase 3 (rootfs) next** (2026-10-22)
+Status: **v2.4 — Phase 3 done (private rootfs, profiles, GPU; decisions #18–#21); Phase 4 (nono) next** (2026-10-22)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -156,11 +156,14 @@ root-in-ns behaviour.
   outside both and sees A as a normal child for signalling/reaping.
 - **IPC ns** — fresh (private System V + shm view).
 - **UTS ns** — `sethostname("wlsctx-<app>-<instance>")`.
-- **Cgroup ns** — the child's full cgroup path is captured *before*
-  unsharing (the cgroup2 fs is not re-rooted on 7.2, #12); after
-  unshare it `mkdir`s the instance sub-cgroup at that full path and
-  moves in, so `/proc/self/cgroup` shows the clean relative path.
-  The supervisor rmdirs it on exit. See §4.
+- **Cgroup ns** — created and entered **before** unsharing, which
+  must happen **before** the rootfs build (the self-bind of `/`
+  makes cgroup2 read-only): the instance sub-cgroup is `mkdir`'ed at
+  the full path and entered via `cgroup.procs`, *then*
+  `unshare(CLONE_NEWCGROUP)` — so the ns root **is** the instance
+  cgroup and the app sees `0::/` (#20). The supervisor rmdirs the
+  empty sub-cgroup on exit. The cgroup2 fs itself is not re-rooted
+  on 7.2 (#12); `/sys/fs` is left empty.
 - **Network ns** — per-app mode, decided in §5 (default: *shared* host
   netns + nono filtering; `--network=none` = bare new netns).
 
@@ -168,12 +171,12 @@ root-in-ns behaviour.
 
 | Target | How | Notes |
 |---|---|---|
-| `/` | bind host `/` **ro** | then mask what must not be visible (below) |
+| `/` | one-shot recursive self-bind (ro flag unattainable — #21) | new layer under the overlays below; read-only *semantics* for the app come from its real uid + nono (Phase 4); masks last |
 | `/dev` | fresh tmpfs + **bind-mount** of the host nodes `null`, `zero`, `full`, `urandom`, `random`, `tty`, `ptmx` | bind-mount, not mknod: nodes keep their canonical genfs SELinux labels (`null_t`, `urandom_t`, …) so future confined domains need plain standard `open/read/write` rules; matches the rootless-runc approach. Clear error if a host node is missing. |
 | `/dev/pts` | `mount devpts -o newinstance` | fresh instance, isolated from host pts |
 | `/dev/dri` | bind from host | GPU; user must be in `render` group (same requirement as rootless podman); `--no-gpu` skips |
 | `/proc` | fresh procfs mount | allowed in an unprivileged user ns (namespaced view); verify on target kernel (Phase 2) |
-| `/sys` | ro-binds of `devices/`, `class/` | full `/sys` not mountable unprivileged; these cover DRM/PCI discovery |
+| `/sys` | fresh tmpfs + binds of `devices/`, `class/` (ro unattainable — #21) | only the sysfs *mount root* is unbindable (#18); these subpaths cover DRM/PCI discovery |
 | `/run` | fresh tmpfs | per-instance dir: tagged wayland socket, supervisor socket, (later) dbus-proxy socket, (optionally) ssh-agent socket |
 | `/tmp` | fresh tmpfs | `size=` from profile |
 | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` | ro-binds | `/etc` as-is; passwd/group map consistently through the uid/gid maps |
@@ -307,12 +310,12 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       names incl. the 7.2 quirks of #16)
 
 ### Phase 3 — Rootfs
-- [ ] 3.1 `sandbox/mounts.rs`: the §3.3 table as code: `/dev` tmpfs +
+- [x] 3.1 `sandbox/mounts.rs`: the §3.3 table as code: `/dev` tmpfs +
       node bind-mounts + `devpts -o newinstance`; fresh `/proc`; `/sys`
       ro-binds; `/run`+`/tmp` tmpfs; ro/rw binds; masks; `chroot`
-- [ ] 3.2 `profile/`: TOML app profiles; defaults for rustrover/librewolf
-- [ ] 3.3 `/dev/dri` bind + GPU check (render group), `--no-gpu`
-- [ ] 3.4 Verify: mount table matches the reference; `ls /` minimal;
+- [x] 3.2 `profile/`: TOML app profiles; defaults for rustrover/librewolf
+- [x] 3.3 `/dev/dri` bind + GPU check (render group), `--no-gpu`
+- [x] 3.4 Verify: mount table matches the reference; `ls /` minimal;
       host Wayland socket absent; `/dev` nodes openable by the app
 
 ### Phase 4 — nono: landlock + seccomp
@@ -393,3 +396,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
   children, never enable controllers under a populated cgroup — safe),
   and how the user-slice delegation behaves in Phase 6.1 — fallback
   path covers any surprise.
+| 18 | Binding mount roots | Binding the **mount root** of devtmpfs/sysfs/ext4 (e.g. `/dev`, `/sys` themselves) is EINVAL unprivileged on 7.2.11; any **subpath** or file binds fine. Hence `/dev`/`/sys` are rebuilt as fresh tmpfs + subpath binds (the scratch dir carries the node files out of the tree before the self-bind). |
+| 19 | `mknod` unprivileged | Unprivileged `mknod` of device nodes is EPERM on 7.2.11 (SELinux enforcing). `/dev` nodes and `/dev/dri` are therefore **bind-mounted** (canonical genfs SELinux labels preserved), never mknod'd. |
+| 20 | Cgroup ns root | The ns root is the unsharing task's cgroup **at unshare time**, so the instance sub-cgroup must be entered *before* `unshare(CLONE_NEWCGROUP)`: the app sees `0::/` (its own cgroup is the root; 7.2 renders it with a trailing slash). The Phase-2 order (unshare → move) rooted the ns at the session cgroup (`0::/app-N`) and is corrected; it must still precede the rootfs build (cgroup2 goes ro with the self-bind). |
+| 21 | ro-binds are unattainable | On 7.2.11 `MS_BIND\|MS_RDONLY` **silently drops the ro flag** on a bind of a foreign superblock (probed on `/`, on files, and in both one-shot and make-private variants); the two-step bind → `MS_REMOUNT\|MS_RDONLY` is EPERM (the sb's `s_user_ns` is init — we can remount only our *own* fs). §3.3 corrected: `/` and the `/sys` subpaths are plain binds; read-only *semantics* for the app come from its real uid (root-owned trees unwritable) plus the nono landlock/seccomp policy (Phase 4). The test's former `ROOTWR` probe was a false positive (EACCES ≠ EROFS) and the `/proc/mounts` `head -1` read the *bottom* of the mount stack — the topmost entry is the last line. |

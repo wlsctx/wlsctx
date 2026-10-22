@@ -13,13 +13,16 @@ changes** (README.md is stale pending its phase-8 rewrite).
 ## Layout
 
 - `src/main.rs` — binary entry: logging, CLI parse, pipeline dispatch
-- `src/cli.rs` — clap CLI (currently the single `wayland` mode; becomes
-  the subcommand tree per PLAN.md)
+- `src/cli.rs` — clap subcommand tree: `run` (the tagged Wayland
+  pipeline, `--app`/`--instance`/`--gpu`) and `wayland` (legacy mode)
 - `src/wayland/` — the tagged Wayland socket: `listener` (socket
   activation / `--listen`), `roundtrip` (bounded sync), `context`
   (`wp_security_context_v1`), `signals` (signalfd loop)
-- `src/sandbox/`, `src/profile/` — placeholders for the in-process
-  sandbox and per-app TOML profiles (PLAN.md phases 1–4)
+- `src/sandbox/` — the in-process sandbox: `userns`, `namespaces`
+  (mount/pid/cgroup/ipc/uts/net), `mounts` (private rootfs builder),
+  `mod` (S→A→B pipeline, `run_sandboxed`)
+- `src/profile/` — per-app TOML profiles (`gpu`, `ro_binds`, `rw_binds`,
+  `mask`, `env`; `deny_unknown_fields`)
 - `src/testutil.rs` — shared `#[cfg(test)]` helpers (env locking, TmpDir)
 - `PLAN.md` — rework plan: architecture, decisions log, phase/task list
 - `assets/` — logos/headers
@@ -30,14 +33,25 @@ changes** (README.md is stale pending its phase-8 rewrite).
   sway/wlroots desktop. No containers: the sandbox is created by
   `wlsctx` itself (namespaces, private rootfs, landlock+seccomp via
   `nono`) — see PLAN.md.
-- The app runs as its **real uid (non-root)** inside the user namespace.
-  The `uid_map` maps both `0` (so the mount phase holds CAP_SYS_ADMIN)
-  and the real uid (so the app keeps its identity) and is written
-  **exactly once** — modern kernels do not allow a second write
-  (PLAN decision #9). The `0` entry is then inert: after
-  `setresuid(self)` the kernel clears our ns capabilities (an
-  unprivileged `setresuid` cannot reach 0), and nono's seccomp denies
-  `setuid`/`setgid`/`setres*`/`sete*` on top (PLAN §3.1).
+- The app runs as its **real uid** inside the user namespace: the
+  `uid_map` is a **single extent `<uid> <uid> 1`**, written **exactly
+  once** (decision #9), because that is all an unprivileged creator may
+  write (decision #10). In-ns `0` is therefore **unmapped** — the app
+  can never be root or another user, and root-owned trees are simply
+  unwritable by it. (The old two-entry `0→uid; uid→uid` map was
+  replaced in Phase 3.)
+- The private rootfs is **rebuilt, not masked**: the recursive self-bind
+  of `/` (never `ro` — see below) is the base; `/dev` and `/sys` are
+  **fresh tmpfs** with subpath binds of the nodes the app needs, because
+  binding the *mount root* of devtmpfs/sysfs/ext4 is `EINVAL`
+  unprivileged (decision #18) and `mknod` is `EPERM` (decision #19).
+  `MS_BIND|MS_RDONLY` on those foreign-superblock binds silently drops
+  the ro flag and `MS_REMOUNT` is `EPERM` (decision #21) — so ro
+  semantics come from the app's real uid plus nono's landlock/seccomp
+  policy (Phase 4), not from mount flags.
+- The cgroup ns is rooted at the instance sub-cgroup, which must be
+  created and entered **before** `unshare(CLONE_NEWCGROUP)` (decision
+  #20); the app then sees `0::/`.
 - The app only sees the **tagged** Wayland socket, never the host
   socket; the reference pipe ("close" fd) must stay open for the
   process lifetime (ownership note in `wayland/context.rs`).
