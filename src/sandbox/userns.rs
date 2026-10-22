@@ -267,6 +267,12 @@ pub(crate) mod tests {
         pub(crate) fn err(&mut self) -> ErrWriter<'_> {
             ErrWriter { fd: self.err_fd, _marker: std::marker::PhantomData }
         }
+
+        /// The raw write fds, for code that cannot hold a `&mut`
+        /// (e.g. a thread inside a forked child).
+        pub(crate) fn fds(&self) -> (i32, i32) {
+            (self.out_fd, self.err_fd)
+        }
     }
 
     /// An unbuffered writer to the child's stderr pipe.
@@ -604,11 +610,16 @@ pub(crate) mod tests {
             }
         };
 
-        // The outer fork+pipe captures the *grandchild* (the
-        // sandboxed `id`) stdout and the intermediate child's
+        // The outer fork+pipe captures the *great-grandchild* (the
+        // sandboxed `id`) stdout and the intermediate children's
         // stderr (where setup errors are logged).
+        let config = crate::sandbox::SandboxConfig {
+            app_id: "app".to_string(),
+            instance_id: "1".to_string(),
+            network: crate::sandbox::namespaces::NetworkMode::Shared,
+        };
         let (code, out, err) = run_in_child(move |o| {
-            match run_sandboxed(&[OsString::from("id")]) {
+            match run_sandboxed(&[OsString::from("id")], &config) {
                 Ok(code) => code,
                 Err(e) => {
                     let _ = writeln!(o.err(), "run_sandboxed error: {e:#}");
