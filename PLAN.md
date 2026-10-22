@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.1 — target Fedora 45; decision #9 (single-write uid_map) confirmed; Phase 1 in progress** (2026-10-22)
+Status: **v2.2 — decision #10 (single-extent map) confirmed on kernel 7.2.11-300.fc45; Phase 1 done; Phase 2 in progress** (2026-10-22)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -28,12 +28,12 @@ host user session (uid 1000, sway)
 │   │   - sd-notify, signal forwarding, waits on child
 │   │
 │   └── fork ──► app process      ← the sandbox, runs as UID 1000 (not root)
-│       phase 1 (ns-root):  unshare user → mount: build rootfs
-│       phase 2:            setuid 1000, drop uid 0 from the mapping
-│       phase 3:            unshare pid → ipc → uts → cgroup → net
-│       phase 4:            nono: landlock + seccomp
-│       phase 5:            execve  (app is PID 1 of its pidns)
-│
+│       unshare user   (single-extent map: identity stays 1000, full
+│                       ns cap set, 0 unmapped — decision #10)
+│       unshare mount  → build the rootfs (ns-local CAP_SYS_ADMIN)
+│       unshare pid → ipc → uts → cgroup → net
+│       nono: landlock + seccomp
+│       execve  (app is PID 1 of its pidns)
 └── (later phases) wlsctx dbus-proxy / wlsctx xwayland host sidecars
 ```
 
@@ -87,49 +87,65 @@ Checked against the published crate source before writing this plan.
 
 ## 3. Sandbox construction (what the child does)
 
-### 3.1 User namespace + the non-root credential sequence
+### 3.1 User namespace + the non-root credential model
 
-Decision #9 (confirmed): modern kernels permit **exactly one write** to
-`uid_map`/`gid_map` (verified in the v7.2 stable source — the target's
-kernel series; no post-hoc narrowing), so the map is written **once,
-before the mount phase**, carrying both entries:
+Two kernel rules fix the shape of the map (verified in the v7.2.11
+source — `kernel/user_namespace.c` — and empirically on this machine):
+
+- `uid_map`/`gid_map` accept **exactly one successful write**
+  (decision #9).
+- An **unprivileged** creator may write **only a single extent of
+  count 1 whose in-ns id equals its own uid/gid**:
+  `new_idmap_permitted()`'s fast path requires exactly that (the ns
+  owner is the creator's euid, set by `create_user_ns()`); anything
+  larger needs `CAP_SETUID`/`CAP_SETGID` in the *parent* ns, which we
+  don't have. Two extents sharing a parent id would in any case be
+  rejected by `mappings_overlap()` — so the old two-entry
+  `0 → self; self → self` map is **EINVAL** on modern kernels
+  (decision #10). bwrap reaches multi-extent maps through the setuid
+  `newuidmap`/`newgidmap` helpers; we deliberately don't.
+
+So the map is the single extent `<real uid> → <real uid>` (and the
+same for gid), and `setgroups=deny` is written first, before the maps:
 
 ```
-0 → <real uid>          (lets *us* hold CAP_SYS_ADMIN in the ns for
-                          the mount phase)
-<real uid> → <real uid> (keeps the app's identity)
-1 → <subuid range>      (optional profile flag: files owned by
-                          subuid-range owners)
+<real uid> → <real uid>   (the app's identity — the in-ns uid from the
+                             start; 0 is simply not in the map)
 ```
-
-The mapping is non-injective (the real uid appears under two in-ns
-ids); that is legal and is the pattern bwrap uses.
 
 Sequence (in the forked child — wlsctx itself stays outside the ns):
 
 1. `unshare(CLONE_NEWUSER)`; write `setgroups=deny`; **one write** of
-   `uid_map`/`gid_map` (above).
-2. **Mount phase** (as ns-root): the remaining namespaces (§3.2) and
-   the whole rootfs build (§3.3), including `devpts` and `/dev/dri`.
-3. **`setresuid(real uid)` / `setresgid(real uid)`** — the kernel
-   **clears our capability sets** (we are no longer mapped-0).
-   Inherited supplementary groups are kept (the user's real groups,
-   e.g. `render` — this is what keeps `/dev/dri` accessible; in the
-   ns view both the node's group and our group collapse to the same
-   unmapped value, so DAC still matches).
-4. The `0` entry is now **inert**: an unprivileged `setresuid` may only
-   pick values from the previous ruid/euid/suid, so no process can
-   ever become ns-0 again — it can never unmount, can never mount into
-   a freshly unshared mount ns, and its nested-userns tricks are
-   contained by landlock (it can only ever bind-mount what landlock
-   lets it open). Phase 4's nono filter additionally *denies* the
-   `setuid`/`setgid`/`setres*`/`sete*` syscalls, so the lock holds
-   structurally as well.
-5. **nono apply** (landlock + seccomp), then **`execve()` the app**.
+   `uid_map`/`gid_map` (the single extent above).
+2. **Mount phase**: unshare the mount ns and build the whole rootfs
+   (§3.3). We hold **the full ns capability set** throughout:
+   `set_cred_user_ns()` grants the creator CAP_FULL_SET in the new ns
+   and nothing on this path clears it (the 7.0 credential rework moved
+   the setuid cap-clearing; empirically CapEff is still
+   `000001ffffffffff` after the map write and after a no-op
+   `setresuid(self)`). That is safe *by construction of the map*:
+   every ns-local capability (dac, kill, ptrace, mount, …) only has
+   effect on objects and processes inside our namespaces — and the
+   only identity mapped into them is ours — so at exec time we hold no
+   privilege beyond running the same command unconfined as the same
+   user. The hard privilege boundary is nono's landlock + seccomp
+   filter (Phase 4), which additionally denies the
+   `setuid`/`setgid`/`setres*`/`sete*` family.
+3. The remaining namespaces (§3.2).
+4. **nono apply** (landlock + seccomp), then **`execve()` the app**.
 
-The app sees itself as its real uid (1000) — no root-in-ns behaviour,
-files it writes are owned by its real uid on the host, identical to
-running unconfined.
+The identity is locked **by the map itself**: the in-ns id is the real
+uid from the start, in-ns `0` is unmapped, so no `set*uid` call can
+ever move it (`setresuid(0)` is EINVAL; the only other mapped value is
+the same one), and a second map write is impossible (write-once).
+`verify_locked()` asserts exactly this before the exec and aborts
+(exit 126) if anything is off.
+
+A subuid range for file *ownership* would need a second extent and
+hence a setuid helper (`newuidmap`); deferred (decision #10). Files
+the app writes are owned by its real uid on the host — identical to
+running unconfined. The app sees itself as its real uid (1000): no
+root-in-ns behaviour.
 
 ### 3.2 Remaining namespaces (order after the mount phase)
 
@@ -225,15 +241,16 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | # | Question | Decision |
 |---|---|---|
 | 1 | Network default | Shared host netns + nono filter; `--network=none` for air-gapped; veth/pasta later |
-| 2 | UID inside ns | **Non-root (1000)** via a mapping that includes the real uid (§3.1, revised by #9); subuid range as profile option |
+| 2 | UID inside ns | **Non-root (1000)** via a mapping that includes the real uid (§3.1, revised by #9, #10); subuid range deferred (#10) |
 | 3 | D-Bus proxy | **Deferred** to a later phase (after namespacing works) |
 | 4 | Xwayland | **Deferred** to a later phase |
 | 5 | App distribution | *Open* — run host-installed apps (`/opt/<app>` ro-bind) for now; GPG/fetch story undecided |
 | 6 | `wlsctx wayland` subcommand | Keep (already tested; no unit file in repo anymore) |
 | 7 | Cleanup | Delete `docker-bake.hcl`, `systemd/`, `selinux/` (done this round). **`Dockerfile` still to decide** — it only existed to build the container image; propose deleting it in favour of a plain static build recipe. |
 | 8 | systemd integration | In-process D-Bus `StartTransientUnit` scope + raw-cgroup fallback (§4) |
-| 9 | `uid_map` write-once | **Confirmed.** Modern kernels permit exactly one write to `uid_map`/`gid_map` (verified in the v7.2 stable source and current master), so decision 2's two-phase narrowing is not implementable. Design: single write of `0 self` + `self self` (+ optional subuid range); after the mount phase `setresuid(self)` clears our ns capabilities, and an unprivileged `setresuid` can only pick previous ruid/euid/suid values — so the `0` entry is inert; nono's seccomp (Phase 4) denies the setuid/setgid/setres*/sete* family on top. §3.1 rewritten accordingly. |
-| 10 | Target release | **Fedora 45** (release imminent; machine upgrade in progress). Kernel series 7.x; Landlock ABI ≥ v4 and unprivileged userns expected — Phase 1.4 verifies on the upgraded machine. |
+| 9 | `uid_map` write-once | **Confirmed.** Modern kernels permit exactly one write to `uid_map`/`gid_map` (verified in the v7.2 stable source and current master). The original design (single write of `0 self` + `self self`) turned out to be invalid — superseded by #10, which keeps write-once but makes the map a single extent. |
+| 10 | Map shape: single extent | **`<self> <self> 1`** (one extent, uid and gid). Kernel constraints: write-once (#9); an unprivileged creator may only write one extent of count 1 equal to its own uid/gid (`new_idmap_permitted()` fast path); two extents sharing a parent id are rejected by `mappings_overlap()` — so the two-entry `0 self; self self` map is EINVAL (bwrap uses the setuid `newuidmap` helper for more; we don't). Consequences: the identity is the real uid from the start, 0 is unmapped (`setresuid(0)` is EINVAL), the full ns cap set is held at exec — safe by construction of the map (§3.1) — and locked by nono in Phase 4. Subuid range for file ownership deferred (needs a setuid helper). Verified on 7.2.11-300.fc45; §3.1 rewritten; Phase 1 done. |
+| 11 | Target release | **Fedora 45** (machine upgraded; running 7.2.11-300.fc45). Kernel series 7.x; Landlock ABI ≥ v4 and unprivileged userns — verified on this machine (Phase 1.4). |
 
 ## 7. Phases & task list
 
@@ -251,20 +268,22 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 
 ### Phase 1 — User namespace, non-root mapping
 - [x] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`; `setgroups=deny`;
-      **single write** of `uid_map`/`gid_map` with `0→self` **and**
-      `self→self` (subuid range behind a profile flag) — decision #9
-- [x] 1.2 Credential sequence: after the (currently empty) mount phase
-      → `setresuid/gid(self)` → assert CapEff==0 and `setresuid(0)`
-      fails (the `0` entry is inert; decision #9)
+      **single write** of `uid_map`/`gid_map` — one extent each,
+      `<self> <self> 1` (decision #10; the old two-entry form is
+      EINVAL on modern kernels)
+- [x] 1.2 Credential verification (`verify_locked`): ruid/euid/suid =
+      the real uid; CapEff is the full ns set (nothing is dropped —
+      the map locks the identity); `setresuid(0)`/`setresgid(0)` are
+      EINVAL (decision #10)
 - [x] 1.3 `wlsctx run -- <cmd>` ad-hoc path to observe results (CLI
       becomes a subcommand tree: `run`, `wayland`)
-- [ ] 1.4 Verify **on the target/VM** (the tests exist and auto-skip
-      in nested-userns environments such as the dev container):
-      `id` inside shows the real uid; `lsns`; unprivileged userns
-      enabled; **write-once probe**: a second write to `uid_map` is
-      rejected with EPERM and the map is unchanged (the kernel
-      constraint decision #9 relies on)
-
+- [x] 1.4 Verified on this machine (Fedora 45, kernel 7.2.11-300.fc45,
+      from the dev container's level-2 user ns — the *stricter* case;
+      the plain level-1 session on the same kernel is a subset of the
+      permission checks): `id` inside shows the real uid; the
+      write-once probe passes (second write EPERM, map unchanged); the
+      full ns cap set is held at exec; a rejected map is a hard test
+      fail, not a skip
 ### Phase 2 — Remaining namespaces
 - [ ] 2.1 Mount ns (unshare right after user ns; rootfs build lands in
       Phase 3 but the unshare slot is here)
@@ -347,13 +366,13 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 - **Kernel features on Fedora 45**: unprivileged user+mount+proc+devpts
   from a plain user session — Phase 1/2 verify tasks exist exactly for
   this (Fedora ships unprivileged userns enabled, but verify).
-- **`uid_map` is write-once (decision #9)**: modern kernels permit
-  *exactly one* successful write to `uid_map`/`gid_map` — verified in the
-  v7.2 stable source (the target's kernel series) and current master
-  ("Any map is only ever written once"). The two-phase narrowing in §3.1
-  is **not supported**; the revised design (single write + seccomp-locked
-  uid) awaits confirmation. Phase 1.4 probes the rule empirically on the
-  target either way.
+- **`uid_map` is write-once and, for us, single-extent (#9, #10)**:
+  confirmed on 7.2.11-300.fc45 — the single-extent self-map works, the
+  full ns cap set is held at exec, `setresuid(0)` is EINVAL, and the
+  write-once probe (second write EPERM, map unchanged) passes. What
+  remains of this risk: a subuid range for file ownership needs a
+  setuid helper (`newuidmap`) if we ever want it — a later phase, not
+  a blocker.
 - **seccomp friction with GUI apps**: JVMs and browsers do exotic
   syscalls; nono's default is allow-everything-except-notified, which
   should keep friction low — but `strace`-driven tuning is expected in
