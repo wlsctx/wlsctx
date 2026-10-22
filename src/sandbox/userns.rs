@@ -1,25 +1,45 @@
 //! User namespace creation and the credential sequence (PLAN.md §3.1,
-//! decision #9).
+//! decisions #9 and #10).
 //!
-//! Modern kernels permit **exactly one write** to `uid_map`/`gid_map`
-//! (no post-hoc narrowing — verified in the v7.2 stable source), so
-//! the map is written once, *before* the mount phase, carrying both
-//! entries:
+//! Kernel rules (verified against the v7.2.11 source —
+//! `kernel/user_namespace.c` — and empirically on this machine):
 //!
-//! ```text
-//! 0 → <real uid>          (lets us hold CAP_SYS_ADMIN in the ns for
-//!                           the mount phase)
-//! <real uid> → <real uid> (keeps the app's identity)
-//! 1 → <subuid range>      (optional profile flag)
-//! ```
+//! * `uid_map`/`gid_map` accept **exactly one successful write**
+//!   (decision #9); after that the file is read-only for the life of
+//!   the process.
+//! * An unprivileged creator may write **only a single extent of
+//!   count 1 whose in-ns id equals its own uid/gid**
+//!   (`new_idmap_permitted()`; `create_user_ns()` sets the ns owner
+//!   to the creator's euid, so the "owner == euid" gate passes).
+//!   Multi-extent maps are unreachable for us: `mappings_overlap()`
+//!   forbids two extents sharing a parent id, and an unprivileged
+//!   creator can only map its own id — so the old two-entry
+//!   `0 → uid; uid → uid` map is EINVAL on modern kernels
+//!   (decision #10). bwrap works around this with the setuid
+//!   `newuidmap` helper; we deliberately don't.
+//! * `setgroups` must be written **before** the maps; while
+//!   setgroups is not allowed, the gid self-map is permitted
+//!   unprivileged as well.
 //!
-//! After the mount phase, `setresuid`/`setresgid` back to the real
-//! uid/gid makes the kernel **clear our capability sets**; from then
-//! on the only uid we can ever hold is the real one (an unprivileged
-//! `setresuid` may only pick values from the previous ruid/euid/suid),
-//! so the `0` entry of the map is unreachable. The nono filter
-//! (phase 4) denies the `setuid`/`setgid`/`setres*`/`sete*` family on
-//! top, so the lock holds structurally as well.
+//! So the map is the single extent `<real uid> → <real uid>` (and
+//! `<real gid> → <real gid>`). The process's in-ns id is the real
+//! uid **from the start** — its parent-ns id re-read through the map
+//! — and in-ns `0` is simply not in the map. The app can never be
+//! `0`, never another user, and can never move: a second map write
+//! is impossible (write-once), and `setresuid(0)` is EINVAL because
+//! `0` is unmapped.
+//!
+//! `set_cred_user_ns()` grants the creator **CAP_FULL_SET in the new
+//! ns**, and nothing in this sequence clears it — the capability
+//! set stays full at exec time. That is safe *by construction of the
+//! map*: every ns-local capability (dac, kill, ptrace, mount, …)
+//! acts only on the single mapped identity — our own uid/gid — and
+//! the mounts we make (phase 3) happen in our private mount ns. The
+//! hard privilege boundary is nono's landlock + seccomp filter
+//! (phase 4).
+//!
+//! Mapping a subuid range (for file ownership) needs a second extent
+//! and hence a setuid helper; deferred (decision #10).
 
 use std::io::{self, Write};
 
@@ -27,14 +47,12 @@ use anyhow::{Context, Result, bail};
 
 /// The real (host) credentials to map into the user namespace.
 pub(crate) struct Credentials {
-    /// The real uid; also the in-ns uid the app will see.
+    /// The real uid; also the in-ns uid (the map is one extent).
     pub uid: u32,
-    /// The real gid; also the in-ns gid the app will see.
+    /// The real gid; also the in-ns gid (the map is one extent).
     pub gid: u32,
-    /// Optional subuid block (profile option): maps the 65536 host
-    /// uids starting at this one to in-ns uids 1..=65536 (files owned
-    /// by subuid-range owners).
-    pub subuid: Option<u32>,
+    // (A subuid range for file ownership would need a second map
+    // extent and a setuid helper; deferred — decision #10.)
 }
 
 impl Credentials {
@@ -52,7 +70,7 @@ impl Credentials {
         if unsafe { libc::getresgid(&mut rgid, &mut egid, &mut sgid) } != 0 {
             return Err(io::Error::last_os_error()).context("getresgid(2)");
         }
-        Ok(Self { uid: ruid, gid: rgid, subuid: None })
+        Ok(Self { uid: ruid, gid: rgid })
     }
 }
 
@@ -82,22 +100,13 @@ pub(crate) fn enter_userns(creds: &Credentials) -> Result<()> {
 }
 
 /// The single `uid_map`/`gid_map` payloads (decision #9: written
-/// exactly once).
+/// exactly once; decision #10: one extent, because that is all an
+/// unprivileged creator may write).
 fn map_contents(creds: &Credentials) -> (String, String) {
-    let mut uid = String::new();
-    uid.push_str(&format!("0 {} 1\n", creds.uid));
-    uid.push_str(&format!("{} {} 1\n", creds.uid, creds.uid));
-    if let Some(sub) = creds.subuid {
-        uid.push_str(&format!("1 {sub} 65536\n"));
-    }
-
-    let mut gid = String::new();
-    gid.push_str(&format!("0 {} 1\n", creds.gid));
-    gid.push_str(&format!("{} {} 1\n", creds.gid, creds.gid));
-    // (No subgid block: the subuid range covers file *ownership*;
-    // group access to subuid-owned files is out of scope for now.)
-
-    (uid, gid)
+    (
+        format!("{} {} 1\n", creds.uid, creds.uid),
+        format!("{} {} 1\n", creds.gid, creds.gid),
+    )
 }
 
 /// Write a /proc map file (`setgroups`, `uid_map`, `gid_map`). The
@@ -113,31 +122,19 @@ fn write_map_file(path: &str, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// After the mount phase: drop ns-root to the real uid/gid. The
-/// kernel clears our capability sets at that moment, and an
-/// unprivileged `setresuid` cannot then reach the `0` entry of the
-/// map (decision #9). Each step is verified and this fails loudly
-/// (before the exec) if anything is not as expected.
-pub(crate) fn drop_ns_root(creds: &Credentials) -> Result<()> {
-    // We are ns-0 (mapped to the real uid, full ns capabilities):
-    // setting the real uid/gid is permitted, and the kernel clears
-    // the capability sets because the new identity is not mapped-0.
-    if unsafe { libc::setresuid(creds.uid, creds.uid, creds.uid) } != 0 {
-        return Err(io::Error::last_os_error())
-            .context(format!("setresuid({}) (dropping ns-root)", creds.uid));
-    }
-    if unsafe { libc::setresgid(creds.gid, creds.gid, creds.gid) } != 0 {
-        return Err(io::Error::last_os_error())
-            .context(format!("setresgid({}) (dropping ns-root)", creds.gid));
-    }
-
+/// Verify the post-map credential state (the old `drop_ns_root` was
+/// a privilege drop; with the single-extent map there is nothing to
+/// drop — the identity is the real uid from the start, locked in by
+/// the map itself). Everything here is a *check*, and a failure
+/// aborts the sandbox setup (exit 126) before the app is exec'd.
+pub(crate) fn verify_locked(creds: &Credentials) -> Result<()> {
     check_resids(creds)?;
-    check_caps_empty()?;
+    check_caps_present()?;
     check_repriv_blocked()?;
     Ok(())
 }
 
-/// Verify the ruid/euid/suid (and gid) triple after the drop.
+/// Verify the ruid/euid/suid (and gid) triple.
 fn check_resids(creds: &Credentials) -> Result<()> {
     let mut ruid: u32 = 0;
     let mut euid: u32 = 0;
@@ -147,7 +144,7 @@ fn check_resids(creds: &Credentials) -> Result<()> {
     }
     if (ruid, euid, suid) != (creds.uid, creds.uid, creds.uid) {
         bail!(
-            "after setresuid({}): ruid={ruid} euid={euid} suid={suid}",
+            "ruid={ruid} euid={euid} suid={suid}; expected the real uid {} on all three",
             creds.uid
         );
     }
@@ -159,7 +156,7 @@ fn check_resids(creds: &Credentials) -> Result<()> {
     }
     if (rgid, egid, sgid) != (creds.gid, creds.gid, creds.gid) {
         bail!(
-            "after setresgid({}): rgid={rgid} egid={egid} sgid={sgid}",
+            "rgid={rgid} egid={egid} sgid={sgid}; expected the real gid {} on all three",
             creds.gid
         );
     }
@@ -179,44 +176,50 @@ fn cap_eff() -> Result<u64> {
     bail!("no CapEff line in /proc/self/status");
 }
 
-/// After dropping to the real uid the effective capability set must
-/// be empty: the kernel clears it when the identity leaves mapped-0.
-fn check_caps_empty() -> Result<()> {
+/// The creator holds the full ns capability set, and the design
+/// relies on it (phase 3 builds the rootfs with ns-local
+/// CAP_SYS_ADMIN). It must still be here at this point: if a kernel
+/// change clears it, the rootfs phase is broken, so fail loudly
+/// instead of discovering it in the mount phase.
+fn check_caps_present() -> Result<()> {
     let caps = cap_eff()?;
-    if caps != 0 {
-        bail!(
-            "CapEff is {caps:#018x} after dropping to the real uid; \
-             expected 0 (the kernel clears the ns capability set when the \
-             identity leaves mapped-0)"
-        );
+    if caps == 0 {
+        bail!("CapEff is 0 before the exec; the design relies on the creator's ns capability set (PLAN §3.1)");
+    }
+    if caps & (1 << 21) == 0 {
+        bail!("CapEff is {caps:#018x} without CAP_SYS_ADMIN; the rootfs phase cannot mount (PLAN §3.1)");
     }
     Ok(())
 }
 
-/// The `0` entry of the map is still *there*, but unreachable: without
-/// CAP_SETUID a `setresuid(0)` must fail with EPERM (an unprivileged
-/// setresuid may only pick previous ruid/euid/suid values).
+/// In-ns `0` is not in the map, so no set*uid call can ever reach it:
+/// the kernel rejects the attempt with EINVAL. Anything else
+/// (success, a different errno) would mean the id can move, which
+/// breaks the "locked at the real uid" invariant.
 fn check_repriv_blocked() -> Result<()> {
-    assert_eperm(
+    assert_errno(
         "setresuid(0,0,0)",
+        libc::EINVAL,
         || unsafe { libc::setresuid(0, 0, 0) },
     )?;
-    assert_eperm(
+    assert_errno(
         "setresgid(0,0,0)",
+        libc::EINVAL,
         || unsafe { libc::setresgid(0, 0, 0) },
     )?;
     Ok(())
 }
 
 /// Run `call` (a raw syscall returning 0 on success) and require
-/// EPERM — anything else (success included) is a design violation.
-fn assert_eperm(what: &str, call: impl FnOnce() -> i32) -> Result<()> {
+/// exactly `want` — anything else (success included) is a design
+/// violation.
+fn assert_errno(what: &str, want: i32, call: impl FnOnce() -> i32) -> Result<()> {
     if call() == 0 {
-        bail!("{what} SUCCEEDED after dropping to the real uid — the 0 entry is reachable, this breaks the design (PLAN §3.1)");
+        bail!("{what} SUCCEEDED — the credential state can move, this breaks the design (PLAN §3.1)");
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::EPERM) {
-        bail!("{what} failed with {err:?}; expected EPERM");
+    if err.raw_os_error() != Some(want) {
+        bail!("{what} failed with {err:?}; expected errno {want}");
     }
     Ok(())
 }
@@ -258,10 +261,7 @@ mod tests {
     impl ChildOut {
         /// A writer for the child's *stderr* pipe (diagnostics).
         fn err(&mut self) -> ErrWriter<'_> {
-            ErrWriter {
-                fd: self.err_fd,
-                _marker: std::marker::PhantomData,
-            }
+            ErrWriter { fd: self.err_fd, _marker: std::marker::PhantomData }
         }
     }
 
@@ -379,16 +379,42 @@ mod tests {
         Credentials::current()
     }
 
-    /// The two map entries every phase-1 map carries.
-    fn both_entries(c: &Credentials) -> (String, String) {
+    /// The single extent the map carries (decision #10).
+    fn single_extent(c: &Credentials) -> (String, String) {
         (
-            format!("0 {} 1", c.uid),
             format!("{} {} 1", c.uid, c.uid),
+            format!("{} {} 1", c.gid, c.gid),
         )
     }
 
+    /// `/proc` map files format their columns with multiple spaces;
+    /// normalize to single spaces before comparing.
+    fn normalize_map(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Classify an `enter_userns` failure from the child's side:
+    /// exit 1 = the environment cannot create the namespace at all
+    /// (skip); exit 20 = the namespace was created but the kernel
+    /// rejected our map (hard fail — the design is broken here).
+    fn enter_or_classify(o: &mut ChildOut, creds: &Credentials) -> i32 {
+        match enter_userns(creds) {
+            Ok(()) => 0,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("uid_map") || msg.contains("gid_map") {
+                    let _ = writeln!(o, "MAP-REJECTED: {msg}");
+                    20
+                } else {
+                    let _ = writeln!(o, "NS-FAIL: {msg}");
+                    1
+                }
+            }
+        }
+    }
+
     #[test]
-    fn enter_then_drop_credential_sequence() {
+    fn enter_then_verify_credential_sequence() {
         let creds = match creds() {
             Ok(c) => c,
             Err(e) => {
@@ -397,52 +423,65 @@ mod tests {
             }
         };
 
-        let (code, out, _err) = run_in_child(move |o| {
+        let (code, out, err) = run_in_child(move |o| {
             // 1. Enter: unshare + setgroups + the single map write.
-            if let Err(e) = enter_userns(&creds) {
-                let _ = writeln!(o, "SETUP-FAIL enter_userns: {e:#}");
-                return 1;
+            let rc = enter_or_classify(o, &creds);
+            if rc != 0 {
+                return rc;
             }
 
-            // The initial map must carry both entries.
+            // The map must be exactly the single extent — one line,
+            // no `0` entry.
             let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
-            let (want0, wantself) = both_entries(&creds);
-            if !map.contains(&want0) || !map.contains(&wantself) {
-                let _ = writeln!(o, "FAIL uid_map is {map:?}; want entries {want0:?} and {wantself:?}");
+            let (want_uid, want_gid) = single_extent(&creds);
+            let lines: Vec<&str> = map.lines().collect();
+            if lines.len() != 1 || normalize_map(lines[0]) != want_uid {
+                let _ = writeln!(o, "FAIL uid_map is {map:?}; want the single extent {want_uid:?}");
                 return 2;
+            }
+            let gmap = std::fs::read_to_string("/proc/self/gid_map").unwrap_or_default();
+            let glines: Vec<&str> = gmap.lines().collect();
+            if glines.len() != 1 || normalize_map(glines[0]) != want_gid {
+                let _ = writeln!(o, "FAIL gid_map is {gmap:?}; want the single extent {want_gid:?}");
+                return 3;
             }
 
             let setgroups =
                 std::fs::read_to_string("/proc/self/setgroups").unwrap_or_default();
             if setgroups.trim() != "deny" {
                 let _ = writeln!(o, "FAIL setgroups is {setgroups:?}; want \"deny\"");
-                return 3;
+                return 4;
             }
 
-            // As ns-root we hold the full ns capability set.
+            // The creator holds the full ns capability set, and the
+            // design relies on it (it is never cleared on this path).
             match cap_eff() {
                 Err(e) => {
                     let _ = writeln!(o, "FAIL reading CapEff: {e:#}");
-                    return 4;
+                    return 5;
                 }
                 Ok(0) => {
-                    let _ = writeln!(o, "FAIL CapEff is 0 before the drop; expected the full ns set as ns-root");
-                    return 4;
+                    let _ = writeln!(o, "FAIL CapEff is 0 after the map write; the design needs the full ns set");
+                    return 5;
+                }
+                Ok(caps) if caps & (1 << 21) == 0 => {
+                    let _ = writeln!(o, "FAIL CapEff is {caps:#018x} without CAP_SYS_ADMIN; the rootfs phase cannot mount");
+                    return 5;
                 }
                 Ok(_) => {}
             }
 
-            // 2. Drop to the real uid (mount phase is empty in phase 1).
-            if let Err(e) = drop_ns_root(&creds) {
-                let _ = writeln!(o, "SETUP-FAIL drop_ns_root: {e:#}");
-                return 5;
+            // 2. Verify the lock (identity is the real uid by
+            //    construction; 0 is unmapped and unreachable).
+            if let Err(e) = verify_locked(&creds) {
+                let _ = writeln!(o, "SETUP-FAIL verify_locked: {e:#}");
+                return 6;
             }
 
-            // 3. The result: locked at the real uid, no capabilities,
-            //    0 unreachable.
+            // 3. The result.
             let _ = writeln!(
                 o,
-                "OK: uid locked at {} / gid {} (CapEff cleared, setresuid(0) rejected with EPERM)",
+                "OK: uid locked at {} / gid {} (0 unmapped, setresuid(0) EINVAL, ns cap set retained for phase 3/4)",
                 creds.uid, creds.gid
             );
             0
@@ -450,24 +489,32 @@ mod tests {
 
         match code {
             Some(0) => {}
-            // enter_userns failing means this environment cannot create
-            // the mapping (e.g. we ourselves are in a nested user
-            // namespace, as in the dev container): skip, don't fail.
+            // The environment cannot create a (nested) user namespace
+            // here at all: skip, don't fail.
             Some(1) => {
-                eprintln!("skipping (environment cannot create the mapping):\n{out}\n{_err}");
+                eprintln!("skipping (environment cannot create a user namespace):\n{out}\n{err}");
                 return;
             }
-            Some(other) => panic!("credential sequence failed (exit {other}):\n{out}\n{_err}"),
+            // The namespace was created but the kernel rejected our
+            // map: this is a design/kernel mismatch, not an
+            // environment quirk — fail loudly (this is the case that
+            // used to hide behind a "skip").
+            Some(20) => panic!("the kernel rejected the single-extent map (this is a design failure, not an environment skip):\n{out}\n{err}"),
+            Some(other) => panic!("credential sequence failed (exit {other}):\n{out}\n{err}"),
             None => panic!("test harness failed"),
         }
-        assert!(out.contains("OK: uid locked"), "expected an OK line; got:\n{out}\n{_err}");
+        assert!(
+            out.contains("OK: uid locked"),
+            "expected an OK line; got:\n{out}\n{err}"
+        );
     }
 
     /// Decision #9 probe: the kernel permits exactly one successful
     /// write to the map files. After the first write, a second write
-    /// with *any* content (identical, narrowing, or unrelated) must be
-    /// rejected, and the map must remain unchanged. This is the
-    /// kernel constraint the whole credential design relies on.
+    /// with *any* content (identical, the old two-entry form, or an
+    /// unrelated entry) must be rejected, and the map must remain
+    /// unchanged. This is the kernel constraint the whole credential
+    /// design relies on.
     #[test]
     fn uid_map_is_write_once() {
         let creds = match creds() {
@@ -478,21 +525,19 @@ mod tests {
             }
         };
 
-        let (code, out, _err) = run_in_child(move |o| {
-            if let Err(e) = enter_userns(&creds) {
-                let _ = writeln!(o, "SETUP-FAIL enter_userns: {e:#}");
-                return 1;
+        let (code, out, err) = run_in_child(move |o| {
+            let rc = enter_or_classify(o, &creds);
+            if rc != 0 {
+                return rc;
             }
 
-            let (identical, narrowed, different) = (
-                map_contents(&creds).0.clone(),
-                format!("{} {} 1\n", creds.uid, creds.uid),
-                format!("0 {} 1\n", creds.uid),
-            );
+            let identical = map_contents(&creds).0.clone();
+            let old_two_entry = format!("0 {} 1\n{} {} 1\n", creds.uid, creds.uid, creds.uid);
+            let unrelated = format!("0 {} 1\n", creds.uid);
             for (label, contents) in [
                 ("identical", identical),
-                ("narrowing (drop the 0 entry)", narrowed),
-                ("unrelated single entry", different),
+                ("the old two-entry form", old_two_entry),
+                ("unrelated single entry (0 -> real uid)", unrelated),
             ] {
                 match write_map_file("/proc/self/uid_map", &contents) {
                     Ok(()) => {
@@ -500,11 +545,12 @@ mod tests {
                         return 10;
                     }
                     Err(e) => {
-                        let epem = e
+                        let is_eperm = e
                             .chain()
-                            .any(|c| c.downcast_ref::<io::Error>()
+                            .any(|c| c
+                                .downcast_ref::<io::Error>()
                                 .is_some_and(|io| io.raw_os_error() == Some(libc::EPERM)));
-                        if !epem {
+                        if !is_eperm {
                             let _ = writeln!(o, "FAIL: second write ({label}) failed with {e:#}; expected EPERM");
                             return 11;
                         }
@@ -514,8 +560,8 @@ mod tests {
 
             // The map must be exactly what we first wrote.
             let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
-            let (want0, wantself) = both_entries(&creds);
-            if !map.contains(&want0) || !map.contains(&wantself) {
+            let (want, _) = single_extent(&creds);
+            if normalize_map(&map) != want {
                 let _ = writeln!(o, "FAIL: the map changed after the rejected writes: {map:?}");
                 return 12;
             }
@@ -527,17 +573,21 @@ mod tests {
         match code {
             Some(0) => {}
             Some(1) => {
-                eprintln!("skipping (environment cannot create the mapping):\n{out}\n{_err}");
+                eprintln!("skipping (environment cannot create a user namespace):\n{out}\n{err}");
                 return;
             }
-            Some(other) => panic!("write-once probe failed (exit {other}):\n{out}\n{_err}"),
+            Some(20) => panic!("the kernel rejected the single-extent map:\n{out}\n{err}"),
+            Some(other) => panic!("write-once probe failed (exit {other}):\n{out}\n{err}"),
             None => panic!("test harness failed"),
         }
-        assert!(out.contains("OK: write-once holds"), "expected an OK line; got:\n{out}\n{_err}");
+        assert!(
+            out.contains("OK: write-once holds"),
+            "expected an OK line; got:\n{out}\n{err}"
+        );
     }
 
-    /// End-to-end for phase 1: `wlsctx run -- id` executes the command
-    /// in the new user namespace and the command sees the *real* uid.
+    /// End-to-end: `wlsctx run -- id` executes the command in the new
+    /// user namespace and the command sees the *real* uid/gid.
     #[test]
     fn run_sandboxed_command_sees_the_real_uid() {
         let creds = match creds() {
@@ -549,20 +599,11 @@ mod tests {
         };
 
         // The outer fork+pipe captures the *grandchild* (the
-        // sandboxed `id`) stdout: the intermediate child only runs
-        // run_sandboxed and exits.
+        // sandboxed `id`) stdout and the intermediate child's
+        // stderr (where setup errors are logged).
         let (code, out, err) = run_in_child(move |o| {
             match run_sandboxed(&[OsString::from("id")]) {
-                Ok(126) => {
-                    // The sandbox setup failed inside the grandchild
-                    // (126 = cannot execute): this environment cannot
-                    // create the mapping.
-                    1
-                }
-                Ok(c) => {
-                    let _ = writeln!(o.err(), "run_sandboxed exited with {c}");
-                    0
-                }
+                Ok(code) => code,
                 Err(e) => {
                     let _ = writeln!(o.err(), "run_sandboxed error: {e:#}");
                     2
@@ -572,11 +613,18 @@ mod tests {
 
         match code {
             Some(0) => {}
-            Some(1) => {
-                eprintln!("skipping: the sandbox could not be set up in this environment (nested user namespace?); the assertions run for real on the target\n{err}");
+            // 126 = setup failed inside the grandchild. Distinguish
+            // "cannot create the namespace here" (skip) from "the
+            // kernel rejected our map" (hard fail).
+            Some(126) => {
+                if err.contains("uid_map") || err.contains("gid_map") {
+                    panic!("the kernel rejected the single-extent map (design failure, not an environment skip):\n{err}");
+                }
+                eprintln!("skipping (environment cannot create a user namespace):\n{err}");
                 return;
             }
-            other => panic!("run_sandboxed harness failed: {other:?}\n{out}\n{err}"),
+            Some(other) => panic!("run_sandboxed exited with {other}:\n{out}\n{err}"),
+            None => panic!("test harness failed"),
         }
 
         let want = format!("uid={}(", creds.uid);

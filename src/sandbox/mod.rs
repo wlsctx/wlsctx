@@ -2,10 +2,10 @@
 //! (user → mount → pid → ipc → uts → cgroup → net), the private
 //! rootfs, and the landlock + seccomp policy applied via `nono`.
 //!
-//! Phase 1: the user namespace and the non-root credential sequence
-//! ([userns]), plus the `wlsctx run -- <cmd>` path that executes a
-//! command through it. The later phases fill in the marked slots in
-//! [run_sandboxed].
+//! Phase 1: the user namespace and the credential model ([userns] —
+//! the single-extent map, decision #10), plus the `wlsctx run --
+//! <cmd>` path that executes a command through it. The later phases
+//! fill in the marked slots in [run_sandboxed].
 
 pub(crate) mod userns;
 
@@ -17,7 +17,8 @@ use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 
 /// Run `command` inside a new user namespace, as our real uid
-/// (PLAN.md §3.1, decision #9). Returns the command's exit code.
+/// (PLAN.md §3.1, decisions #9 and #10). Returns the command's exit
+/// code.
 ///
 /// All namespace work happens in a forked child: wlsctx itself stays
 /// *outside* the namespaces, so the app remains a normal, reappable
@@ -45,9 +46,11 @@ pub(crate) fn run_sandboxed(command: &[OsString]) -> Result<i32> {
                 std::process::exit(126);
             }
             // (Phase 2 slot: mount, pid, ipc, uts, cgroup, net namespaces)
-            // (Phase 3 slot: rootfs construction, while we are ns-root)
-            if let Err(e) = userns::drop_ns_root(&creds) {
-                error!("dropping to the real uid failed: {e:#}");
+            // (Phase 3 slot: rootfs construction; we hold the full ns
+            //  capability set throughout — the map, not a drop, locks
+            //  the identity)
+            if let Err(e) = userns::verify_locked(&creds) {
+                error!("credential verification failed: {e:#}");
                 std::process::exit(126);
             }
             // (Phase 4 slot: nono landlock + seccomp, then exec)
