@@ -1,38 +1,50 @@
 # AGENTS.md
 
-wlsctx: runs GUI apps (JetBrains IDEs, Librewolf) in unprivileged Podman
-pods on a wlroots Wayland desktop (sway, Fedora) with native Wayland + GPU
-rendering. The Rust binary `wlsctx` tags the pod's shared Wayland socket with
-the `wp_security_context_v1` protocol so the compositor identifies sandboxed
-clients. **README.md is the full architecture/threat-model doc — read it
-before non-trivial changes.**
+wlsctx: runs GUI apps (JetBrains IDEs, Librewolf) in an unprivileged
+**in-process sandbox** on a wlroots Wayland desktop (sway, Fedora) with
+native Wayland + GPU rendering. The Rust binary `wlsctx` creates
+namespaces, a private rootfs and landlock+seccomp confinement (`nono`)
+and tags the app's Wayland socket with the `wp_security_context_v1`
+protocol so the compositor identifies sandboxed clients. The project is
+mid-rework away from the old podman/quadlet deployment: **PLAN.md is the
+authoritative plan and decisions log — read it before non-trivial
+changes** (README.md is stale pending its phase-8 rewrite).
 
 ## Layout
 
-- `src/main.rs` — the wlsctx binary (only Rust code; Dockerfile builds it static)
-- `containers/systemd/` — quadlets: `wl-app@.pod` + sidecars (`wl-display@`,
-  `wl-dbus@`, `wl-xwayland@`), app containers (`app-podman-@`), image/build
-  units. Drop-ins: `wl-.container.d/` (pod defaults), `app-podman-.container.d/`
-- `containers/apps/` — Containerfiles: `runtime`, `jetbrains`, `librewolf`,
-  `xwayland-satellite`, `xdg-dbus-proxy`, `dev/rust`
-- `selinux/` — CIL blocks for the sidecar containers
-- `systemd/user/` — non-quadlet units (wlsctx socket activation, dbus-proxy fallback)
-- `docker-bake.hcl` — image build matrix (Fedora `DISTRO_RELEASE`)
+- `src/main.rs` — binary entry: logging, CLI parse, pipeline dispatch
+- `src/cli.rs` — clap CLI (currently the single `wayland` mode; becomes
+  the subcommand tree per PLAN.md)
+- `src/wayland/` — the tagged Wayland socket: `listener` (socket
+  activation / `--listen`), `roundtrip` (bounded sync), `context`
+  (`wp_security_context_v1`), `signals` (signalfd loop)
+- `src/sandbox/`, `src/profile/` — placeholders for the in-process
+  sandbox and per-app TOML profiles (PLAN.md phases 1–4)
+- `src/testutil.rs` — shared `#[cfg(test)]` helpers (env locking, TmpDir)
+- `PLAN.md` — rework plan: architecture, decisions log, phase/task list
+- `assets/` — logos/headers
 
 ## Facts
 
-- Target: Fedora 43, user-level systemd, podman quadlet
-  (`~/.config/containers/systemd/`), sway/wlroots.
-- Quadlet naming: instance `%i` = pod/app instance; `%j` = app product
-  (e.g. `rustrover`). Pod runtime dir is `/run/pod` (`POD_RUNTIME_DIR`).
-- Pod XDG homes are pod named volumes (`pod_%i_home`, `%j_%i_cache`, …),
-  not the real homedir. Apps run read-only with `DropCapability=ALL`.
-- `--ipc=host` + `/dev/dri/renderD128…131` (optional, `-` prefix) are
-  required for Vulkan/GPU; do not "clean them up".
-- `wlsctx` image comes from `ghcr.io/wlsctx/wlsctx`; all other images are
-  local (`Policy=never`).
-- D-Bus is only reachable via the `wl-dbus@` proxies
-  (`/run/pod/session-bus-proxy`, `at-spi-bus-proxy`).
-- Rust edition 2024; deps in Cargo.toml are pinned in Cargo.lock.
-- This is a personal WIP repo: several configs are intentionally mid-tuning
-  (commented knobs in drop-ins, stub SIGHUP handler, loose at-spi filter).
+- Target: Fedora 43, user-level systemd, sway/wlroots desktop. No
+  containers: the sandbox is created by `wlsctx` itself (namespaces,
+  private rootfs, landlock+seccomp via `nono`) — see PLAN.md.
+- The app runs as its **real uid (non-root)** inside the user namespace:
+  the two-phase `uid_map` (map `0` for the mount phase, then narrow the
+  map to drop it) is load-bearing — do not "simplify" it away (PLAN
+  §3.1).
+- The app only sees the **tagged** Wayland socket, never the host
+  socket; the reference pipe ("close" fd) must stay open for the
+  process lifetime (ownership note in `wayland/context.rs`).
+- Per-instance runtime dir: `$XDG_RUNTIME_DIR/wlsctx/<instance>/`.
+- GPU: `/dev/dri/renderD*` nodes are bind-mounted into the sandbox's
+  `/dev`; the user must be in the `render` group. `/dev` nodes are
+  **bind-mounted, not mknod'd**, so future SELinux modules can use the
+  canonical genfs labels.
+- SIGHUP exits with status 129 (128+SIGHUP) by design — no restart
+  logic in the binary (intentional).
+- Rust edition 2024; deps are pinned in Cargo.lock. `nono` is
+  Apache-2.0 (compatible with this repo's AGPL-3.0); its docs are thin,
+  the crate source is the reference.
+- This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
+  each phase committed and working; the README rewrite is phase 8.

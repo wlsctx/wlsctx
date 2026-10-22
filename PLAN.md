@@ -227,8 +227,8 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 
 ### Phase 0 — Cleanup & skeleton
 - [x] 0.1 Delete `containers/` (`0c842cf`)
-- [x] 0.2 Delete `docker-bake.hcl`, `systemd/`, `selinux/`; decide `Dockerfile`
-- [ ] 0.3 Restructure `src/` into a binary crate with modules:
+- [x] 0.2 Delete `docker-bake.hcl`, `systemd/`, `selinux/`; `Dockerfile` deleted (`42191e9`)
+- [x] 0.3 Restructure `src/` into a binary crate with modules:
       `cli.rs`, `wayland/{mod,listener,context,signals}.rs` (move current
       code + all its tests, no behaviour change), `sandbox/`, `profile/`
 - [ ] 0.4 Add deps: `nono` (pinned), `toml`, `serde`
