@@ -1,51 +1,55 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **DRAFT — for discussion before implementation** (2026-10-22)
+Status: **v2 — decisions incorporated, ready to implement Phase 0/1** (2026-10-22)
 
-The podman/quadlet layer is deleted (`0c842cf`). Containment moves into the
-`wlsctx` binary itself: it becomes a CLI tool that, per app, creates Linux
-namespaces, builds a private rootfs, applies landlock + seccomp via the
-[`nono`](https://docs.rs/nono) library, and `exec()`s the app — with `wlsctx`
-itself staying on the host as the **supervisor** (tagged Wayland socket,
-seccomp-notify handler, signal forwarding, D-Bus proxy sidecar).
+The podman/quadlet layer is deleted (`0c842cf`); the remaining
+container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
+deleted in the same rework. Containment moves into the `wlsctx` binary
+itself: it becomes a CLI tool that, per app, creates Linux namespaces,
+builds a private rootfs, applies landlock + seccomp via the
+[`nono`](https://docs.rs/nono) library, and `exec()`s the app — with
+`wlsctx` itself staying on the host as the **supervisor** (tagged Wayland
+socket, seccomp-notify handler, signal forwarding, systemd integration).
+systemd integration and SELinux policy are written **from scratch** in
+later phases.
 
 ---
 
 ## 1. Target architecture
 
 ```
-host user session (uid 1000, sway, host session bus)
+host user session (uid 1000, sway)
 │
 ├── wlsctx run rustrover          ← supervisor, unsandboxed, host namespaces
+│   │   - optional: registers itself in a systemd user SCOPE via D-Bus
+│   │     (StartTransientUnit, Delegate=app) — or plain cgroup fallback
 │   │   - tagged Wayland socket   (wp_security_context_v1, as today)
 │   │   - supervisor IPC listener (nono supervisor socket)
-│   │   - systemd sd-notify, signal forwarding, waits on child
+│   │   - sd-notify, signal forwarding, waits on child
 │   │
-│   └── fork ──► app process      ← the sandbox
-│       unshare:  user → pid → ipc → uts → cgroup → net → mount
-│       mounts:   private /dev, /proc, /sys (subsets), /run, /tmp
-│                 binds: /usr /etc /opt/<app> (ro), XDG dirs (rw),
-│                        /dev/dri, tagged wayland socket, dbus-proxy socket
-│       nono:     landlock (deny-by-default fs + unix sockets + network)
-│                 seccomp (static network block / notify filters)
-│       exec:     /opt/rustrover/bin/…   (PID 1 of its own pidns)
+│   └── fork ──► app process      ← the sandbox, runs as UID 1000 (not root)
+│       phase 1 (ns-root):  unshare user → mount: build rootfs
+│       phase 2:            setuid 1000, drop uid 0 from the mapping
+│       phase 3:            unshare pid → ipc → uts → cgroup → net
+│       phase 4:            nono: landlock + seccomp
+│       phase 5:            execve  (app is PID 1 of its pidns)
 │
-└── wlsctx dbus-proxy <instance>  ← host-side sidecar: xdg-dbus-proxy
-                                    filtered view of the host session bus
+└── (later phases) wlsctx dbus-proxy / wlsctx xwayland host sidecars
 ```
 
 Compared to the container era:
 
-- **Gone:** podman pods, containers, quadlets, Containerfiles, image layers,
-  pod networks, SELinux CIL for container sidecars, MCS.
-- **Same in spirit:** unprivileged user namespace with uid 0 → 1000 (the app
-  is "root" inside, real uid 1000 outside — identical to rootless podman);
-  private filesystem view; filtered session bus; per-app private runtime dir
-  under `$XDG_RUNTIME_DIR/wlsctx/<instance>/`; tagged Wayland socket +
-  compositor policy; GPU render nodes by direct device access.
-- **New:** landlock (fs/socket/network baseline) and seccomp via `nono`,
-  supervisor pattern with runtime capability requests, cgroup ns +
-  systemd `Delegate` for the app's cgroup subtree.
+- **Gone:** pods, containers, quadlets, Containerfiles, image layers, pod
+  networks, SELinux CIL for `container_t` sidecars, MCS, `systemd-run`
+  shell-outs.
+- **Same in spirit:** unprivileged user namespace; private filesystem view;
+  per-instance runtime dir under `$XDG_RUNTIME_DIR/wlsctx/<instance>/`;
+  tagged Wayland socket + compositor policy; GPU render nodes by direct
+  device access; (later) filtered session bus.
+- **Different:** the app runs as **uid 1000, not root**, inside the
+  namespace (see §3.2) — stronger than rootless podman, and friendly to
+  apps that refuse to run as root; landlock + seccomp via `nono`;
+  cgroup ns under a systemd *scope* created over D-Bus (no `systemd-run`).
 
 The supervisor stays *outside* the namespaces deliberately: it needs host
 access (compositor socket, session bus, cgroup files) and it is the process
@@ -56,262 +60,283 @@ the seccomp-notify fd belongs to.
 Checked against the published crate source before writing this plan.
 
 - **Linux backend = Landlock LSM** (ABI detection via `Sandbox::detect_abi()`;
-  network rules require ABI ≥ v4 → kernel ≥ 6.7; Fedora 43 is fine). Older
+  network rules need ABI ≥ v4 → kernel ≥ 6.7; Fedora 43 is fine). Older
   kernels fall back to seccomp-based network filtering
   (`apply_auto()` returns the fallback state).
 - **`CapabilitySet`** is the policy object:
   - fs: `allow_path/allow_file(path, Read|ReadWrite|…)`, deny-by-default
-  - unix sockets: `allow_unix_socket(_dir/_subtree)` — for the tagged
-    wayland socket, dbus-proxy sockets, ssh-agent, X11
+  - unix sockets: `allow_unix_socket(_dir/_subtree)` — tagged wayland
+    socket, (later) dbus-proxy sockets, ssh-agent, X11
   - network: `block_network()`, `set_network_mode(Blocked|AllowAll|ProxyOnly)`,
     `allow_tcp_connect/bind`, `allow_localhost_port(_range)`, `allow_https()`
-  - further confinement knobs: `set_signal_mode()`, `set_process_info_mode()`,
+  - further knobs: `set_signal_mode()`, `set_process_info_mode()`,
     `set_ipc_mode()`, `with_resource_limits()`
 - **`Sandbox::apply_auto(&caps)`** applies to the *calling process*
-  (irreversible; inherited across `execve`). There are also
-  `prepare_*`/`install_*`/`apply_external()` primitives that support a
-  **post-fork choreography** (supervisor prepares the BPF, child installs
-  it) — we will verify exactly which pattern to use in Phase 5.
+  (irreversible; inherited across `execve`). `prepare_*`/`install_*`/
+  `apply_external()` primitives also support post-fork choreography
+  (supervisor prepares the BPF, child installs) — verify which pattern to
+  use in Phase 4.
 - **seccomp** is built by nono itself (raw BPF, no libseccomp): a static
-  filter for network blocking / arch guard, plus a **SECCOMP_RET_USER_NOTIF**
-  filter that routes `openat/openat2`, `bind/connect/sendto/sendmsg/sendmmsg`
+  filter (network block, arch guard) plus a **SECCOMP_RET_USER_NOTIF**
+  filter routing `openat/openat2`, `bind/connect/sendto/sendmsg/sendmmsg`
   to a supervising process.
-- **Supervisor IPC** (`nono::supervisor`): length-prefencoded messages over a
+- **Supervisor IPC** (`nono::supervisor`): length-prefixed messages over a
   Unix socket, `SO_PEERCRED` auth, `SCM_RIGHTS` fd injection; pluggable
-  `ApprovalBackend` (nono-cli ships Terminal/Webhook/Policy backends; we
-  start with an auto-deny `PolicyApproval`).
+  `ApprovalBackend` (we start with an auto-deny `PolicyApproval`).
 - License: Apache-2.0 — compatible with this repo's AGPL-3.0.
 
-## 3. Sandbox construction (what the child does, in order)
+## 3. Sandbox construction (what the child does)
 
-1. **User ns** — `unshare(CLONE_NEWUSER)`, write `/proc/self/setgroups` =
-   `deny`, map uid/gid `0 → <real uid>` (plus optionally the subuid range
-   `100000–165536 → 1–65537`, see Q2). Rootless-podman-equivalent mapping is
-   *required*: the new mount namespace is owned by this user ns, and
-   mounting inside it needs `CAP_SYS_ADMIN` in it.
-2. **Mount ns** — built *first* among the non-user ns, because the user ns
-   above is what allows it (order in the syscall sequence: user → mount →
-   build rootfs → the rest). See §3.1.
-3. **PID ns** — the child `fork()`s exactly once *after* unsharing, so the
-   grandchild (the app) is **PID 1** of the new pidns; when the app dies,
-   the kernel tears the namespace down and its children die with it (no
-   orphans). `wlsctx` stays outside the pidns and sees the app as a normal
-   child pid for signalling/reaping.
-4. **IPC ns** — fresh (private System V + shared-memory view).
-5. **UTS ns** — `sethostname("wlsctx-<app>-<instance>")`.
-6. **Cgroup ns** — child is moved into a sub-cgroup of the service's cgroup
-   *before* unsharing, so the app's `/proc/self/cgroup` shows a clean path
-   (e.g. `/app`) and `/sys/fs/cgroup` is rooted at the service. Requires
-   systemd delegation, see §4.
-7. **Network ns** — mode is per-app, see Q1.
-8. **nono apply** — landlock + seccomp on the (soon-to-be-PID 1) process,
-   then **`execve()` the app**. The seccomp notify fd is handed to the
-   supervisor (wlsctx) which services capability requests for its lifetime.
+### 3.1 User namespace + the non-root credential sequence
 
-### 3.1 Rootfs construction (mount namespace)
+The kernel allows a **second write** to `/proc/self/uid_map` that *narrows*
+the previous mapping (entries may be removed/ranges shrunk; a previously
+mapped range may not be remapped). We exploit this (the same trick bwrap
+uses for non-root `--uid` targets):
+
+1. **Initial map:** `0 → <real uid>` **and** `<real uid> → <real uid>`
+   (one write; non-injective mappings are legal). The `0` entry exists
+   solely so *we* hold `CAP_SYS_ADMIN` in the user ns for the mount phase.
+   (Optional profile flag: also map the subuid range `100000–165536 →
+   1–65537` for files owned by subuid-range owners.)
+2. **Mount phase** (as ns-root): build the entire rootfs (§3.3), including
+   `devpts` and `/dev/dri`.
+3. **`setresuid(real uid)` / `setresgid(real uid)`** — permitted as
+   ns-root. Inherited supplementary groups are kept (the user's real
+   groups, e.g. `render` — this is what keeps `/dev/dri` accessible; in
+   the ns view both the node's group and our group collapse to the same
+   unmapped value, so DAC still matches).
+4. **Narrow the map:** rewrite `uid_map`/`gid_map` **without the 0 entry**.
+   From now on no process in this user ns can ever hold `CAP_SYS_ADMIN`
+   again (ns-uid 0 is unmapped; `setresuid(0)` is impossible). Consequence:
+   the app can never unmount, can never mount into a freshly unshared
+   mount ns, and its nested-userns tricks are contained by landlock (it
+   can only ever bind-mount what landlock lets it open).
+5. **nono apply** (landlock + seccomp), then **`execve()` the app**.
+
+The app sees itself as its real uid (1000) — no root-in-ns behaviour,
+files it writes are owned by its real uid on the host, identical to
+running unconfined.
+
+### 3.2 Remaining namespaces (order after the mount phase)
+
+- **PID ns** — the child `fork()`s once more, so the app is **PID 1** of
+  the new pidns; when it dies the kernel tears the namespace down and its
+  children die with it (no orphans). `wlsctx` stays outside the pidns and
+  sees the app as a normal child for signalling/reaping.
+- **IPC ns** — fresh (private System V + shm view).
+- **UTS ns** — `sethostname("wlsctx-<app>-<instance>")`.
+- **Cgroup ns** — unshared while the child is still in the *unit/scope
+  cgroup* (inherited from us), then the child moves itself into the
+  `app` sub-cgroup (visible inside the ns as `/app`), so
+  `/proc/self/cgroup` shows a clean stable path. See §4.
+- **Network ns** — per-app mode, decided in §5 (default: *shared* host
+  netns + nono filtering; `--network=none` = bare new netns).
+
+### 3.3 Rootfs construction (mount phase, as ns-root)
 
 | Target | How | Notes |
 |---|---|---|
-| `/` | bind host `/` **ro** | then mask what must not be visible (see below) |
-| `/dev` | fresh tmpfs + `mknod` | `null, zero, full, urandom, random, tty, ptmx` + `devpts` at `/dev/pts`; all are on the unprivileged-mknod list |
-| `/dev/dri` | bind from host (ro) | GPU; requires user in `render` group (same as rootless podman) |
-| `/proc` | fresh procfs mount | allowed in unprivileged user ns (namespaced view); verify on target kernel (task 4.4) |
+| `/` | bind host `/` **ro** | then mask what must not be visible (below) |
+| `/dev` | fresh tmpfs + **bind-mount** of the host nodes `null`, `zero`, `full`, `urandom`, `random`, `tty`, `ptmx` | bind-mount, not mknod: nodes keep their canonical genfs SELinux labels (`null_t`, `urandom_t`, …) so future confined domains need plain standard `open/read/write` rules; matches the rootless-runc approach. Clear error if a host node is missing. |
+| `/dev/pts` | `mount devpts -o newinstance` | fresh instance, isolated from host pts |
+| `/dev/dri` | bind from host | GPU; user must be in `render` group (same requirement as rootless podman); `--no-gpu` skips |
+| `/proc` | fresh procfs mount | allowed in an unprivileged user ns (namespaced view); verify on target kernel (Phase 2) |
 | `/sys` | ro-binds of `devices/`, `class/` | full `/sys` not mountable unprivileged; these cover DRM/PCI discovery |
-| `/run` | fresh tmpfs | holds the per-instance dir: tagged wayland socket, supervisor socket, dbus-proxy socket, (optionally) ssh-agent socket |
+| `/run` | fresh tmpfs | per-instance dir: tagged wayland socket, supervisor socket, (later) dbus-proxy socket, (optionally) ssh-agent socket |
 | `/tmp` | fresh tmpfs | `size=` from profile |
-| `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` | ro-binds | `/etc` as-is (passwd/group map consistently because of the uid map) |
-| app dir | ro-bind (e.g. `/opt/rustrover`) | path comes from the app profile |
+| `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` | ro-binds | `/etc` as-is; passwd/group map consistently through the uid/gid maps |
+| app dir | ro-bind (e.g. `/opt/rustrover`) | path from the app profile |
 | XDG dirs | rw-binds | `~/.config`, `~/.cache`, `~/.local`, `~/Documents`, `~/Downloads` — per profile |
-| masked | bind empty tmpfs over | `/root`, `/home/*` (except mapped ones), `/boot`, `/var`, `/srv`, `/media`, `/mnt`, `/opt/*` (except the app), anything else the profile marks private |
+| masked | bind empty tmpfs over | `/root`, `/home/*` (except mapped ones), `/boot`, `/var`, `/srv`, `/media`, `/mnt`, `/opt/*` (except the app), anything the profile marks private |
 
-Then `chroot()`/pivot to the assembled root. The **host** Wayland socket is
-deliberately *not* visible to the app — only the tagged one is — so the app
+Then `chroot()` to the assembled root. The **host** Wayland socket is
+deliberately *not* visible to the app — only the tagged one — so the app
 cannot bypass the security context.
 
-## 4. systemd integration (cgroup below a transient unit)
+All of this happens **before** nono is applied, so seccomp never needs to
+permit `mount`/`mknod`/`unshare` for the app.
 
-- `wlsctx run` is designed to be started as a **transient user service**:
-  `systemd-run --user -p Delegate=…` (a `wlsctx launch` wrapper subcommand)
-  or via `StartTransientUnit` over D-Bus. The unit's cgroup then owns both
-  `wlsctx` (supervisor) and the app.
-- To let the app live in a **sub-cgroup** (`<unit>/app`) that `wlsctx`
-  creates and moves itself into:
-  - transient unit: pass the property (`-p Delegate=app` / via
-    `StartTransientUnit` properties) — this is the "tell systemd" mechanism,
-    it suppresses "unexpected processes in cgroup" and grants subtree write
-    rights (task 6.1, including verifying the cgroup v2 *no-internal-process*
-    rule works out under user-slice delegation);
-  - persistent named unit (per-app, optional): a drop-in carrying
-    `Delegate=app` in `<unit>.d/`.
-- `wlsctx run` also degrades gracefully when started from a plain terminal
-  (no systemd): cgroup ns is skipped or falls back to a manually created
-  leaf under the user slice; document which (task 6.2).
+## 4. systemd integration (least-intrusive: D-Bus, no `systemd-run`)
 
-## 5. CLI design
+`wlsctx run` attempts, in order:
+
+1. **D-Bus to the user systemd** (`org.freedesktop.systemd1.Manager`,
+   over the session bus; `zbus` or `dbus` crate — pick in Phase 6):
+   `StartTransientUnit("wlsctx-<app>-<instance>.scope", "replace",
+   { Delegate: "app", StopWhenUnneeded: "yes", Pids: [self] }, {})`.
+   `systemd` moves **wlsctx itself** into the new scope's cgroup; we then
+   create the delegated `app` sub-cgroup below it. (Same mechanism
+   rootless podman uses for its scopes — `Delegate` on a scope is
+   supported.) With `StopWhenUnneeded`, the scope dies when both the
+   supervisor and the app exit; `systemctl --user status` sees the unit.
+2. **Fallback (no systemd / D-Bus call failed):** no unit at all. Create
+   the `wlsctx-<app>` and `wlsctx-<app>/app` sub-cgroups with plain file
+   writes under the cgroup wlsctx is currently in (user-slice leaves are
+   writable by the user; creating child cgroups under a populated cgroup
+   is legal in cgroup v2 — the no-internal-process rule only blocks
+   enabling *controllers* there, which we don't need for a cgroup ns),
+   and proceed. Documented degradation: no unit visibility/accounting.
+
+`cgroup.subtree_control` writes (resource limits for the `app` sub-cgroup)
+are a later optional extension, not required for namespacing to work.
+
+## 5. CLI design & network decision
 
 ```
 wlsctx run  [OPTIONS] <app-id> [APP ARGS...]     # full pipeline, execs app
 wlsctx run  [OPTIONS] -- <command> [ARGS...]     # ad-hoc (no profile)
-wlsctx wayland [OPTIONS]                         # today's behaviour:
-                                                 # tagged socket only (mode A
-                                                 # socket activation stays)
-wlsctx dbus-proxy [OPTIONS] <instance>           # host sidecar: xdg-dbus-proxy
-wlsctx profile show <app-id>                     # dump resolved policy
-                                                 # (mounts/landlock/seccomp)
-# later: status/stop, xwayland, list
+wlsctx wayland [OPTIONS]                         # today's behaviour: tagged
+                                                 # socket only (mode A)
+# later phases: dbus-proxy, xwayland, profile show, status/stop
 ```
 
-Key options: `--app-id`, `--instance-id`, `--network={none,host,filter}`,
-`--gpu/--no-gpu`, `--dbus/--no-dbus`, `--config=<dir>`, `-v/-vv`.
+Key options: `--app-id`, `--instance-id`,
+`--network={filter|none|host}`, `--gpu/--no-gpu`, `--config=<dir>`,
+`-v/-vv`.
+
+**Network (decided):** default `filter` = *shared* host netns with nono's
+network filtering (egress allowed, no bind — matches the old
+"egress allowed" behaviour at zero plumbing cost; nono covers it
+natively). `--network=none` = new netns, `lo` only. `--network=host` =
+no filtering. Private-netns options (veth, pasta/slirp4netns) are a later
+hardening phase, out of scope for now.
 
 **App profiles** replace the quadlet drop-ins: TOML in
 `~/.config/wlsctx/apps/<app-id>.toml` (ro binds, rw binds, masked paths,
-env vars, network mode, gpu, dbus filter args, tmp size). New deps:
-`nono`, `toml` (+ `serde`).
+env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
+`toml`, `serde`, and a D-Bus crate in Phase 6.
 
-## 6. Open questions — decide before Phase 2+
+## 6. Decisions log
 
-1. **Network default.** Old behaviour: private netns, egress allowed, no
-   LAN presence. Options:
-   - (a) *shared host netns* + nono network filtering (`AllowAll` egress,
-     no bind) — simplest; nono covers it natively; keeps IDEs working;
-     loses LAN-presence isolation (moot on a 1–2 user laptop?);
-   - (b) new netns + veth to host — closest to the old pod network, but
-   real plumbing (we'd write the setup in wlsctx);
-   - (c) new netns + userspace proxy (pasta/slirp4netns style) — more
-   plumbing, most isolation;
-   - (d) plain new netns (no connectivity) for `--network=none` apps.
-   **Proposal: (a) as default + (d) available now; (b)/(c) as later
-   hardening.**
-2. **UID mapping.** Single mapping `0 → self` (simplest; other users' files
-   show as `nobody`) or rootless-podman-style subuid range (needed if any
-   bind-mounted path contains files owned by non-self uids that the app
-   must *write*). **Proposal: single mapping now, subuid range as a
-   profile option.**
-3. **D-Bus proxy shape.** Host-side `wlsctx dbus-proxy <instance>` spawning
-   `xdg-dbus-proxy` (external binary, as today's
-   `systemd/user/wl-dbus-nocontainer@.service` already does on the host).
-   Per-instance unit + on-demand spawn? One shared proxy? **Proposal:
-   per-instance, systemd socket-activated, exactly like the existing
-   nocontainer unit.**
-4. **Xwayland satellite.** Keep as a host-side sidecar (for X apps) or drop
-   for now (RustRover uses native Wayland; LibreWolf uses Wayland)?
-5. **App distribution.** The GPG-verified JetBrains image build is gone with
-   the Containerfiles. For now: run apps installed on the host (bind
-   `/opt/<app>`). Do we want a `wlsctx fetch <app>`-style installer
-   later? (Probably a separate project.)
-6. **`wlsctx wayland` (mode A).** Keep as subcommand (it's already tested
-   and useful standalone) — **proposal: keep**; the dangling
-   `systemd/user/wlsctx@.socket` is repointed at `wlsctx wayland
-   --socket-activation`.
-7. **Repo cleanup decisions:** delete `docker-bake.hcl` (all targets gone),
-   delete `selinux/` (CIL was for `container_t` sidecars), `Dockerfile` →
-   keep only as a static-musl build recipe (no ghcr image) or drop?
+| # | Question | Decision |
+|---|---|---|
+| 1 | Network default | Shared host netns + nono filter; `--network=none` for air-gapped; veth/pasta later |
+| 2 | UID inside ns | **Non-root (1000)** via two-phase mapping (§3.1); subuid range as profile option |
+| 3 | D-Bus proxy | **Deferred** to a later phase (after namespacing works) |
+| 4 | Xwayland | **Deferred** to a later phase |
+| 5 | App distribution | *Open* — run host-installed apps (`/opt/<app>` ro-bind) for now; GPG/fetch story undecided |
+| 6 | `wlsctx wayland` subcommand | Keep (already tested; no unit file in repo anymore) |
+| 7 | Cleanup | Delete `docker-bake.hcl`, `systemd/`, `selinux/` (done this round). **`Dockerfile` still to decide** — it only existed to build the container image; propose deleting it in favour of a plain static build recipe. |
+| 8 | systemd integration | In-process D-Bus `StartTransientUnit` scope + raw-cgroup fallback (§4) |
 
 ## 7. Phases & task list
 
-> Each phase ends with a working, committed state. "Verify" items run on the
-> target machine (Fedora 43, sway, unprivileged user).
+> Each phase ends with a working, committed state. "Verify" items run on
+> the target machine (Fedora 43, sway, unprivileged user).
 
 ### Phase 0 — Cleanup & skeleton
 - [x] 0.1 Delete `containers/` (`0c842cf`)
-- [ ] 0.2 Decide §6 open questions
-- [ ] 0.3 Remove `docker-bake.hcl`, `selinux/`; decide `Dockerfile` fate;
-      repoint `systemd/user/wlsctx@.socket` (or set aside); keep
-      `wl-dbus-nocontainer@.service` (now the relevant D-Bus pattern)
-- [ ] 0.4 Restructure `src/` into a binary crate with modules:
+- [x] 0.2 Delete `docker-bake.hcl`, `systemd/`, `selinux/`; decide `Dockerfile`
+- [ ] 0.3 Restructure `src/` into a binary crate with modules:
       `cli.rs`, `wayland/{mod,listener,context,signals}.rs` (move current
       code + all its tests, no behaviour change), `sandbox/`, `profile/`
-- [ ] 0.5 Add deps: `nono` (pinned), `toml`, `serde`
+- [ ] 0.4 Add deps: `nono` (pinned), `toml`, `serde`
 
-### Phase 1 — User namespace
-- [ ] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`, `setgroups=deny`,
-      write `uid_map`/`gid_map` (single mapping; subuid range behind a
-      profile flag)
-- [ ] 1.2 `wlsctx run -- id`-style ad-hoc path to observe the result
-- [ ] 1.3 Verify: `lsns`, `id` inside, files under `/etc` show the mapped
-      uid; kernel's unprivileged-userns is enabled on the target
+### Phase 1 — User namespace, non-root mapping
+- [ ] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`; `setgroups=deny`;
+      initial `uid_map`/`gid_map` with `0→self` **and** `self→self`
+      (subuid range behind a profile flag)
+- [ ] 1.2 Credential sequence: finish mounts → `setresuid/gid(self)` →
+      rewrite maps without 0 → assert we can no longer `setresuid(0)`
+- [ ] 1.3 `wlsctx run -- <cmd>` ad-hoc path to observe results
+- [ ] 1.4 Verify: `id` inside shows the real uid; `lsns`; kernel's
+      unprivileged-userns enabled; the map-narrowing rule behaves as
+      documented (write a test for it)
 
 ### Phase 2 — Remaining namespaces
-- [ ] 2.1 Mount ns (unshare right after user ns)
-- [ ] 2.2 PID ns: single extra fork so the app is PID 1; death semantics
-      check (kill app → whole ns gone)
+- [ ] 2.1 Mount ns (unshare right after user ns; rootfs build lands in
+      Phase 3 but the unshare slot is here)
+- [ ] 2.2 PID ns: extra fork so the app is PID 1; death semantics
+      (kill app → whole ns gone)
 - [ ] 2.3 IPC ns + UTS ns (hostname `wlsctx-<app>-<instance>`)
-- [ ] 2.4 Cgroup ns: create `<unit>/app` sub-cgroup, move in, unshare
-      (needs Phase 6.1 delegation); verify `/proc/self/cgroup` view
-- [ ] 2.5 Network ns per chosen mode (Q1)
-- [ ] 2.6 Verify full set against a reference: `bwrap --unshare-user
-      --unshare-pid …` `mount`/`lsns`/`cat /proc/self/*` diff
+- [ ] 2.4 Cgroup ns: unshare in the unit cgroup, then move child to the
+      `app` sub-cgroup; verify `/proc/self/cgroup` view
+- [ ] 2.5 Network ns per mode (`none` = bare netns + `lo up`)
+- [ ] 2.6 Verify full set against a reference:
+      `bwrap --unshare-user --uid <self> --unshare-pid …` —
+      `mount`/`lsns`/`/proc/self/*` diff
 
 ### Phase 3 — Rootfs
-- [ ] 3.1 `sandbox/mounts.rs`: the §3.1 table as code (dev nodes, proc,
-      sys binds, run/tmp tmpfs, ro/rw binds, masks, chroot)
+- [ ] 3.1 `sandbox/mounts.rs`: the §3.3 table as code: `/dev` tmpfs +
+      node bind-mounts + `devpts -o newinstance`; fresh `/proc`; `/sys`
+      ro-binds; `/run`+`/tmp` tmpfs; ro/rw binds; masks; `chroot`
 - [ ] 3.2 `profile/`: TOML app profiles; defaults for rustrover/librewolf
-- [ ] 3.3 `/dev/dri` bind + GPU check (render group), optional
-      `--no-gpu`
+- [ ] 3.3 `/dev/dri` bind + GPU check (render group), `--no-gpu`
 - [ ] 3.4 Verify: mount table matches the reference; `ls /` minimal;
-      app files visible; host Wayland socket *absent*
+      host Wayland socket absent; `/dev` nodes openable by the app
 
 ### Phase 4 — nono: landlock + seccomp
 - [ ] 4.1 Build `CapabilitySet` from profile: fs paths + modes, unix
-      socket caps (tagged wayland, dbus, ssh), network mode, signal /
+      socket caps (tagged wayland, later dbus/ssh), network mode, signal /
       process-info / ipc modes
-- [ ] 4.2 Apply before `execve` in the child; verify the post-fork
-      install path (`apply_auto` vs `prepare_*`/`apply_external`)
+- [ ] 4.2 Apply after the credential sequence, before `execve` in the
+      child; verify the install path (`apply_auto` vs
+      `prepare_*`/`apply_external` + notify-fd handoff to the supervisor)
 - [ ] 4.3 Supervisor side: hold the seccomp-notify fd, service the
       supervisor socket with an auto-deny `PolicyApproval`; log denials
-      via nono diagnostics (`audit`/`diagnostic`)
+      via nono diagnostics
 - [ ] 4.4 Verify: blocked path → EACCES; allowed path works; network per
-      mode; a blocked syscall doesn't take the app down unexpectedly
-      (tune the static filter so a normal GUI app *runs*)
+      mode; a normal GUI app *runs* (strace-driven tuning of the static
+      filter if needed)
 
 ### Phase 5 — Wayland + full pipeline
 - [ ] 5.1 Tagged-socket creation moves ahead of the fork (supervisor side,
       reusing the existing listener/roundtrip/context code)
-- [ ] 5.2 Reference pipe handed to the app (socket stays live while the
-      app lives; app death invalidates it — clean lifecycle)
-- [ ] 5.3 `wlsctx run <app-id>`: profile → env → `execve`;
-      `wlsctx run -- <cmd>` ad-hoc
+- [ ] 5.2 Reference pipe handed to the app (socket lives while the app
+      lives; app death invalidates it — clean lifecycle)
+- [ ] 5.3 `wlsctx run <app-id>`: profile → env → `execve`
 - [ ] 5.4 sd-notify (READY on child spawn), signal forwarding
       (TERM/INT to app; keep SIGHUP→129 semantics), exit-status
       propagation, `/run` dir cleanup
-- [ ] 5.5 E2E on target: RustRover and LibreWolf run, `wlsinfo` diff vs
+- [ ] 5.5 E2E on target: RustRover and LibreWolf run; `wlsinfo` diff vs
       host matches the old acceptance checklist
 
-### Phase 6 — systemd & sidecars
-- [ ] 6.1 `wlsctx launch`: `systemd-run --user -p Delegate=…` (or
-      `StartTransientUnit` over D-Bus); drop-in variant for named units;
-      verify no "unexpected process" warnings, correct `systemctl status`
-- [ ] 6.2 `wlsctx dbus-proxy <instance>`: wrap `xdg-dbus-proxy` (reuse
-      `wl-dbus-nocontainer@` socket unit as the model); verify portal
-      calls succeed, everything else filtered
-- [ ] 6.3 Graceful non-systemd invocation (plain terminal): cgroup fallback
-      + documented behaviour
-- [ ] 6.4 (optional, Q4) `wlsctx xwayland` host-side satellite
+### Phase 6 — systemd integration
+- [ ] 6.1 D-Bus `StartTransientUnit` scope (Delegate=app,
+      StopWhenUnneeded, Pids=self) — pick `zbus` vs `dbus` crate;
+      verify `systemctl --user status` shows the scope, no "unexpected
+      process" warnings, scope dies with the instance
+- [ ] 6.2 Raw-cgroup fallback (no systemd / call failed): create
+      sub-cgroups under the current cgroup, proceed; document degradation
+- [ ] 6.3 `wlsctx wayland` remains usable standalone (socket activation
+      is up to the user's own units — repo ships none)
 
-### Phase 7 — Docs & hardening
-- [ ] 7.1 Rewrite `README.md`: architecture, threat model (what changed
+### Phase 7 — Sidecars (deferred)
+- [ ] 7.1 `wlsctx dbus-proxy <instance>`: host-side `xdg-dbus-proxy`
+      (per-instance; decide socket-unit vs direct spawn in this phase)
+- [ ] 7.2 (optional) `wlsctx xwayland` host-side satellite
+
+### Phase 8 — Docs, SELinux, hardening
+- [ ] 8.1 Rewrite `README.md`: architecture, threat model (what changed
       vs. containers; residual risks: network, GPU, downloads, portal
       attribution), install, verify-your-setup, adding an app
-- [ ] 7.2 Update `AGENTS.md` (layout, facts)
-- [ ] 7.3 Integration test suite (`tests/`): in-ns assertions (uid/pid/
-      mounts/cgroup), landlock deny checks, seccomp checks, network
-      checks, wayland tagged-socket check, dbus filter check, lifecycle
-      (TERM → clean death) — runs as a regular user
-- [ ] 7.4 Threat-model review against the old README's list, item by item
+- [ ] 8.2 New SELinux policy from scratch (local module confining the
+      supervisor and app domains; the bind-mounted `/dev` nodes keep
+      canonical labels, which makes this tractable — see §3.3)
+- [ ] 8.3 Update `AGENTS.md` (layout, facts)
+- [ ] 8.4 Integration test suite (`tests/`): in-ns assertions (uid is
+      non-root, pid 1, mounts, cgroup), landlock deny checks, seccomp
+      checks, network checks, wayland tagged-socket check, lifecycle
+      (TERM → clean death) — all runnable as a regular user
+- [ ] 8.5 Threat-model review against the old README's list, item by item
 
 ## 8. Risks / things to watch
 
-- **Kernel features on Fedora 43**: unprivileged user+mount+proc+devpts all
-  must work from a plain user session — Phase 1/2 verify tasks exist
-  exactly for this (Fedora ships unprivileged userns enabled, but verify).
-- **seccomp friction with GUI apps**: JVMs and browsers do a lot of exotic
+- **Kernel features on Fedora 43**: unprivileged user+mount+proc+devpts
+  from a plain user session — Phase 1/2 verify tasks exist exactly for
+  this (Fedora ships unprivileged userns enabled, but verify).
+- **`uid_map` narrowing rule**: the second-write restriction (no remapping
+  of already-mapped uids) is the load-bearing assumption of §3.1;
+  bwrap uses this pattern, but Phase 1.4 includes an explicit test.
+- **seccomp friction with GUI apps**: JVMs and browsers do exotic
   syscalls; nono's default is allow-everything-except-notified, which
   should keep friction low — but `strace`-driven tuning is expected in
   Phase 4.
 - **nono API churn**: pin the version in `Cargo.lock`; the
-  supervisor/prepare/apply split needs reading of the crate source in
-  Phase 4 (its docs are thin; the source is the reference).
-- **cgroup v2 no-internal-process rule**: moving processes into a child of
-  a delegated cgroup has corner cases; Phase 6.1 includes a fallback
-  decision if delegation behaves differently than expected for user units.
+  supervisor/prepare/apply split needs source-level reading in Phase 4
+  (docs are thin; the source is the reference).
+- **cgroup corner cases**: no-internal-process rule (we only *create*
+  children, never enable controllers under a populated cgroup — safe),
+  and how the user-slice delegation behaves in Phase 6.1 — fallback
+  path covers any surprise.
