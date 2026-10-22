@@ -319,6 +319,48 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       host Wayland socket absent; `/dev` nodes openable by the app
 
 ### Phase 4 — nono: landlock + seccomp
+
+**Design** (verified against the nono 0.80.0 source, 2026-10-22):
+- **B, pre-exec:** (1) install the *combined* seccomp-notify filter —
+  `prepare_seccomp_af_unix_filter().with_openat_notifications()`; Linux
+  allows one `NEW_LISTENER` filter per thread, so the AF_UNIX mediation
+  (traps `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg`) and the openat
+  logging (traps `openat`/`openat2`) share one listener (#22).
+  (2) `Sandbox::apply_landlock(&caps)` — the floor: default-deny fs,
+  signal scoping (V6), and `no_new_privs` (locks the single-extent
+  identity, #10). The filter is installed *before* landlock per nono's
+  docs, so blocked paths still reach the supervisor.
+  (3) hand the notify-fd *number* to A over a pre-made B→A pipe
+  (#23). (4) exec (the listener fd has no CLOEXEC — it survives).
+- **A:** reads the number, extracts its own listener fd from B's fd
+  table via `pidfd_open`+`pidfd_getfd` (A is B's parent, same uid —
+  ptrace-permitted), sends it to S via `SCM_RIGHTS` over a pre-made
+  S↔A socketpair. Direct SCM_RIGHTS from B is impossible: its
+  `sendmsg` is already trapped (#23). If the handoff fails (B died
+  early) S falls back to a plain `waitpid` — landlock still applies.
+- **S (the supervisor):** a poll loop over the notify listener and the
+  supervisor socket (`SupervisorSocket::pair()`, the
+  `CapabilityRequest` channel, auto-deny `ApprovalBackend`). Dispatch by
+  syscall number: openat → resolve the path from `/proc/<pid>/mem`
+  (`read_notif_path`/`resolve_notif_path`, `read_open_how` for
+  openat2), check the capability allowlist → continue or
+  EACCES+log; socket syscalls → read the sockaddr, *pathname* AF_UNIX
+  must match a granted socket (abstract/unnamed denied — #25),
+  non-UNIX families pass through (shared netns is the network
+  default). The supervisor never *expands* access in this phase
+  (no fd injection); landlock remains the floor. Loop ends when A dies
+  (B's death tears down the whole pidns, #14).
+- **CapabilitySet** (`policy.rs`): base "app essentials" — `/` Read
+  (refer/traverse — required, nono grants no ancestor metadata on
+  Linux, #24), `/usr /lib /lib64 /bin /sbin /etc /proc /sys` Read,
+  `/dev` RW, `/tmp` RW, the per-instance `/run` dir RW, `$HOME` RW;
+  plus profile `ro_binds`→Read, `rw_binds`→ReadWrite, `mask`→no
+  grant, `unix_sockets`→`allow_unix_socket`, the instance-dir subtree
+  (home of the Phase-5 tagged wayland socket), network
+  shared→AllowAll / none→Blocked, `signals`/`ipc` per profile.
+  Built identically in S and B from the same pure function (B inherits
+  nothing but re-runs it).
+- **4.1–4.3 checklist**
 - [ ] 4.1 Build `CapabilitySet` from profile: fs paths + modes, unix
       socket caps (tagged wayland, later dbus/ssh), network mode, signal /
       process-info / ipc modes
@@ -400,3 +442,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 19 | `mknod` unprivileged | Unprivileged `mknod` of device nodes is EPERM on 7.2.11 (SELinux enforcing). `/dev` nodes and `/dev/dri` are therefore **bind-mounted** (canonical genfs SELinux labels preserved), never mknod'd. |
 | 20 | Cgroup ns root | The ns root is the unsharing task's cgroup **at unshare time**, so the instance sub-cgroup must be entered *before* `unshare(CLONE_NEWCGROUP)`: the app sees `0::/` (its own cgroup is the root; 7.2 renders it with a trailing slash). The Phase-2 order (unshare → move) rooted the ns at the session cgroup (`0::/app-N`) and is corrected; it must still precede the rootfs build (cgroup2 goes ro with the self-bind). |
 | 21 | ro-binds are unattainable | On 7.2.11 `MS_BIND\|MS_RDONLY` **silently drops the ro flag** on a bind of a foreign superblock (probed on `/`, on files, and in both one-shot and make-private variants); the two-step bind → `MS_REMOUNT\|MS_RDONLY` is EPERM (the sb's `s_user_ns` is init — we can remount only our *own* fs). §3.3 corrected: `/` and the `/sys` subpaths are plain binds; read-only *semantics* for the app come from its real uid (root-owned trees unwritable) plus the nono landlock/seccomp policy (Phase 4). The test's former `ROOTWR` probe was a false positive (EACCES ≠ EROFS) and the `/proc/mounts` `head -1` read the *bottom* of the mount stack — the topmost entry is the last line. |
+| 22 | One notify listener per thread | Linux allows a single `SECCOMP_FILTER_FLAG_NEW_LISTENER` filter per thread, so nono's AF_UNIX mediation filter (traps all `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg` — the family is checked in userspace, BPF cannot dereference) and the openat-logging filter must be one combined program (`PreparedSeccompNotifyFilter::with_openat_notifications`). Consequence: every `sendmsg` of the app (incl. all wayland/TCP traffic) is a supervisor round-trip — the supervisor must stay a tight, responsive loop or the app stalls. The filter is installed **before** `apply_landlock` (nono's requirement: the supervisor must see paths Landlock would block). |
+| 23 | Notify-fd handoff without SCM_RIGHTS from B | B's `sendmsg` is trapped by its own filter, so B cannot hand the listener fd to S via `SCM_RIGHTS` after install. Handoff: B writes the listener's *fd number* to a pre-made B→A pipe; A (unfiltered, B's parent, same uid) does `pidfd_open(B)`+`pidfd_getfd(num)` to take its own copy, then sends it to S over a pre-made S↔A socketpair. All three channels are created in S **before** the first fork and distributed at the forks (A closes the S-side copies, B closes the A-side copies). A dead B (zombie has no fd table) → handoff fails → S falls back to plain `waitpid` (landlock still enforced). |
+| 24 | Landlock needs explicit ancestor grants on Linux | A landlock rule is a default-deny floor: to reach a granted subtree the app also needs refer/traverse on every ancestor. nono's `path_metadata_dirs` (ancestor metadata grants) is macOS-only — on Linux the policy itself must grant `/` Read (and any other ancestor chains). Consistent with the current rootfs: the self-bind of `/` already shows the app every top-level directory, so Read-on-`/` adds no visibility. |
+| 25 | Supervisor decides (auto-deny), never expands | The supervisor's role in Phase 4 is mediation+logging, not expansion: openat/AF_UNIX notifications are answered continue (allowlisted) or EACCES (denied + logged); there is no fd injection, no approval flow. Abstract/unnamed AF_UNIX sockets are denied (nono's default for pathname mediation) — GUI apps that use abstract-socket IPC (e.g. Chromium-style) may need a per-profile relaxation, to be added if Phase 5's E2E hits it. |
