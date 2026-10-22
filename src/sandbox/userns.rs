@@ -343,6 +343,14 @@ pub(crate) mod tests {
                     eprintln!("test setup: redirecting stdout/stderr failed");
                     std::process::exit(126);
                 }
+                // The test harness has no logger (main's env_logger
+                // init never runs in tests), and A/B report their
+                // setup failures via `log::error!` before `exit(126)`
+                // — initialize one (to the captured stderr) so those
+                // messages actually reach the assertion.
+                let _ = env_logger::try_init_from_env(
+                    env_logger::Env::default().default_filter_or("warn"),
+                );
                 let code = body(&mut ChildOut { out_fd: w_out, err_fd: w_err });
                 // Close the write ends explicitly (fd 1/2 share the
                 // same pipe; `exit` closes everything regardless) so
@@ -602,6 +610,9 @@ pub(crate) mod tests {
     /// user namespace and the command sees the *real* uid/gid.
     #[test]
     fn run_sandboxed_command_sees_the_real_uid() {
+        let _lock = crate::testutil::SANDBOX_LOCK
+            .lock()
+            .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
         let creds = match creds() {
             Ok(c) => c,
             Err(e) => {
@@ -617,6 +628,8 @@ pub(crate) mod tests {
             app_id: "app".to_string(),
             instance_id: "1".to_string(),
             network: crate::sandbox::namespaces::NetworkMode::Shared,
+            profile: crate::profile::Profile::adhoc(),
+            gpu: false,
         };
         let (code, out, err) = run_in_child(move |o| {
             match run_sandboxed(&[OsString::from("id")], &config) {

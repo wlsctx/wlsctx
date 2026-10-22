@@ -186,11 +186,13 @@ pub(crate) fn full_cgroup_path() -> Result<String> {
 /// Returns the *full* path of the session cgroup.
 pub(crate) fn enter_cgroupns(name: &str) -> Result<String> {
     let full = full_cgroup_path()?;
-    unshare(libc::CLONE_NEWCGROUP, "CLONE_NEWCGROUP")?;
-
-    // The cgroup2 filesystem is not re-rooted by the namespace on
-    // this kernel, so the sub-cgroup is reachable by its full path
-    // even from inside the namespace (verified in Phase 2).
+    // The cgroup ns's root is the unsharing task's cgroup **at
+    // unshare time**, so the instance sub-cgroup must be created
+    // and entered *before* the unshare: the app then sees `0::`
+    // (its own cgroup is the ns root) and can never see the session
+    // tree or sibling instances (decision #20). The cgroup2
+    // filesystem is not re-rooted by the namespace on this kernel,
+    // so the sub-cgroup is reachable by its full path (Phase 2).
     let sub = format!("/sys/fs/cgroup{full}/{name}");
     match std::fs::create_dir(&sub) {
         Ok(()) => {}
@@ -216,6 +218,7 @@ pub(crate) fn enter_cgroupns(name: &str) -> Result<String> {
         })?;
     f.write_all(format!("{}\n", std::process::id()).as_bytes())
         .with_context(|| format!("moving into {procs}"))?;
+    unshare(libc::CLONE_NEWCGROUP, "CLONE_NEWCGROUP")?;
     Ok(full)
 }
 
@@ -258,9 +261,10 @@ mod tests {
     use crate::sandbox::run_sandboxed;
     use std::os::unix::fs::MetadataExt;
     use crate::sandbox::userns::tests::{
-        run_in_child, enter_or_classify, creds, raw_write, ChildOut,
+        run_in_child, enter_or_classify, creds, ChildOut,
     };
     use crate::sandbox::SandboxConfig;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::Write;
 
@@ -269,6 +273,10 @@ mod tests {
             app_id: app.to_string(),
             instance_id: inst.to_string(),
             network: net,
+            // Phase 2 tests run without the GPU: the precheck and the
+            // `/dev/dri` build are skipped.
+            gpu: false,
+            profile: crate::profile::Profile::adhoc(),
         }
     }
 
@@ -284,6 +292,9 @@ mod tests {
     /// capture child (the multithreaded test process itself never
     /// enters a namespace).
     fn run_cmd(command: &[&str], config: &SandboxConfig) -> (Option<i32>, String, String) {
+        let _lock = crate::testutil::SANDBOX_LOCK
+            .lock()
+            .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
         let command: Vec<OsString> = command.iter().map(OsString::from).collect();
         let config = config.clone();
         run_in_child(move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
@@ -302,6 +313,9 @@ mod tests {
         if err.contains("uid_map") || err.contains("gid_map") {
             panic!("the kernel rejected the single-extent map (design failure, not an environment skip):\n{err}");
         }
+        if err.contains("rootfs construction failed") || err.contains("sandbox setup failed") {
+            panic!("a setup step failed inside the namespaces (a real failure, not an environment skip):\n{err}");
+        }
         eprintln!("skipping (environment cannot create the namespaces):\n{err}");
         true
     }
@@ -319,19 +333,6 @@ mod tests {
             Some(other) => panic!("{what} failed (exit {other}, expected 0):\n{out}\n{err}"),
             None => panic!("test harness failed"),
         }
-    }
-
-    /// The first pid in `/proc/<pid>/task/<pid>/children`, polling.
-    fn first_child_of(pid: i32, tries: u32, ms: u64) -> Option<i32> {
-        for _ in 0..tries {
-            if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-                if let Some(p) = s.split_whitespace().next().and_then(|t| t.parse::<i32>().ok()) {
-                    return Some(p);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-        None
     }
 
     /// The optional fields (propagation group, …) of the `/` entry.
@@ -502,55 +503,87 @@ mod tests {
         );
     }
 
+    /// The `(comm)` field of a `/proc/<pid>/stat` line.
+    fn comm_of(stat: &str) -> &str {
+        let open = stat.find('(').unwrap_or(0);
+        let close = stat.rfind(')').unwrap_or(open);
+        stat[open + 1..close].trim_matches(' ')
+    }
+
+    /// The `sleep` process that is a live descendant of `root`
+    /// (breadth-first walk over `/proc` parent links — the test
+    /// binary's S → A → B chain), or none.
+    fn find_sleep_descendant(root: i32) -> Option<i32> {
+        let mut children: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // Fields after the last ')': state ppid ...
+            let Some(ppid) = stat.rfind(')')
+                .map(|c| stat[c + 1..].split_whitespace().nth(1).unwrap_or_default())
+                .and_then(|t| t.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            children.entry(ppid).or_default().push(pid);
+        }
+        let mut queue = vec![root];
+        while let Some(p) = queue.pop() {
+            for &k in children.get(&p).into_iter().flatten() {
+                match std::fs::read_to_string(format!("/proc/{k}/stat")) {
+                    Ok(stat) if comm_of(&stat) == "sleep" => return Some(k),
+                    Ok(_) => queue.push(k),
+                    Err(_) => {} // vanished between the listing and the read
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn killing_the_app_takes_down_the_whole_ns() {
+        let _lock = crate::testutil::SANDBOX_LOCK
+            .lock()
+            .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
         // Decision #14: the kernel's pidns teardown does NOT kill
         // surviving members on this kernel, so the "no orphans"
         // guarantee is ours to build: when the app (PID 1) dies, the
         // intermediate child `A` must reap it and exit with its status
         // (137 for a SIGKILL), and nothing may be left behind.
+        //
+        // The killer runs in the **parent** (test) process, not inside
+        // the forked child: a thread inside the child would make the
+        // second fork (A) happen from a multithreaded process, which
+        // deadlocks on a lock held by a now-dead thread (a futex
+        // wait that never resolves). The parent is already
+        // multithreaded, so a thread here is safe; the child stays
+        // single-threaded like every other sandbox test.
         let command = vec![OsString::from("/usr/bin/sleep"), OsString::from("60")];
         let config = cfg("app", "1", NetworkMode::Shared);
-        let (code, out, err) = run_in_child(move |o: &mut ChildOut| {
-            // This thread finds the app (B, in-ns PID 1) while the
-            // main path blocks in `run_sandboxed`, and SIGKILLs it.
-            // (The child is single-threaded at this point — spawning
-            // a thread *inside* it is safe; it only does raw I/O and
-            // `kill`.)
-            let (_, err_fd) = o.fds();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let killer = std::thread::spawn(move || {
-                let a = first_child_of(std::process::id() as i32, 100, 20);
-                let b = a.and_then(|a| first_child_of(a, 100, 20));
-                let _ = tx.send(b.unwrap_or(-1));
-                if let Some(b) = b {
-                    let _ = raw_write(
-                        err_fd,
-                        format!("killing B (pid {b}, in-ns PID 1) with SIGKILL\n").as_bytes(),
-                    );
+        let (tx, rx) = std::sync::mpsc::channel::<i32>();
+        let killer = std::thread::spawn(move || {
+            let root = std::process::id() as i32;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                if let Some(b) = find_sleep_descendant(root) {
+                    let _ = tx.send(b);
+                    eprintln!("killing B (pid {b}, in-ns PID 1) with SIGKILL");
                     unsafe { libc::kill(b, libc::SIGKILL) };
+                    return;
                 }
-            });
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
 
-            let result = run_sandboxed(&command, &config);
-            let _ = killer.join();
-            let b_pid = rx.recv().unwrap_or(-1);
-            match result {
-                Ok(137) => {
-                    if b_pid > 0 && std::fs::read_to_string(format!("/proc/{b_pid}/stat")).is_err() {
-                        let _ = writeln!(
-                            o,
-                            "OK: B (pid {b_pid}, in-ns PID 1) was SIGKILLed and is gone; A reaped it and exited 137; the supervisor got 137"
-                        );
-                        0
-                    } else {
-                        let _ = writeln!(o, "FAIL: B (pid {b_pid}) still exists after the SIGKILL");
-                        8
-                    }
-                }
+        let (code, out, err) = run_in_child(move |o: &mut ChildOut| {
+            match run_sandboxed(&command, &config) {
                 Ok(c) => {
-                    let _ = writeln!(o, "FAIL: supervisor exit {c}, expected 137 (B pid {b_pid})");
-                    9
+                    let _ = writeln!(o, "status={c}");
+                    0
                 }
                 Err(e) => {
                     let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
@@ -558,8 +591,19 @@ mod tests {
                 }
             }
         });
+        let _ = killer.join();
+        let b_pid = rx.recv().unwrap_or(-1);
         match code {
-            Some(0) => {}
+            Some(0) => {
+                assert!(
+                    out.contains("status=137"),
+                    "the app must die of the SIGKILL and A must carry 137 to the supervisor:\n{out}\n{err}"
+                );
+                assert!(
+                    b_pid > 0 && std::fs::read_to_string(format!("/proc/{b_pid}/stat")).is_err(),
+                    "B (pid {b_pid}) must be gone after the SIGKILL"
+                );
+            }
             Some(126) => {
                 if skip_if_unsupported(&err) {
                     return;
@@ -568,7 +612,6 @@ mod tests {
             Some(other) => panic!("killing test failed (exit {other}):\n{out}\n{err}"),
             None => panic!("test harness failed"),
         }
-        assert!(out.contains("OK:"), "{out}\n{err}");
         // No stray may survive: the only descendants of the capture
         // child were A (exited) and B (SIGKILLed) — both are gone, so
         // the test process has no `sleep` descendants of its own.
@@ -627,7 +670,9 @@ mod tests {
         if expect(code, &out, &err, "cgroup ns").is_err() {
             return;
         }
-        assert_eq!(out.trim(), "0::/app-7", "got:\n{out}\n{err}");
+        // The instance cgroup is the ns root (moved in before the
+        // unshare, decision #20): 7.2 renders the ns root as "/".
+        assert_eq!(out.trim(), "0::/", "got:\n{out}\n{err}");
         // And the outside world still sees the session's full path.
         let outer = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
         assert!(outer.starts_with("0::/"), "outer view must be the full path: {outer:?}");

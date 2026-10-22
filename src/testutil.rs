@@ -17,6 +17,13 @@ pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// only one test at a time may install a fd there.
 pub static LISTEN_FD_LOCK: Mutex<()> = Mutex::new(());
 
+/// Only one full-sandbox test at a time: `run_sandboxed` tests share
+/// per-instance state on the **host** (the
+/// `$XDG_RUNTIME_DIR/wlsctx/<app>-<inst>` runtime dir and its rootfs
+/// build scratch), so concurrent runs with the same instance id race
+/// on it (a supervisor's cleanup can remove another run's scratch).
+pub static SANDBOX_LOCK: Mutex<()> = Mutex::new(());
+
 /// A uniquely named directory under the system temp dir, removed on
 /// drop. The counter makes every instance unique *within* a test
 /// binary, so parallel tests never share (or drop) the same

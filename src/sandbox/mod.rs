@@ -5,9 +5,12 @@
 //! Phase 1: the user namespace and the credential model ([userns] —
 //! the single-extent map, decision #10). Phase 2: the remaining
 //! namespaces ([namespaces]) and the double-fork in [run_sandboxed]
-//! that makes the app PID 1 of a fresh pid namespace. Phases 3
-//! (rootfs) and 4 (nono) fill in the marked slots in [run_sandboxed].
+//! that makes the app PID 1 of a fresh pid namespace. Phase 3: the
+//! private rootfs ([mounts]) and the per-app profiles
+//! (`crate::profile`). Phase 4 (nono landlock + seccomp) still to
+//! come.
 
+pub(crate) mod mounts;
 pub(crate) mod namespaces;
 pub(crate) mod userns;
 
@@ -28,6 +31,11 @@ pub(crate) struct SandboxConfig {
     pub instance_id: String,
     /// Network mode (PLAN §5); the default is the shared host netns.
     pub network: namespaces::NetworkMode,
+    /// The app profile (TOML file, built-in, or the ad-hoc default).
+    pub profile: crate::profile::Profile,
+    /// The final GPU decision: the profile's value unless overridden
+    /// by `--gpu`/`--no-gpu`.
+    pub gpu: bool,
 }
 
 /// Run `command` inside the full namespace set, as our real uid
@@ -37,9 +45,11 @@ pub(crate) struct SandboxConfig {
 /// Topology (PLAN §3.2):
 ///
 /// ```text
-/// S (wlsctx — outside every namespace)
-/// ├─ A: user → mount → pid ns; forks B; reaps B, exits with B's status
-/// │  └─ B: ipc → uts → cgroup → net (per mode) → verify → exec (PID 1)
+/// S (wlsctx — outside every namespace; the GPU precheck and the
+/// per-instance runtime dir live here)
+/// ├─ A: user → mount → pid → cgroup ns; builds the rootfs; forks B;
+/// │     reaps B, exits with B's status
+/// │  └─ B: ipc → uts → net (per mode) → fresh /proc → verify → exec (PID 1)
 /// ```
 ///
 /// `S` (us) never enters a namespace, so the app remains a normal,
@@ -77,6 +87,19 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
         namespaces::cgroup_name_for(&config.app_id, &config.instance_id)
     );
 
+    // The GPU precheck runs here (host-side properties: `/dev/dri`
+    // exists, the user is in the `render` group) so a bad
+    // configuration fails before any namespace is entered.
+    if config.gpu {
+        mounts::precheck_gpu()?;
+    }
+    // The per-instance runtime dir on the host: created before the
+    // fork, so A can bind it into the fresh `/run` (it is also the
+    // future home of the tagged Wayland socket — Phase 5).
+    let runtime_dir = mounts::instance_runtime_dir(&config);
+    std::fs::create_dir_all(&runtime_dir)
+        .with_context(|| format!("creating the per-instance runtime dir {runtime_dir}"))?;
+
     // SAFETY: fork(2) from a single-threaded point in the process
     // lifecycle; the parent only handles `child` below.
     match unsafe { fork() }.context("forking the sandbox child")? {
@@ -96,6 +119,21 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 error!("pid namespace setup failed: {e:#}");
                 std::process::exit(126);
             }
+            // The cgroup ns must be unshared **before** the rootfs
+            // build: the ro-bind of `/` makes cgroup2 read-only, and
+            // the instance sub-cgroup is created and entered here
+            // (decision #12). B, a fork of A, inherits the namespace
+            // and the membership.
+            let cgroup_name =
+                namespaces::cgroup_name_for(&config.app_id, &config.instance_id);
+            if let Err(e) = namespaces::enter_cgroupns(&cgroup_name) {
+                error!("cgroup namespace setup failed: {e:#}");
+                std::process::exit(126);
+            }
+            if let Err(e) = mounts::build_rootfs(&config) {
+                error!("rootfs construction failed: {e:#}");
+                std::process::exit(126);
+            }
             // The second fork: B is the app and is PID 1 of the new
             // pid namespace.
             let app = match unsafe { fork() } {
@@ -112,23 +150,20 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     if let Err(e) = (|| -> Result<()> {
                         namespaces::enter_ipcns()?;
                         namespaces::enter_utsns(&hostname)?;
-                        namespaces::enter_cgroupns(&namespaces::cgroup_name_for(
-                            &config.app_id,
-                            &config.instance_id,
-                        ))?;
                         if config.network == namespaces::NetworkMode::None {
                             namespaces::enter_netns()?;
                         }
+                        // The fresh procfs must be mounted by B, the
+                        // member of the new pid ns, so the view is
+                        // namespaced (the app is PID 1).
+                        mounts::mount_namespaced()?;
                         userns::verify_locked(&creds)
                     })() {
                         error!("sandbox setup failed: {e:#}");
                         std::process::exit(126);
                     }
-                    // (Phase 3 slot: rootfs construction; we hold the
-                    //  full ns capability set — the map, not a drop,
-                    //  locks the identity)
                     // (Phase 4 slot: nono landlock + seccomp, then exec)
-                    exec_app(command);
+                    exec_app(command, &config.profile.env);
                 }
                 ForkResult::Parent { child } => {
                     // Reap B and exit with B's status: exit codes and
@@ -171,20 +206,31 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     log::warn!("cleaning up the sub-cgroup {sub_cgroup} failed: {e}");
                 }
             }
+            // Best-effort removal of the rootfs scratch (its mounts
+            // died with the children's mount ns; the directory
+            // itself is a plain host directory).
+            let scratch = format!("{runtime_dir}/.rootfs-scratch");
+            if let Err(e) = std::fs::remove_dir_all(&scratch) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("cleaning up the rootfs scratch {scratch} failed: {e}");
+                }
+            }
             Ok(code)
         }
     }
 }
 
-/// Replace this (child) process with `command`. Never returns on
-/// success; on failure the error is logged and the child exits with
-/// 126.
-fn exec_app(command: &[OsString]) -> ! {
+/// Replace this (child) process with `command`, adding the profile's
+/// environment variables on top of the session environment. Never
+/// returns on success; on failure the error is logged and the child
+/// exits with 126.
+fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, String>) -> ! {
     let (program, args) = command
         .split_first()
         .expect("command is non-empty (checked in run_sandboxed)");
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
+    cmd.envs(env);
     // On success exec(3) never returns: this process is replaced. The
     // returned error means the exec itself failed (bad path,
     // permissions, …).

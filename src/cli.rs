@@ -51,6 +51,13 @@ pub(crate) struct RunArgs {
         default_value = "shared"
     )]
     pub(crate) network: String,
+    /// Force GPU access (`/dev/dri` is built in the sandbox) even if
+    /// the app profile disables it
+    #[arg(long, overrides_with = "no_gpu")]
+    pub(crate) gpu: bool,
+    /// Skip the GPU even if the app profile enables it
+    #[arg(long, overrides_with = "gpu")]
+    pub(crate) no_gpu: bool,
     /// Command and its arguments, run inside the sandbox
     /// (everything after `--`; e.g. `wlsctx run -- /bin/sh -c 'id'`)
     #[arg(trailing_var_arg = true, required = true)]

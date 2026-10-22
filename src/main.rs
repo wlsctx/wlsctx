@@ -32,6 +32,21 @@ fn main() -> Result<()> {
         // `run`: exec the command inside the sandbox and exit with
         // its exit code.
         Command::Run(args) => {
+            // The app profile (TOML file, then built-in, then the
+            // ad-hoc default — a malformed file is a hard error).
+            let profile = match profile::load(&args.app_id)? {
+                Some(p) => p,
+                None => profile::Profile::adhoc(),
+            };
+            // The final GPU decision: explicit flags win over the
+            // profile.
+            let gpu = if args.gpu {
+                true
+            } else if args.no_gpu {
+                false
+            } else {
+                profile.gpu
+            };
             let config = sandbox::SandboxConfig {
                 app_id: args.app_id,
                 instance_id: args.instance_id,
@@ -39,6 +54,8 @@ fn main() -> Result<()> {
                     "none" => sandbox::namespaces::NetworkMode::None,
                     _ => sandbox::namespaces::NetworkMode::Shared,
                 },
+                profile,
+                gpu,
             };
             let code = sandbox::run_sandboxed(&args.command, &config)?;
             info!("Sandboxed command exited with {code}");
