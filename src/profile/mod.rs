@@ -41,6 +41,15 @@ pub(crate) struct Profile {
     /// Environment variables added for the app (on top of the
     /// session environment).
     pub env: BTreeMap<String, String>,
+    /// AF_UNIX socket paths the app may use, on top of the
+    /// per-instance dir (the tagged wayland socket — Phase 5).
+    pub unix_sockets: Vec<String>,
+    /// IPC mode: `"shm"` (POSIX shared memory only; the default) or
+    /// `"full"` (also semaphores).
+    pub ipc: String,
+    /// Signal mode: `"isolated"` (the default — the app may only
+    /// signal itself and its descendants; Landlock V6) or `"all"`.
+    pub signals: String,
 }
 
 impl Default for Profile {
@@ -52,6 +61,9 @@ impl Default for Profile {
             rw_binds: Vec::new(),
             mask: Vec::new(),
             env: BTreeMap::new(),
+            unix_sockets: Vec::new(),
+            ipc: "shm".to_string(),
+            signals: "isolated".to_string(),
         }
     }
 }

@@ -12,6 +12,7 @@
 
 pub(crate) mod mounts;
 pub(crate) mod namespaces;
+pub(crate) mod policy;
 pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
