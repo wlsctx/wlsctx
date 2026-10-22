@@ -1,7 +1,0 @@
-(block wlsctx
-    (blockinherit container)
-    (allow process user_tmp_t ( dir ( getattr ioctl lock open read search )))
-    (allow process user_tmp_t ( file ( getattr ioctl lock open read )))
-    (allow process user_tmp_t ( sock_file ( getattr open read write )))
-    (allow process unconfined_t (unix_stream_socket (connectto)))
-)
