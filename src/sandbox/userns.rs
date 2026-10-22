@@ -221,6 +221,7 @@ fn assert_eperm(what: &str, call: impl FnOnce() -> i32) -> Result<()> {
     Ok(())
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,44 +229,121 @@ mod tests {
     use nix::sys::wait::{waitpid, WaitStatus};
     use nix::unistd::ForkResult;
     use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
 
-    /// Run `body` in a forked child whose stdout is redirected to a
-    /// pipe, and return (exit code, captured output). The child's
-    /// exit code is what `body` returns (101 on panic).
+    /// One raw `write(2)` to `fd` (short writes are allowed — the
+    /// `writeln!`/`write_all` machinery retries).
+    fn raw_write(fd: i32, buf: &[u8]) -> io::Result<usize> {
+        // SAFETY: `fd` is a valid, open file descriptor; `buf` is valid
+        // for its length.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    /// The child's output channel: **unbuffered** writers straight to
+    /// the pipe fds. The body must use this (and `o.err()`) instead
+    /// of `println!`/`eprintln!`: Rust's global stdout is a buffered
+    /// `LineWriter` whose buffer is silently dropped by
+    /// `process::exit` — a final line ending in `'\n'` never reaches
+    /// the pipe (that was the fork+pipe "0 bytes" bug).
+    struct ChildOut {
+        out_fd: i32,
+        err_fd: i32,
+    }
+
+    impl ChildOut {
+        /// A writer for the child's *stderr* pipe (diagnostics).
+        fn err(&mut self) -> ErrWriter<'_> {
+            ErrWriter {
+                fd: self.err_fd,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    }
+
+    /// An unbuffered writer to the child's stderr pipe.
+    struct ErrWriter<'a> {
+        fd: i32,
+        _marker: std::marker::PhantomData<&'a ()>,
+    }
+
+    impl Write for ErrWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            raw_write(self.fd, buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for ChildOut {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            raw_write(self.out_fd, buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `body` in a forked child and return (exit code, stdout,
+    /// stderr). The child's exit code is what `body` returns (101 on
+    /// panic); its output is what `body` wrote to `ChildOut`.
+    ///
+    /// fd 1/2 are also dup'd to the same pipes, so an exec'd
+    /// grandchild (the `run_sandboxed` test) and raw panic messages
+    /// still land in the capture.
     ///
     /// Returns (None, ..) if the harness itself fails.
     ///
     /// NOTE: forking a multithreaded test process is only safe here
     /// because the child never blocks on a lock another test thread
-    /// could hold (it only does file I/O, prints, and exits); if you
+    /// could hold (it only does file I/O, writes, and exits); if you
     /// ever see a hang, re-run with `-- --test-threads=1`.
-    fn run_in_child(body: impl FnOnce() -> i32 + Send) -> (Option<i32>, String) {
-        let mut fds: [i32; 2] = [-1; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    fn run_in_child(body: impl FnOnce(&mut ChildOut) -> i32 + Send) -> (Option<i32>, String, String) {
+        let mut fds: [i32; 4] = [-1; 4];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(fds.as_mut_ptr().add(2)) } != 0
+        {
             eprintln!("test setup: pipe(2): {}", io::Error::last_os_error());
-            return (None, String::new());
+            return (None, String::new(), String::new());
         }
-        let (r, w) = (fds[0], fds[1]);
+        let (r_out, w_out, r_err, w_err) = (fds[0], fds[1], fds[2], fds[3]);
 
         // SAFETY: fork(2); the child below only exits, never returns.
         match unsafe { nix::unistd::fork() } {
             Ok(ForkResult::Child) => {
-                unsafe { libc::close(r) };
-                // Redirect stdout to the pipe, saving the original in
-                // case the redirect itself fails.
-                let saved = unsafe { libc::dup(1) };
-                if saved < 0 || unsafe { libc::dup2(w, 1) } < 0 {
-                    eprintln!("test setup: redirecting stdout failed");
+                unsafe { libc::close(r_out) };
+                unsafe { libc::close(r_err) };
+                // Point fd 1/2 at the pipes (for exec'd grandchildren
+                // and panic messages); save the originals in case the
+                // redirect fails.
+                let saved_out = unsafe { libc::dup(1) };
+                let saved_err = unsafe { libc::dup(2) };
+                if saved_out < 0
+                    || saved_err < 0
+                    || unsafe { libc::dup2(w_out, 1) } < 0
+                    || unsafe { libc::dup2(w_err, 2) } < 0
+                {
+                    eprintln!("test setup: redirecting stdout/stderr failed");
                     std::process::exit(126);
                 }
-                unsafe { libc::close(w) };
-                let code = body();
+                let code = body(&mut ChildOut { out_fd: w_out, err_fd: w_err });
+                // Close the write ends explicitly (fd 1/2 share the
+                // same pipe; `exit` closes everything regardless) so
+                // the parent's read reaches EOF.
+                unsafe { libc::close(w_out) };
+                unsafe { libc::close(w_err) };
                 std::process::exit(code);
             }
             Ok(ForkResult::Parent { child }) => {
-                unsafe { libc::close(w) };
+                unsafe { libc::close(w_out) };
+                unsafe { libc::close(w_err) };
                 // Wait first (all writes are then complete), then
-                // drain the pipe to EOF.
+                // drain the pipes to EOF.
                 let code = match waitpid(Some(child), None) {
                     Ok(WaitStatus::Exited(_, code)) => Some(code),
                     Ok(WaitStatus::Signaled(_, sig, _)) => Some(128 + sig as i32),
@@ -279,19 +357,19 @@ mod tests {
                     }
                 };
                 let mut out = String::new();
-                {
-                    use std::os::fd::FromRawFd;
-                    // SAFETY: `r` is ours at this point (the child
-                    // closed its copy before exiting).
-                    let mut file = unsafe { std::fs::File::from_raw_fd(r) };
-                    use std::io::Read;
-                    let _ = file.read_to_string(&mut out);
-                }
-                (code, out)
+                let mut err = String::new();
+                // SAFETY: `r_out`/`r_err` are ours at this point (the
+                // child closed its copies before exiting); the
+                // `File`s close them again on drop.
+                let mut f_out = unsafe { std::fs::File::from_raw_fd(r_out) };
+                let mut f_err = unsafe { std::fs::File::from_raw_fd(r_err) };
+                let _ = f_out.read_to_string(&mut out);
+                let _ = f_err.read_to_string(&mut err);
+                (code, out, err)
             }
             Err(e) => {
                 eprintln!("test setup: fork(2): {e}");
-                (None, String::new())
+                (None, String::new(), String::new())
             }
         }
     }
@@ -319,10 +397,10 @@ mod tests {
             }
         };
 
-        let (code, out) = run_in_child(move || {
+        let (code, out, _err) = run_in_child(move |o| {
             // 1. Enter: unshare + setgroups + the single map write.
             if let Err(e) = enter_userns(&creds) {
-                println!("SETUP-FAIL enter_userns: {e:#}");
+                let _ = writeln!(o, "SETUP-FAIL enter_userns: {e:#}");
                 return 1;
             }
 
@@ -330,25 +408,25 @@ mod tests {
             let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
             let (want0, wantself) = both_entries(&creds);
             if !map.contains(&want0) || !map.contains(&wantself) {
-                println!("FAIL uid_map is {map:?}; want entries {want0:?} and {wantself:?}");
+                let _ = writeln!(o, "FAIL uid_map is {map:?}; want entries {want0:?} and {wantself:?}");
                 return 2;
             }
 
             let setgroups =
                 std::fs::read_to_string("/proc/self/setgroups").unwrap_or_default();
             if setgroups.trim() != "deny" {
-                println!("FAIL setgroups is {setgroups:?}; want \"deny\"");
+                let _ = writeln!(o, "FAIL setgroups is {setgroups:?}; want \"deny\"");
                 return 3;
             }
 
             // As ns-root we hold the full ns capability set.
             match cap_eff() {
                 Err(e) => {
-                    println!("FAIL reading CapEff: {e:#}");
+                    let _ = writeln!(o, "FAIL reading CapEff: {e:#}");
                     return 4;
                 }
                 Ok(0) => {
-                    println!("FAIL CapEff is 0 before the drop; expected the full ns set as ns-root");
+                    let _ = writeln!(o, "FAIL CapEff is 0 before the drop; expected the full ns set as ns-root");
                     return 4;
                 }
                 Ok(_) => {}
@@ -356,13 +434,14 @@ mod tests {
 
             // 2. Drop to the real uid (mount phase is empty in phase 1).
             if let Err(e) = drop_ns_root(&creds) {
-                println!("SETUP-FAIL drop_ns_root: {e:#}");
+                let _ = writeln!(o, "SETUP-FAIL drop_ns_root: {e:#}");
                 return 5;
             }
 
             // 3. The result: locked at the real uid, no capabilities,
             //    0 unreachable.
-            println!(
+            let _ = writeln!(
+                o,
                 "OK: uid locked at {} / gid {} (CapEff cleared, setresuid(0) rejected with EPERM)",
                 creds.uid, creds.gid
             );
@@ -375,13 +454,13 @@ mod tests {
             // the mapping (e.g. we ourselves are in a nested user
             // namespace, as in the dev container): skip, don't fail.
             Some(1) => {
-                eprintln!("skipping (environment cannot create the mapping):\n{out}");
+                eprintln!("skipping (environment cannot create the mapping):\n{out}\n{_err}");
                 return;
             }
-            Some(other) => panic!("credential sequence failed (exit {other}):\n{out}"),
+            Some(other) => panic!("credential sequence failed (exit {other}):\n{out}\n{_err}"),
             None => panic!("test harness failed"),
         }
-        assert!(out.contains("OK: uid locked"), "expected an OK line; got:\n{out}");
+        assert!(out.contains("OK: uid locked"), "expected an OK line; got:\n{out}\n{_err}");
     }
 
     /// Decision #9 probe: the kernel permits exactly one successful
@@ -399,9 +478,9 @@ mod tests {
             }
         };
 
-        let (code, out) = run_in_child(move || {
+        let (code, out, _err) = run_in_child(move |o| {
             if let Err(e) = enter_userns(&creds) {
-                println!("SETUP-FAIL enter_userns: {e:#}");
+                let _ = writeln!(o, "SETUP-FAIL enter_userns: {e:#}");
                 return 1;
             }
 
@@ -417,7 +496,7 @@ mod tests {
             ] {
                 match write_map_file("/proc/self/uid_map", &contents) {
                     Ok(()) => {
-                        println!("FAIL: the second write ({label}) was ACCEPTED — write-once is not in effect on this kernel");
+                        let _ = writeln!(o, "FAIL: the second write ({label}) was ACCEPTED — write-once is not in effect on this kernel");
                         return 10;
                     }
                     Err(e) => {
@@ -426,7 +505,7 @@ mod tests {
                             .any(|c| c.downcast_ref::<io::Error>()
                                 .is_some_and(|io| io.raw_os_error() == Some(libc::EPERM)));
                         if !epem {
-                            println!("FAIL: second write ({label}) failed with {e:#}; expected EPERM");
+                            let _ = writeln!(o, "FAIL: second write ({label}) failed with {e:#}; expected EPERM");
                             return 11;
                         }
                     }
@@ -437,24 +516,24 @@ mod tests {
             let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
             let (want0, wantself) = both_entries(&creds);
             if !map.contains(&want0) || !map.contains(&wantself) {
-                println!("FAIL: the map changed after the rejected writes: {map:?}");
+                let _ = writeln!(o, "FAIL: the map changed after the rejected writes: {map:?}");
                 return 12;
             }
 
-            println!("OK: write-once holds (second writes rejected with EPERM, map unchanged)");
+            let _ = writeln!(o, "OK: write-once holds (second writes rejected with EPERM, map unchanged)");
             0
         });
 
         match code {
             Some(0) => {}
             Some(1) => {
-                eprintln!("skipping (environment cannot create the mapping):\n{out}");
+                eprintln!("skipping (environment cannot create the mapping):\n{out}\n{_err}");
                 return;
             }
-            Some(other) => panic!("write-once probe failed (exit {other}):\n{out}"),
+            Some(other) => panic!("write-once probe failed (exit {other}):\n{out}\n{_err}"),
             None => panic!("test harness failed"),
         }
-        assert!(out.contains("OK: write-once holds"), "expected an OK line; got:\n{out}");
+        assert!(out.contains("OK: write-once holds"), "expected an OK line; got:\n{out}\n{_err}");
     }
 
     /// End-to-end for phase 1: `wlsctx run -- id` executes the command
@@ -472,7 +551,7 @@ mod tests {
         // The outer fork+pipe captures the *grandchild* (the
         // sandboxed `id`) stdout: the intermediate child only runs
         // run_sandboxed and exits.
-        let (code, out) = run_in_child(move || {
+        let (code, out, err) = run_in_child(move |o| {
             match run_sandboxed(&[OsString::from("id")]) {
                 Ok(126) => {
                     // The sandbox setup failed inside the grandchild
@@ -480,12 +559,12 @@ mod tests {
                     // create the mapping.
                     1
                 }
-                Ok(code) => {
-                    eprintln!("run_sandboxed exited with {code}");
+                Ok(c) => {
+                    let _ = writeln!(o.err(), "run_sandboxed exited with {c}");
                     0
                 }
                 Err(e) => {
-                    eprintln!("run_sandboxed error: {e:#}");
+                    let _ = writeln!(o.err(), "run_sandboxed error: {e:#}");
                     2
                 }
             }
@@ -494,15 +573,15 @@ mod tests {
         match code {
             Some(0) => {}
             Some(1) => {
-                eprintln!("skipping: the sandbox could not be set up in this environment (nested user namespace?); the assertions run for real on the target");
+                eprintln!("skipping: the sandbox could not be set up in this environment (nested user namespace?); the assertions run for real on the target\n{err}");
                 return;
             }
-            other => panic!("run_sandboxed harness failed: {other:?}\n{out}"),
+            other => panic!("run_sandboxed harness failed: {other:?}\n{out}\n{err}"),
         }
 
         let want = format!("uid={}(", creds.uid);
-        assert!(out.contains(&want), "expected `{want}` in `id` output; got:\n{out}");
+        assert!(out.contains(&want), "expected `{want}` in `id` output; got:\n{out}\n{err}");
         let want = format!("gid={}(", creds.gid);
-        assert!(out.contains(&want), "expected `{want}` in `id` output; got:\n{out}");
+        assert!(out.contains(&want), "expected `{want}` in `id` output; got:\n{out}\n{err}");
     }
 }
