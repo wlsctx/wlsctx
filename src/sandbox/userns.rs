@@ -225,8 +225,12 @@ fn assert_errno(what: &str, want: i32, call: impl FnOnce() -> i32) -> Result<()>
 }
 
 
+/// The forked-child test harness (`run_in_child` + `ChildOut`) and the
+/// `enter_userns` failure classifier, shared with the `namespaces`
+/// tests (both modules run in a multithreaded cargo-test process and
+/// must never enter namespaces in the parent).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sandbox::run_sandboxed;
     use nix::sys::wait::{waitpid, WaitStatus};
@@ -237,7 +241,7 @@ mod tests {
 
     /// One raw `write(2)` to `fd` (short writes are allowed — the
     /// `writeln!`/`write_all` machinery retries).
-    fn raw_write(fd: i32, buf: &[u8]) -> io::Result<usize> {
+    pub(crate) fn raw_write(fd: i32, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: `fd` is a valid, open file descriptor; `buf` is valid
         // for its length.
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
@@ -253,20 +257,20 @@ mod tests {
     /// `LineWriter` whose buffer is silently dropped by
     /// `process::exit` — a final line ending in `'\n'` never reaches
     /// the pipe (that was the fork+pipe "0 bytes" bug).
-    struct ChildOut {
+    pub(crate) struct ChildOut {
         out_fd: i32,
         err_fd: i32,
     }
 
     impl ChildOut {
         /// A writer for the child's *stderr* pipe (diagnostics).
-        fn err(&mut self) -> ErrWriter<'_> {
+        pub(crate) fn err(&mut self) -> ErrWriter<'_> {
             ErrWriter { fd: self.err_fd, _marker: std::marker::PhantomData }
         }
     }
 
     /// An unbuffered writer to the child's stderr pipe.
-    struct ErrWriter<'a> {
+    pub(crate) struct ErrWriter<'a> {
         fd: i32,
         _marker: std::marker::PhantomData<&'a ()>,
     }
@@ -303,7 +307,9 @@ mod tests {
     /// because the child never blocks on a lock another test thread
     /// could hold (it only does file I/O, writes, and exits); if you
     /// ever see a hang, re-run with `-- --test-threads=1`.
-    fn run_in_child(body: impl FnOnce(&mut ChildOut) -> i32 + Send) -> (Option<i32>, String, String) {
+    pub(crate) fn run_in_child(
+        body: impl FnOnce(&mut ChildOut) -> i32 + Send,
+    ) -> (Option<i32>, String, String) {
         let mut fds: [i32; 4] = [-1; 4];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0
             || unsafe { libc::pipe(fds.as_mut_ptr().add(2)) } != 0
@@ -375,7 +381,7 @@ mod tests {
     }
 
     /// Fetch the credentials or abort the test.
-    fn creds() -> Result<Credentials> {
+    pub(crate) fn creds() -> Result<Credentials> {
         Credentials::current()
     }
 
@@ -397,7 +403,7 @@ mod tests {
     /// exit 1 = the environment cannot create the namespace at all
     /// (skip); exit 20 = the namespace was created but the kernel
     /// rejected our map (hard fail — the design is broken here).
-    fn enter_or_classify(o: &mut ChildOut, creds: &Credentials) -> i32 {
+    pub(crate) fn enter_or_classify(o: &mut ChildOut, creds: &Credentials) -> i32 {
         match enter_userns(creds) {
             Ok(()) => 0,
             Err(e) => {
