@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.2 — decision #10 (single-extent map) confirmed on kernel 7.2.11-300.fc45; Phase 1 done; Phase 2 in progress** (2026-10-22)
+Status: **v2.3 — Phase 2 done (mount/pid/ipc/uts/cgroup/net; decisions #12–#17); Phase 3 (rootfs) next** (2026-10-22)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -149,16 +149,18 @@ root-in-ns behaviour.
 
 ### 3.2 Remaining namespaces (order after the mount phase)
 
-- **PID ns** — the child `fork()`s once more, so the app is **PID 1** of
-  the new pidns; when it dies the kernel tears the namespace down and its
-  children die with it (no orphans). `wlsctx` stays outside the pidns and
-  sees the app as a normal child for signalling/reaping.
+- **PID ns** — the intermediate fork A unshares the pidns, then forks
+  once more: the app (B) is **PID 1**. A stays in the *parent* pidns,
+  reaps B, and exits with B's status — the teardown we actually rely on
+  (7.2's zap is a no-op for surviving members, #13/#14). `wlsctx` stays
+  outside both and sees A as a normal child for signalling/reaping.
 - **IPC ns** — fresh (private System V + shm view).
 - **UTS ns** — `sethostname("wlsctx-<app>-<instance>")`.
-- **Cgroup ns** — unshared while the child is still in the *unit/scope
-  cgroup* (inherited from us), then the child moves itself into the
-  `app` sub-cgroup (visible inside the ns as `/app`), so
-  `/proc/self/cgroup` shows a clean stable path. See §4.
+- **Cgroup ns** — the child's full cgroup path is captured *before*
+  unsharing (the cgroup2 fs is not re-rooted on 7.2, #12); after
+  unshare it `mkdir`s the instance sub-cgroup at that full path and
+  moves in, so `/proc/self/cgroup` shows the clean relative path.
+  The supervisor rmdirs it on exit. See §4.
 - **Network ns** — per-app mode, decided in §5 (default: *shared* host
   netns + nono filtering; `--network=none` = bare new netns).
 
@@ -251,6 +253,12 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 9 | `uid_map` write-once | **Confirmed.** Modern kernels permit exactly one write to `uid_map`/`gid_map` (verified in the v7.2 stable source and current master). The original design (single write of `0 self` + `self self`) turned out to be invalid — superseded by #10, which keeps write-once but makes the map a single extent. |
 | 10 | Map shape: single extent | **`<self> <self> 1`** (one extent, uid and gid). Kernel constraints: write-once (#9); an unprivileged creator may only write one extent of count 1 equal to its own uid/gid (`new_idmap_permitted()` fast path); two extents sharing a parent id are rejected by `mappings_overlap()` — so the two-entry `0 self; self self` map is EINVAL (bwrap uses the setuid `newuidmap` helper for more; we don't). Consequences: the identity is the real uid from the start, 0 is unmapped (`setresuid(0)` is EINVAL), the full ns cap set is held at exec — safe by construction of the map (§3.1) — and locked by nono in Phase 4. Subuid range for file ownership deferred (needs a setuid helper). Verified on 7.2.11-300.fc45; §3.1 rewritten; Phase 1 done. |
 | 11 | Target release | **Fedora 45** (machine upgraded; running 7.2.11-300.fc45). Kernel series 7.x; Landlock ABI ≥ v4 and unprivileged userns — verified on this machine (Phase 1.4). |
+| 12 | Cgroup ns view on 7.2 | The **cgroup2 filesystem is not re-rooted** by the cgroup ns — only `/proc/*/cgroup` is namespaced. So the child captures its full cgroup path *before* unshare, unshares, then `mkdir`s the instance sub-cgroup at that full path and moves in via `cgroup.procs`. The supervisor `rmdir`s the empty sub-cgroup when the instance dies (best-effort). `/proc/self/cgroup` inside shows the clean relative path. |
+| 13 | pidns-init is unkillable | The first process of a pidns carries `SIGNAL_UNKILLABLE`: default-action signals are ignored, *except* SIGKILL/SIGSTOP from an ancestor pidns. Our app **is** pidns-init, so the shutdown protocol (Phase 5.4) is **SIGTERM, then SIGKILL fallback** — never wait for a TERM. |
+| 14 | pidns teardown on 7.2 | When the ns leader exits, `zap_pid_ns_processes()` **does run** (`disable_pid_allocation()` proven), but on 7.2.11 the SIGKILL to surviving members is empirically a **no-op** — strays reparent, they don't die. We therefore don't rely on it: A (ns leader, in the *parent* pidns) reaps B and **exits by choice**, so nothing is left behind; exit codes propagate through A reliably (verified 5/5 for 0/42/137, incl. `128+sig` for signals). |
+| 15 | `/sys/class/net` is global | On 7.2 it lists interfaces of **all** netns (a global sysfs tree) — `unshare --net` still shows the host's. Per-netns verification uses `/proc/net/dev` (per-reader view) and netlink (`ip link`); the network tests do exactly that. |
+| 16 | Mount-ns naming/propagation quirks | The mount-ns symlink is `ns/mnt` (not `ns/mount`); `/proc/self/ns/` also contains `pid_for_children`/`time_for_children` entries. In mountinfo the word `private` is **omitted** (it's the default; only `shared:`/`slave:`/`unbindable:` tokens appear — host `/` shows `shared:1`). "View is private" is therefore asserted by *absence* of propagation tokens, gated on a host precondition that `/` is shared. |
+| 17 | The mount-ENOENT "flake" | **Not a kernel bug.** The mount test passed a non-NUL-terminated Rust `&str` to `mount()`/`umount()`; the kernel over-reads until a NUL, and the byte after the heap buffer is usually zero (worked) but occasionally not (garbage-suffixed path → ENOENT, sticky, invisible to `stat()`, stale dir left behind). v7.2 dcache/namei audited and exonerated (incl. the 98b6cf102b35 negative-dentry fix — a real but different bug). Fixed `6d255d1`. Rule: **every path handed to a C interface is NUL-terminated** (`dir_c` pattern). |
 
 ## 7. Phases & task list
 
@@ -285,17 +293,18 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       full ns cap set is held at exec; a rejected map is a hard test
       fail, not a skip
 ### Phase 2 — Remaining namespaces
-- [ ] 2.1 Mount ns (unshare right after user ns; rootfs build lands in
+- [x] 2.1 Mount ns (unshare right after user ns; rootfs build lands in
       Phase 3 but the unshare slot is here)
-- [ ] 2.2 PID ns: extra fork so the app is PID 1; death semantics
-      (kill app → whole ns gone)
-- [ ] 2.3 IPC ns + UTS ns (hostname `wlsctx-<app>-<instance>`)
-- [ ] 2.4 Cgroup ns: unshare in the unit cgroup, then move child to the
-      `app` sub-cgroup; verify `/proc/self/cgroup` view
-- [ ] 2.5 Network ns per mode (`none` = bare netns + `lo up`)
-- [ ] 2.6 Verify full set against a reference:
-      `bwrap --unshare-user --uid <self> --unshare-pid …` —
-      `mount`/`lsns`/`/proc/self/*` diff
+- [x] 2.2 PID ns: extra fork so the app is PID 1; death semantics
+      (kill app → whole ns gone) — see #14 for the real teardown story
+- [x] 2.3 IPC ns + UTS ns (hostname `wlsctx-<app>-<instance>`)
+- [x] 2.4 Cgroup ns: unshare in the unit cgroup, then move child to the
+      `app` sub-cgroup; verify `/proc/self/cgroup` view — #12 for the
+      7.2 dance
+- [x] 2.5 Network ns per mode (`none` = bare netns + `lo up`)
+- [x] 2.6 Verify full set against a reference
+      (`the_full_ns_set_is_fresh`: all 7 ns kinds fresh, `/proc/self/ns`
+      names incl. the 7.2 quirks of #16)
 
 ### Phase 3 — Rootfs
 - [ ] 3.1 `sandbox/mounts.rs`: the §3.3 table as code: `/dev` tmpfs +
