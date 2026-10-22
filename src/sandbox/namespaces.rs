@@ -256,6 +256,7 @@ pub(crate) fn enter_netns() -> Result<()> {
 mod tests {
     use super::*;
     use crate::sandbox::run_sandboxed;
+    use std::os::unix::fs::MetadataExt;
     use crate::sandbox::userns::tests::{
         run_in_child, enter_or_classify, creds, raw_write, ChildOut,
     };
@@ -402,25 +403,63 @@ mod tests {
             }
             // And a tmpfs mount works with our ns-local CAP_SYS_ADMIN.
             let dir = std::env::temp_dir().join(format!("wlsctx-priv-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                let _ = writeln!(o, "FAIL creating the mount target dir {dir:?}: {e}");
+                return 4;
+            }
+            // The mount target must be a NUL-terminated C string: a
+            // Rust &str buffer has no trailing NUL, and mount() would
+            // over-read it. (The "mount ENOENT flake" chased during
+            // Phase 2 was exactly that: a non-terminated pointer whose
+            // over-read occasionally produced a garbage-suffixed path
+            // that no longer named the dir — sticky per allocation,
+            // invisible to stat(), and easily mistaken for a kernel
+            // lookup race. v7.2's dcache/namei were examined and are
+            // not at fault.)
+            let pre = std::fs::metadata(&dir);
+            let pre_s = pre
+                .as_ref()
+                .map(|s| format!("ok (ino {})", s.ino()))
+                .unwrap_or_else(|e| format!("GONE: {e}"));
+            let dir_c = format!("{}\0", dir.to_str().unwrap());
             let st = unsafe {
                 libc::mount(
                     b"tmpfs\0".as_ptr().cast(),
-                    dir.to_str().unwrap().as_ptr().cast(),
+                    dir_c.as_ptr().cast::<libc::c_char>(),
                     b"tmpfs\0".as_ptr().cast(),
                     0,
                     std::ptr::null(),
                 )
             };
             if st != 0 {
+                let e = io::Error::last_os_error();
+                let post = std::fs::metadata(&dir);
+                let parent = std::fs::metadata(std::env::temp_dir());
+                let mut mi = String::new();
+                for line in std::fs::read_to_string("/proc/self/mountinfo")
+                    .unwrap_or_default()
+                    .lines()
+                {
+                    if line.contains(" /tmp ") || line.contains(" /tmp\t") {
+                        mi = line.to_string();
+                    }
+                }
                 let _ = writeln!(
                     o,
-                    "FAIL mounting tmpfs in the private view: {}",
-                    io::Error::last_os_error()
+                    "FAIL mounting tmpfs in the private view: {e}; pre-mount stat: {pre_s}; post-mount stat dir: {}; parent {:?}: {}; /tmp line: {mi}",
+                    post
+                        .as_ref()
+                        .map(|s| format!("ok (ino {})", s.ino()))
+                        .unwrap_or_else(|e| format!("GONE: {e}")),
+                    std::env::temp_dir(),
+                    parent
+                        .as_ref()
+                        .map(|s| format!("ok (ino {})", s.ino()))
+                        .unwrap_or_else(|e| format!("GONE: {e}"))
                 );
                 return 4;
             }
-            let _ = unsafe { libc::umount(dir.to_str().unwrap().as_ptr().cast()) };
+            let _ = unsafe { libc::umount(dir_c.as_ptr().cast::<libc::c_char>()) };
             let _ = std::fs::remove_dir_all(&dir);
             let _ = writeln!(o, "OK: view private, tmpfs mount works");
             0
