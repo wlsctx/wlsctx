@@ -7,7 +7,6 @@
 //! re-runs it after the forks — the value itself is not shared).
 
 use anyhow::{bail, Context, Result};
-use nono::Sandbox;
 use nono::capability::{
     AccessMode, CapabilitySet, IpcMode, SignalMode, UnixSocketMode,
 };
@@ -107,16 +106,30 @@ pub(crate) fn capability_set(
     Ok(caps)
 }
 
-/// Apply the policy in this (child) process: the combined
-/// seccomp-notify filter **first** (decision #22: one NEW_LISTENER
-/// per thread; the filter must precede landlock so the supervisor
-/// sees paths Landlock would block), then the Landlock floor
-/// (which also sets `no_new_privs`, locking the single-extent
-/// identity — #10, #22).
+/// Apply the policy in this (child) process. Three stages, in this
+/// order (decision #22 — the notify filter must be the *only*
+/// NEW_LISTENER filter, and it must precede the Landlock floor so
+/// the supervisor sees every path the floor would block):
+///
+/// 1. **Prepare** the Landlock policy (`detect_abi` +
+///    `prepare_landlock_with_abi`): the rule paths are opened here,
+///    *before* the filter exists. If this ran after the filter, its
+///    `openat`(O_PATH) calls would be trapped and B would block on
+///    its own install, with no supervisor yet holding the listener.
+/// 2. **Install** the combined seccomp-notify filter (it sets
+///    `no_new_privs` itself).
+/// 3. **`apply_raw`**: builds the ruleset from the pre-opened fds
+///    (no path opens — nothing left to trap), re-asserts
+///    `no_new_privs` (locking the single-extent identity — #10) and
+///    `restrict_self` — the irreversible floor.
 ///
 /// Returns the notify listener fd. It has no CLOEXEC flag, so it
 /// survives the app's exec (the supervisor services it — #23).
 pub(crate) fn apply(caps: &CapabilitySet) -> Result<OwnedFd> {
+    let abi = nono::sandbox::detect_abi()
+        .map_err(|e| anyhow::anyhow!("detecting the Landlock ABI: {e}"))?;
+    let prepared = nono::sandbox::prepare_landlock_with_abi(caps, &abi)
+        .map_err(|e| anyhow::anyhow!("preparing the Landlock policy: {e}"))?;
     let notify = nono::sandbox::prepare_seccomp_af_unix_filter()
         .with_openat_notifications()
         .install_raw()
@@ -127,7 +140,14 @@ pub(crate) fn apply(caps: &CapabilitySet) -> Result<OwnedFd> {
                 std::io::Error::from_raw_os_error(e.errno())
             )
         })?;
-    let notify = unsafe { OwnedFd::from_raw_fd(notify) };
-    Sandbox::apply_landlock(caps).context("applying the landlock policy")?;
-    Ok(notify)
+    prepared
+        .apply_raw()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "applying the Landlock floor failed at {:?} ({})",
+                e.stage(),
+                std::io::Error::from_raw_os_error(e.errno())
+            )
+        })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(notify) })
 }

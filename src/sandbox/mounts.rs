@@ -5,9 +5,9 @@
 //! The order matters:
 //!
 //! 1. **Before** `/` becomes read-only, copy out what must survive
-//!    it: the standard `/dev` node files and the `/sys` subpaths we
-//!    keep, bound into a scratch dir under the per-instance runtime
-//!    dir.
+//!    it: the standard `/dev` node files, the `/sys` subpaths we
+//!    keep, and the per-instance runtime dir itself, bound into a
+//!    scratch dir on `/var/tmp` (outside every masked tree).
 //! 2. The one-shot recursive self-bind of `/` (`MS_BIND|MS_REC` —
 //!    verified unprivileged on 7.2.11). Everything below layers over
 //!    it. The `MS_RDONLY` that the §3.3 table once called for is
@@ -55,6 +55,20 @@ const DEV_NODES: [&str; 6] = ["null", "zero", "full", "urandom", "random", "tty"
 /// (`$XDG_RUNTIME_DIR/wlsctx/<app>-<inst>`): home of the tagged
 /// Wayland socket (Phase 5), of the build scratch, and the dir that
 /// the app sees as its own runtime dir (bound into the fresh `/run`).
+/// The rootfs scratch dir on the **host**: a per-instance directory
+/// on `/var/tmp`, outside `/dev`, `/sys`, `/run` and `/tmp` — the
+/// four trees the build replaces — so every bind source and target
+/// in it stays resolvable through the whole build.
+///
+/// It is not part of the capability set: the Landlock floor (and the
+/// supervisor, for the syscalls the filter traps) keeps the app out
+/// of it, and its contents are binds of things the app already sees
+/// via `/dev` and `/sys` anyway. `S` removes it on exit.
+pub(crate) fn rootfs_scratch_dir(cfg: &SandboxConfig) -> String {
+    let inst = namespaces::cgroup_name_for(&cfg.app_id, &cfg.instance_id);
+    format!("/var/tmp/.wlsctx/{inst}")
+}
+
 pub(crate) fn instance_runtime_dir(cfg: &SandboxConfig) -> String {
     let uid = nix::unistd::getuid().as_raw();
     let xdg = std::env::var("XDG_RUNTIME_DIR")
@@ -183,20 +197,31 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     let host_runtime = instance_runtime_dir(cfg);
     let inst_name = namespaces::cgroup_name_for(&cfg.app_id, &cfg.instance_id);
 
-    // 1) Scratch: carry out of the tree that is about to become
-    //    read-only what must survive it. (The scratch sits under the
-    //    host's per-instance runtime dir; the fresh `/run` in step 5
-    //    hides it from the app, and the supervisor removes it on
-    //    exit.)
-    let scratch = format!("{host_runtime}/.rootfs-scratch");
+    // 1) Scratch: carry out of the tree what must survive the masks.
+    //    It lives on `/var/tmp` — a plain rootfs directory outside
+    //    `/dev`, `/sys`, `/run` and `/tmp`, the four trees this
+    //    build replaces — because the scratch must stay resolvable
+    //    through every step, including step 5's fresh `/run` (which
+    //    masks the per-instance runtime dir itself: for the default
+    //    `XDG_RUNTIME_DIR=/run/user/<uid>` a scratch inside that
+    //    dir would be unresolvable after the mask). Not being in the
+    //    capability set, the Landlock floor keeps the app out of it;
+    //    `S` removes it on exit.
+    let scratch = rootfs_scratch_dir(cfg);
     for d in [
         format!("{scratch}/dev"),
         format!("{scratch}/sys/devices"),
         format!("{scratch}/sys/class"),
+        format!("{scratch}/runtime"),
     ] {
         std::fs::create_dir_all(&d)
             .with_context(|| format!("creating the scratch dir {d}"))?;
     }
+    // Other users must not walk the scratch on the host: it carries
+    // the per-instance runtime dir (future home of the tagged
+    // Wayland socket).
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting the mode of {scratch}"))?;
     for n in DEV_NODES {
         let src = format!("/dev/{n}");
         if !Path::new(&src).exists() {
@@ -211,6 +236,12 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     }
     mount("/sys/devices", &format!("{scratch}/sys/devices"), "none", libc::MS_BIND, "")?;
     mount("/sys/class", &format!("{scratch}/sys/class"), "none", libc::MS_BIND, "")?;
+    // The per-instance runtime dir, carried the same way: for the
+    // default XDG location it sits under `/run`, which the fresh
+    // `/run` tmpfs of step 5 masks — a bind source resolved there
+    // would silently hit the fresh tmpfs's empty stand-in directory
+    // (a self-bind no-op that never crosses to the host).
+    mount(&host_runtime, &format!("{scratch}/runtime"), "none", libc::MS_BIND, "")?;
 
     // 2) A new layer over the whole tree (one-shot recursive
     //    self-bind — verified unprivileged on 7.2.11). Not ro:
@@ -280,7 +311,11 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     // 5) /run: a fresh tmpfs with **only** the per-instance dir. The
     //    host's Wayland sockets sit directly under $XDG_RUNTIME_DIR
     //    and are deliberately invisible here — the app may reach only
-    //    the tagged socket (Phase 5), never the host's.
+    //    the tagged socket (Phase 5), never the host's. The
+    //    instance dir's *content* arrives from the step-1 carry
+    //    (`scratch/runtime`): its own host path is masked by this
+    //    very mount, so binding it directly here would be a
+    //    self-bind onto the fresh tmpfs's empty stand-in.
     mount("none", "/run", "tmpfs", 0, "mode=755")?;
     std::fs::create_dir("/run/user").context("creating /run/user")?;
     let user_dir = format!("/run/user/{uid}");
@@ -289,7 +324,7 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
         .with_context(|| format!("setting the mode of {user_dir}"))?;
     let inst_dir = format!("{user_dir}/wlsctx/{inst_name}");
     std::fs::create_dir_all(&inst_dir).with_context(|| format!("creating {inst_dir}"))?;
-    mount(&host_runtime, &inst_dir, "none", libc::MS_BIND, "")?;
+    mount(&format!("{scratch}/runtime"), &inst_dir, "none", libc::MS_BIND, "")?;
 
     // 6) /tmp: a fresh tmpfs sized by the profile.
     let data = if prof.tmp_size_mib == 0 {

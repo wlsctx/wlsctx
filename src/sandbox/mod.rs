@@ -7,18 +7,22 @@
 //! namespaces ([namespaces]) and the double-fork in [run_sandboxed]
 //! that makes the app PID 1 of a fresh pid namespace. Phase 3: the
 //! private rootfs ([mounts]) and the per-app profiles
-//! (`crate::profile`). Phase 4 (nono landlock + seccomp) still to
-//! come.
+//! (`crate::profile`). Phase 4: the Landlock floor and the
+//! supervisor-meditated seccomp-notify filter ([policy], [supervise]).
 
 pub(crate) mod mounts;
 pub(crate) mod namespaces;
 pub(crate) mod policy;
+pub(crate) mod supervise;
 pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::error;
+use std::os::fd::AsRawFd;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, fork};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 
@@ -101,6 +105,30 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("creating the per-instance runtime dir {runtime_dir}"))?;
 
+    // The supervisor handoff channels, created before the first fork so
+    // both S and A (and, down to B) inherit them (decisions #23, #26):
+    //   * `pipe` — B→A: B writes the notify listener's *fd number* here.
+    //   * `sock` — S↔A: A `pidfd_getfd`s B's listener into its own table
+    //     and `SCM_RIGHTS`es it to S over this socketpair.
+    //   * `ack` — A→B: A's handoff verdict (`1` = exec, `0` = die); B
+    //     blocks on it before execing, which makes the handoff
+    //     deterministic (the listener is `O_CLOEXEC` in B's table, and
+    //     `pidfd_getfd` on B only works pre-exec — decision #26).
+    // The raw fd numbers are identical in S and A after the fork; each
+    // process closes the ends it does not use and leaks the ones it keeps
+    // (`supervise::leak`), so an `OwnedFd` drop never closes a shared end.
+    let (pipe_read, pipe_write) = supervise::create_pipe().context("creating the B→A pipe")?;
+    let (sock_a, sock_s) =
+        supervise::create_socketpair().context("creating the S↔A socketpair")?;
+    let (ack_read, ack_write) =
+        supervise::create_pipe().context("creating the A→B verdict pipe")?;
+    let pr = supervise::leak(pipe_read);
+    let pw = supervise::leak(pipe_write);
+    let sa = supervise::leak(sock_a);
+    let ss = supervise::leak(sock_s);
+    let ar = supervise::leak(ack_read);
+    let aw = supervise::leak(ack_write);
+
     // SAFETY: fork(2) from a single-threaded point in the process
     // lifecycle; the parent only handles `child` below.
     match unsafe { fork() }.context("forking the sandbox child")? {
@@ -108,6 +136,23 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
         // the user/mount/pid namespaces we claim below; on success we
         // never return (we exit with the app's status).
         ForkResult::Child => {
+            // A keeps the B→A pipe (read end `pr`, write end `pw` until
+            // the second fork), the A→S socketpair end `sa`, the A→B
+            // verdict pipe write end `aw`, and — until the second
+            // fork — the verdict pipe read end `ar` too: B is the
+            // verdict's reader and must *inherit* it, so A closes its
+            // copy only *after* the fork (mirroring `pw`). A never
+            // uses S's socketpair end, so close that now (before
+            // forking B, so B does not inherit it).
+            unsafe { libc::close(ss) };
+            log::debug!(
+                "A[{}]: arm=A (kept pr={} pw={} sa={} aw={})",
+                std::process::id(),
+                pr,
+                pw,
+                sa,
+                aw
+            );
             if let Err(e) = userns::enter_userns(&creds) {
                 error!("user namespace setup failed: {e:#}");
                 std::process::exit(126);
@@ -146,8 +191,22 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             };
             match app {
                 ForkResult::Child => {
-                    // B: the app. The remaining namespaces, the
-                    // credential check, and the exec.
+                    // B: the app. It keeps only the B→A pipe write end
+                    // (`pw`) and the A→B verdict read end (`ar`); the
+                    // other ends are closed now so none reaches the
+                    // exec'd app (decisions #23, #26).
+                    unsafe { libc::close(pr) };
+                    unsafe { libc::close(sa) };
+                    unsafe { libc::close(aw) };
+                    log::debug!(
+                        "B[{}]: arm=B (kept pw={} ar={})",
+                        std::process::id(),
+                        pw,
+                        ar
+                    );
+                    // The remaining namespaces, the credential check,
+                    // and — Phase 4 — the combined seccomp-notify filter
+                    // plus the Landlock floor, then the exec.
                     if let Err(e) = (|| -> Result<()> {
                         namespaces::enter_ipcns()?;
                         namespaces::enter_utsns(&hostname)?;
@@ -158,15 +217,117 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         // member of the new pid ns, so the view is
                         // namespaced (the app is PID 1).
                         mounts::mount_namespaced()?;
-                        userns::verify_locked(&creds)
+                        userns::verify_locked(&creds)?;
+                        // Phase 4: build the single capability set that
+                        // drives both floors, install the combined
+                        // filter first, then the Landlock floor (the
+                        // filter must precede Landlock — decision #22).
+                        let caps = policy::capability_set(&config, std::path::Path::new(&runtime_dir))
+                            .context("building the app's capability set")?;
+                        let notify = policy::apply(&caps)
+                            .context("installing the seccomp-notify filter + Landlock floor")?;
+                        // Hand the listener up to the supervisor
+                        // (decision #23): B's own `sendmsg` is trapped,
+                        // so it cannot `SCM_RIGHTS` the fd — write its
+                        // *number* to the B→A pipe instead; A (B's
+                        // parent) extracts it via `pidfd_getfd` and
+                        // forwards it to S.
+                        supervise::write_fdnum(pw, notify.as_raw_fd())
+                            .context("handing the listener fd number to A")?;
+                        unsafe { libc::close(pw) };
+                        // Deterministic handoff (decision #26): the
+                        // listener is `O_CLOEXEC` in our table, and
+                        // A's `pidfd_getfd` on us succeeds only while
+                        // we are the still-dumpable *pre-exec* process
+                        // — so we must not start the exec until A has
+                        // extracted the listener and handed it to S.
+                        // If the verdict is a failure, exec is futile
+                        // anyway (every openat the dynamic loader
+                        // makes would be answered `ENOSYS`), so exit.
+                        match supervise::wait_ack(ar, 10_000) {
+                            Ok(1) => {
+                                unsafe { libc::close(ar) };
+                                // Close our copy; S's (the one it
+                                // services) is the only one left.
+                                drop(notify);
+                                Ok(())
+                            }
+                            _ => bail!("the supervisor handoff did not complete; refusing to exec an unsupervised process"),
+                        }
                     })() {
                         error!("sandbox setup failed: {e:#}");
                         std::process::exit(126);
                     }
-                    // (Phase 4 slot: nono landlock + seccomp, then exec)
                     exec_app(command, &config.profile.env);
                 }
                 ForkResult::Parent { child } => {
+                    // A is done with the B→A pipe's write end (B holds
+                    // the only writer now). Read the listener's fd
+                    // number B wrote, complete the handoff
+                    // (decision #23) — as B's direct parent, the one
+                    // process Yama `restricted` lets `pidfd_getfd` B,
+                    // extract a copy of B's listener into our own
+                    // table and `SCM_RIGHTS` it to S — and send B the
+                    // verdict (decision #26): this runs while B is
+                    // still pre-exec (blocked in `wait_ack`), so the
+                    // extract cannot race the exec. On failure we
+                    // tell B to die: the Landlock floor B installed
+                    // still holds, and we just reap and propagate B's
+                    // status.
+                    //
+                    // Drop our copy of the verdict read end now that B
+                    // has it: B becomes the pipe's only reader, and B
+                    // closes it after the verdict (or at exit).
+                    unsafe { libc::close(ar) };
+                    // Ignore SIGPIPE: on the failure path our verdict
+                    // write below can hit a pipe whose reader (B) is
+                    // already gone, which would otherwise kill us
+                    // before we reap B and corrupt B's exit status. B
+                    // (and the app it execs) already inherited the
+                    // default disposition from the fork above.
+                    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+                    log::debug!(
+                        "A[{}]: arm=A2, B pid {} (kept pr={} sa={} aw={}); waiting for the fd number",
+                        std::process::id(),
+                        child.as_raw(),
+                        pr,
+                        sa,
+                        aw
+                    );
+                    let handed_off = match supervise::read_fdnum(pr) {
+                        Ok(Some(num)) => {
+                            let ok = match supervise::extract_and_send(child.as_raw(), num, sa) {
+                                Ok(listener) => {
+                                    drop(listener);
+                                    true
+                                }
+                                Err(e) => {
+                                    log::debug!("A: listener handoff failed: {e:#}");
+                                    false
+                                }
+                            };
+                            let _ = supervise::send_ack(aw, if ok { 1 } else { 0 });
+                            ok
+                        }
+                        Ok(None) => {
+                            // B died before writing (setup failure):
+                            // tell it not to exec — the write may hit
+                            // a closed pipe, which is exactly the point.
+                            let _ = supervise::send_ack(aw, 0);
+                            false
+                        }
+                        Err(e) => {
+                            log::debug!("A: reading the listener fd number failed: {e:#}");
+                            let _ = supervise::send_ack(aw, 0);
+                            false
+                        }
+                    };
+                    unsafe { libc::close(pr) };
+                    unsafe { libc::close(aw) };
+                    unsafe { libc::close(sa) };
+                    if !handed_off {
+                        log::debug!("A: no supervisor (handoff failed; B will not exec)");
+                    }
                     // Reap B and exit with B's status: exit codes and
                     // 128+signal propagate reliably through this fork
                     // (probed in Phase 2). The kernel does not kill us
@@ -186,7 +347,61 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             }
         }
         ForkResult::Parent { child } => {
-            // S (us): reap A, which carries B's status.
+            // S (us): the supervisor. We keep only the S↔A socketpair
+            // end (`ss`); the B→A pipe, the A→S end, and both ends of
+            // the verdict pipe are ours to drop here (decisions
+            // #23, #26). `ss` receives the notify listener from A
+            // (blocking; A sends it once B has handed up the fd
+            // number, or A exits early and `ss` sees EOF).
+            unsafe { libc::close(pr) };
+            unsafe { libc::close(pw) };
+            unsafe { libc::close(sa) };
+            unsafe { libc::close(ar) };
+            unsafe { libc::close(aw) };
+            log::debug!(
+                "S[{}]: arm=S (kept ss={}); waiting for the listener",
+                std::process::id(),
+                ss
+            );
+
+            // The supervisor runs on a side thread so this one can
+            // block in `waitpid` for A. It services B's trapped
+            // syscalls; S itself never installs the filter.
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut supervisor: Option<std::thread::JoinHandle<()>> = None;
+            match supervise::recv_fd(ss) {
+                Ok(Some(notify)) => {
+                    unsafe { libc::close(ss) };
+                    log::debug!("S[{}]: got the listener (fd {})", std::process::id(), notify.as_raw_fd());
+                    match policy::capability_set(&config, std::path::Path::new(&runtime_dir)) {
+                        Ok(caps) => {
+                            let stop2 = Arc::clone(&stop);
+                            supervisor = Some(std::thread::spawn(move || {
+                                supervise::supervisor(notify, caps, stop2)
+                            }));
+                        }
+                        Err(e) => {
+                            // Mediation needs the same capability set
+                            // that built the floor; without it we
+                            // cannot decide, so disable the supervisor
+                            // (the Landlock floor B installed still
+                            // holds). `notify` closes here.
+                            log::warn!(
+                                "supervisor: capability set unavailable ({e:#}); supervisor disabled"
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    // EOF (B died before the handoff) or a recv error:
+                    // nothing to supervise; the floor still holds in
+                    // whatever B ran.
+                    unsafe { libc::close(ss) };
+                    log::debug!("S: no supervisor (handoff did not complete)");
+                }
+            }
+
+            // Reap A, which carries B's status.
             let code =
                 match waitpid(Some(child), None).context("waiting for the sandbox child")? {
                     WaitStatus::Exited(_, code) => code,
@@ -198,6 +413,12 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         ))
                     }
                 };
+            // The app (and A) are gone: tell the supervisor to stop and
+            // join it (it exits within one poll tick).
+            stop.store(true, Ordering::Relaxed);
+            if let Some(t) = supervisor {
+                let _ = t.join();
+            }
             // Best-effort cleanup of the per-instance sub-cgroup: the
             // app is dead, so it is empty (a parallel instance sharing
             // the name may still hold it — that just makes the rmdir
@@ -209,12 +430,17 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             }
             // Best-effort removal of the rootfs scratch (its mounts
             // died with the children's mount ns; the directory
-            // itself is a plain host directory).
-            let scratch = format!("{runtime_dir}/.rootfs-scratch");
+            // itself is a plain host directory on /var/tmp).
+            let scratch = mounts::rootfs_scratch_dir(&config);
             if let Err(e) = std::fs::remove_dir_all(&scratch) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     log::warn!("cleaning up the rootfs scratch {scratch} failed: {e}");
                 }
+            }
+            // The scratch's parent may be left empty (a sibling
+            // instance still running makes this ENOTEMPTY — ignored).
+            if let Some(parent) = std::path::Path::new(&scratch).parent() {
+                let _ = std::fs::remove_dir(parent);
             }
             Ok(code)
         }
