@@ -53,3 +53,13 @@ changes** (README.md is stale pending its phase-8 rewrite).
   the crate source is the reference.
 - This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
   each phase committed and working; the README rewrite is phase 8.
+
+## Commit conventions
+
+- Small commits, one per meaningful change, committed as you go.
+- Subject: `<emoji> <type>: <summary>` — a conventional type prefix
+  (`feat:`, `fix:`, `chore:`, `docs:`, …) and a summary under 72 chars.
+  The single emoji is chosen per change to capture what actually changed;
+  there is no fixed set of allowed emojis.
+- End the message with an `Assisted-by: <agent>:<model>` trailer (no
+  "generated with" line).
