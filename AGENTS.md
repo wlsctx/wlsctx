@@ -20,7 +20,9 @@ changes** (README.md is stale pending its phase-8 rewrite).
   (`wp_security_context_v1`), `signals` (signalfd loop)
 - `src/sandbox/` — the in-process sandbox: `userns`, `namespaces`
   (mount/pid/cgroup/ipc/uts/net), `mounts` (private rootfs builder),
-  `mod` (S→A→B pipeline, `run_sandboxed`)
+  `policy` (the nono `CapabilitySet` + three-stage apply, #27),
+  `supervise` (notify-fd handoff, verdict pipe, the S-side supervisor
+  loop, #23/#25/#26), `mod` (S→A→B pipeline, `run_sandboxed`)
 - `src/profile/` — per-app TOML profiles (`gpu`, `ro_binds`, `rw_binds`,
   `mask`, `env`; `deny_unknown_fields`)
 - `src/testutil.rs` — shared `#[cfg(test)]` helpers (env locking, TmpDir)
@@ -48,7 +50,12 @@ changes** (README.md is stale pending its phase-8 rewrite).
   `MS_BIND|MS_RDONLY` on those foreign-superblock binds silently drops
   the ro flag and `MS_REMOUNT` is `EPERM` (decision #21) — so ro
   semantics come from the app's real uid plus nono's landlock/seccomp
-  policy (Phase 4), not from mount flags.
+  policy, not from mount flags. The build scratch lives on
+  `/var/tmp/.wlsctx/<inst>` and carries the per-instance runtime dir
+  out from under the fresh-`/run` mask (decision #28). The combined
+  seccomp-notify + Landlock floor is applied three-stage in B pre-exec
+  (decision #27); B blocks on A's verdict before exec (decision #26);
+  S services the listener (auto-deny, decision #25).
 - The cgroup ns is rooted at the instance sub-cgroup, which must be
   created and entered **before** `unshare(CLONE_NEWCGROUP)` (decision
   #20); the app then sees `0::/`.

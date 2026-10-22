@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.4 — Phase 3 done (private rootfs, profiles, GPU; decisions #18–#21); Phase 4 (nono) next** (2026-10-22)
+Status: **v2.5 — Phase 4 done (nono landlock+seccomp, notify-fd handoff, supervisor; decisions #22–#29); Phase 5 (wayland + pipeline) next** (2026-10-22)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -177,7 +177,7 @@ root-in-ns behaviour.
 | `/dev/dri` | bind from host | GPU; user must be in `render` group (same requirement as rootless podman); `--no-gpu` skips |
 | `/proc` | fresh procfs mount | allowed in an unprivileged user ns (namespaced view); verify on target kernel (Phase 2) |
 | `/sys` | fresh tmpfs + binds of `devices/`, `class/` (ro unattainable — #21) | only the sysfs *mount root* is unbindable (#18); these subpaths cover DRM/PCI discovery |
-| `/run` | fresh tmpfs | per-instance dir: tagged wayland socket, supervisor socket, (later) dbus-proxy socket, (optionally) ssh-agent socket |
+| `/run` | fresh tmpfs | per-instance dir: tagged wayland socket, supervisor socket, (later) dbus-proxy socket, (optionally) ssh-agent socket. Its *content* is the host's per-instance runtime dir, **carried into the step-1 scratch before this mask** and bound in from there — binding the host path directly here would silently hit this fresh tmpfs's own empty stand-in dir (#28) |
 | `/tmp` | fresh tmpfs | `size=` from profile |
 | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` | ro-binds | `/etc` as-is; passwd/group map consistently through the uid/gid maps |
 | app dir | ro-bind (e.g. `/opt/rustrover`) | path from the app profile |
@@ -321,23 +321,38 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 ### Phase 4 — nono: landlock + seccomp
 
 **Design** (verified against the nono 0.80.0 source, 2026-10-22):
-- **B, pre-exec:** (1) install the *combined* seccomp-notify filter —
+- **B, pre-exec (three-stage apply, #27):** (1) *prepare* the Landlock
+  policy (`prepare_landlock_with_abi`) — it opens every rule path, so
+  it must run before the filter exists (a filter installed first would
+  trap its own `open(O_PATH)`s → deadlock).
+  (2) install the *combined* seccomp-notify filter —
   `prepare_seccomp_af_unix_filter().with_openat_notifications()`; Linux
   allows one `NEW_LISTENER` filter per thread, so the AF_UNIX mediation
   (traps `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg`) and the openat
   logging (traps `openat`/`openat2`) share one listener (#22).
-  (2) `Sandbox::apply_landlock(&caps)` — the floor: default-deny fs,
-  signal scoping (V6), and `no_new_privs` (locks the single-extent
-  identity, #10). The filter is installed *before* landlock per nono's
-  docs, so blocked paths still reach the supervisor.
-  (3) hand the notify-fd *number* to A over a pre-made B→A pipe
-  (#23). (4) exec (the listener fd has no CLOEXEC — it survives).
+  (3) *apply* the Landlock floor (`apply_raw`) — default-deny fs,
+  signal scoping (V6), `no_new_privs` (locks the single-extent
+  identity, #10); it uses the prepared fds, no new opens.
+  (4) hand the notify-fd *number* to A over a pre-made B→A pipe
+  (#23). (5) block on A's *verdict* over a pre-made A→B pipe —
+  `1` = the listener is in S's hands, exec now; `0` = the handoff
+  failed, exit 126, never an unsupervised exec (#26). The wait is
+  mandatory: the listener is `O_CLOEXEC` in B's table (the kernel
+  allocates it that way) and `pidfd_getfd` on B succeeds only while B
+  is the still-dumpable *pre-exec* process.
 - **A:** reads the number, extracts its own listener fd from B's fd
   table via `pidfd_open`+`pidfd_getfd` (A is B's parent, same uid —
-  ptrace-permitted), sends it to S via `SCM_RIGHTS` over a pre-made
-  S↔A socketpair. Direct SCM_RIGHTS from B is impossible: its
-  `sendmsg` is already trapped (#23). If the handoff fails (B died
-  early) S falls back to a plain `waitpid` — landlock still applies.
+  ptrace-permitted; the pid resolves *globally*, so the host pid
+  returned by `fork()` is the right argument even from inside A's
+  pidns — #29), sends it to S via `SCM_RIGHTS` over a pre-made S↔A
+  socketpair, then sends B the verdict (#26). Close ordering: A drops
+  its copy of the verdict read end only *after* the second fork (B
+  must inherit it), and ignores `SIGPIPE` after the fork — a
+  failure-path verdict can hit a pipe whose reader (B) is already
+  gone, and that must not kill A before it reaps B and propagates B's
+  status. Direct SCM_RIGHTS from B is impossible: its `sendmsg` is
+  already trapped (#23). If the handoff fails (B died early) S falls
+  back to a plain `waitpid` — landlock still applies.
 - **S (the supervisor):** a poll loop over the notify listener and the
   supervisor socket (`SupervisorSocket::pair()`, the
   `CapabilityRequest` channel, auto-deny `ApprovalBackend`). Dispatch by
@@ -360,19 +375,32 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
   shared→AllowAll / none→Blocked, `signals`/`ipc` per profile.
   Built identically in S and B from the same pure function (B inherits
   nothing but re-runs it).
-- **4.1–4.3 checklist**
-- [ ] 4.1 Build `CapabilitySet` from profile: fs paths + modes, unix
+- **4.1–4.4 checklist**
+- [x] 4.1 Build `CapabilitySet` from profile: fs paths + modes, unix
       socket caps (tagged wayland, later dbus/ssh), network mode, signal /
-      process-info / ipc modes
-- [ ] 4.2 Apply after the credential sequence, before `execve` in the
-      child; verify the install path (`apply_auto` vs
-      `prepare_*`/`apply_external` + notify-fd handoff to the supervisor)
-- [ ] 4.3 Supervisor side: hold the seccomp-notify fd, service the
-      supervisor socket with an auto-deny `PolicyApproval`; log denials
-      via nono diagnostics
-- [ ] 4.4 Verify: blocked path → EACCES; allowed path works; network per
-      mode; a normal GUI app *runs* (strace-driven tuning of the static
-      filter if needed)
+      process-info / ipc modes (`policy.rs`; the same pure function runs
+      in S and B)
+- [x] 4.2 Apply after the credential sequence, before `execve` in the
+      child; the install path is nono's three-stage
+      `prepare_landlock_with_abi` → install combined filter →
+      `apply_raw`, plus the notify-fd handoff to the supervisor
+      (#23, #26, #27)
+- [x] 4.3 Supervisor side: hold the seccomp-notify fd (received by
+      `SCM_RIGHTS` from A), a poll loop that mediates
+      openat/openat2 (against the same `CapabilitySet` that built the
+      floor) and the AF_UNIX socket syscalls (granted pathname sockets
+      allowed, abstract/unnamed denied — #25), auto-deny with
+      `EACCES`, denials logged; exits when the notification queue
+      drains (the app died) or on the stop flag
+- [x] 4.4 Verify (the four Phase-4 tests in `supervise::tests`):
+      openat write outside every granted subtree → `EACCES` while the
+      write into the granted instance subtree crosses the bind to the
+      host; read of a base-granted path returns the host file
+      verbatim; `connect` to an ungranted AF_UNIX socket → `EACCES`;
+      `connect` to a socket in the instance subtree is mediated
+      *allow* — the payload reaches the host-side listener. Network-per-
+      mode and "a normal GUI app runs" remain with 5.5 (strace-driven
+      tuning of the filter, if needed, happens there).
 
 ### Phase 5 — Wayland + full pipeline
 - [ ] 5.1 Tagged-socket creation moves ahead of the fork (supervisor side,
@@ -446,3 +474,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 23 | Notify-fd handoff without SCM_RIGHTS from B | B's `sendmsg` is trapped by its own filter, so B cannot hand the listener fd to S via `SCM_RIGHTS` after install. Handoff: B writes the listener's *fd number* to a pre-made B→A pipe; A (unfiltered, B's parent, same uid) does `pidfd_open(B)`+`pidfd_getfd(num)` to take its own copy, then sends it to S over a pre-made S↔A socketpair. All three channels are created in S **before** the first fork and distributed at the forks (A closes the S-side copies, B closes the A-side copies). A dead B (zombie has no fd table) → handoff fails → S falls back to plain `waitpid` (landlock still enforced). |
 | 24 | Landlock needs explicit ancestor grants on Linux | A landlock rule is a default-deny floor: to reach a granted subtree the app also needs refer/traverse on every ancestor. nono's `path_metadata_dirs` (ancestor metadata grants) is macOS-only — on Linux the policy itself must grant `/` Read (and any other ancestor chains). Consistent with the current rootfs: the self-bind of `/` already shows the app every top-level directory, so Read-on-`/` adds no visibility. |
 | 25 | Supervisor decides (auto-deny), never expands | The supervisor's role in Phase 4 is mediation+logging, not expansion: openat/AF_UNIX notifications are answered continue (allowlisted) or EACCES (denied + logged); there is no fd injection, no approval flow. Abstract/unnamed AF_UNIX sockets are denied (nono's default for pathname mediation) — GUI apps that use abstract-socket IPC (e.g. Chromium-style) may need a per-profile relaxation, to be added if Phase 5's E2E hits it. |
+| 26 | Deterministic handoff: the verdict pipe | The seccomp listener is allocated `O_CLOEXEC` in B's table by the kernel (`get_unused_fd_flags(O_CLOEXEC)`, `kernel/seccomp.c`), and `pidfd_getfd` on B succeeds only while B is still dumpable — i.e. *pre-exec* (after exec the credential change fails `task_still_dumpable` → `EPERM`). If B started execing while A was still extracting, the dynamic loader's `openat`s would pile up on the dying listener: `seccomp_notify_free` completes every pending notification with `-ENOSYS` (observed: `Error 38` on `libtinfo.so.6`). Hence B blocks on an A→B **verdict pipe** before exec (`1` = exec, `0` = exit 126 — never an unsupervised exec); A sends it only after the extract + `SCM_RIGHTS` to S have completed. Two close-order invariants: B must *inherit* the verdict read end, so A closes its copy only *after* the second fork (closing it before the fork left B polling a dangling fd number — the "hang" that gdb showed as B-in-poll/A-in-wait4); and A ignores `SIGPIPE` after the fork, because a failure-path verdict can hit a pipe whose reader is already gone and must not kill A before it reaps B. |
+| 27 | nono's three-stage prepare/apply — the filter must never precede landlock's *prepare* | nono's `apply_landlock` calls `open_path_rule` → `open(O_PATH)` for every rule path. Installing the seccomp-notify filter *first* traps those opens: B blocks in a notification wait with no supervisor running yet — a hard deadlock (observed: 300 s timeout, zero output). The working order is nono's own prepare/apply split: `prepare_landlock_with_abi` (opens all rule paths, while unfiltered) → install the combined filter → `apply_raw` (consumes the prepared fds; opens nothing). #22's "the filter must precede landlock" survives as *the filter must precede landlock's **apply***. |
+| 28 | The rootfs scratch lives on `/var/tmp`; the runtime dir is carried before the `/run` mask | The scratch must stay resolvable through every build step, so it cannot sit under any masked tree. The old location (inside the per-instance runtime dir) is under `/run` for the default `XDG_RUNTIME_DIR=/run/user/<uid>` — and a bind *source* resolved after the fresh-`/run` mask hits the fresh tmpfs's empty stand-in directory: a **silent self-bind no-op** that never crosses to the host (writes "succeed" into the throwaway tmpfs; the app-side socket is invisible). New layout: the scratch is `/var/tmp/.wlsctx/<inst>` (mode 0700, not in the capability set; hidden from the app by the `/var` mask of step 8 *and* the Landlock floor), and the per-instance runtime dir is carried into it in step 1 — the only point where its host path is still resolvable — then bound onto the fresh `/run`'s instance dir in step 5. S removes the scratch (and its parent) on exit. |
+| 29 | Raw pidfd syscalls: explicit zero flags; the *host* pid is the right argument | `libc` 0.2 (gnu x86_64) exposes `SYS_pidfd_open`/`SYS_pidfd_getfd` as numbers only, so they are called via `syscall(2)`. The kernel does `if (flags) return -EINVAL` for both, and a short `syscall(2)` call leaves the flags register uninitialised → spurious `EINVAL` (observed on `pidfd_open`). Pass `0` explicitly. Also, `pidfd_open` resolves the pid *globally* (`find_get_pid` → `find_vpid`, the init-namespace hash), so A — inside the fresh pidns — must pass B's **host** pid, which is exactly what `fork()` returns (`clone` returns `pid_vnr` = `level[0].nr`, never the caller-namespace-local pid; B's local pid `1` would be the wrong argument). |
