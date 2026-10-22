@@ -32,12 +32,13 @@ fn main() -> Result<()> {
         // `run`: exec the command inside the sandbox and exit with
         // its exit code.
         Command::Run(args) => {
-            // The per-instance identity/mode become CLI flags next;
-            // until then run the default identity.
             let config = sandbox::SandboxConfig {
-                app_id: "app".to_string(),
-                instance_id: "1".to_string(),
-                network: sandbox::namespaces::NetworkMode::Shared,
+                app_id: args.app_id,
+                instance_id: args.instance_id,
+                network: match args.network.as_str() {
+                    "none" => sandbox::namespaces::NetworkMode::None,
+                    _ => sandbox::namespaces::NetworkMode::Shared,
+                },
             };
             let code = sandbox::run_sandboxed(&args.command, &config)?;
             info!("Sandboxed command exited with {code}");

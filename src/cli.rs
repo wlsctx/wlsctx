@@ -34,6 +34,23 @@ pub(crate) enum Command {
 /// Arguments of `wlsctx run`.
 #[derive(Args, Debug)]
 pub(crate) struct RunArgs {
+    /// Application ID: part of the instance hostname
+    /// (`wlsctx-<app>-<instance>`) and of the per-instance cgroup
+    /// name (only [A-Za-z0-9._-])
+    #[arg(long, default_value = "app")]
+    pub(crate) app_id: String,
+    /// Instance ID: part of the hostname and cgroup name
+    #[arg(long, default_value = "1")]
+    pub(crate) instance_id: String,
+    /// Network mode: `shared` (default — the host netns; nono filters
+    /// it in a later phase) or `none` (a bare netns with only
+    /// loopback, brought up)
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(["shared", "none"]),
+        default_value = "shared"
+    )]
+    pub(crate) network: String,
     /// Command and its arguments, run inside the sandbox
     /// (everything after `--`; e.g. `wlsctx run -- /bin/sh -c 'id'`)
     #[arg(trailing_var_arg = true, required = true)]
@@ -530,6 +547,29 @@ mod tests {
                     std::ffi::OsString::from("--listen"),
                 ]
             );
+        });
+    }
+
+    #[test]
+    fn run_defaults_for_identity_and_network() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from(["wlsctx", "run", "--", "/bin/sh", "-c", "id"])
+                .expect("ad-hoc run must parse with the default identity");
+            let Command::Run(args) = cli.command else {
+                unreachable!();
+            };
+            assert_eq!(args.app_id, "app");
+            assert_eq!(args.instance_id, "1");
+            assert_eq!(args.network, "shared");
+        });
+    }
+
+    #[test]
+    fn run_network_rejects_unknown_modes() {
+        without_wlsctx_env(|| {
+            let err = Cli::try_parse_from(["wlsctx", "run", "--network", "veth", "--", "/bin/sh"])
+                .expect_err("an unknown network mode must be rejected at parse time");
+            assert_eq!(err.kind(), ErrorKind::InvalidValue);
         });
     }
 
