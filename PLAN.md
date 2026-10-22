@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.1 — target changed to Fedora 45; decision #9 (single-write uid_map) pending confirmation** (2026-10-22)
+Status: **v2.1 — target Fedora 45; decision #9 (single-write uid_map) confirmed; Phase 1 in progress** (2026-10-22)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -89,38 +89,42 @@ Checked against the published crate source before writing this plan.
 
 ### 3.1 User namespace + the non-root credential sequence
 
-> **DRAFT — pending decision #9.** Modern kernels only permit a *single*
-> write to the map files, so the two-phase narrowing below is not
-> implementable as written. Proposed replacement: one write of
-> `0 self` + `self self` (the bwrap pattern), `setresuid(self)` after
-> the mount phase (the kernel then clears our ns capabilities), and the
-> leftover `0` entry made harmless because nono's seccomp (Phase 4)
-> auto-denies all of `setuid`/`setgid`/`setresuid`/`setresgid`/
-> `seteuid`/`setegid` — the app can never become ns-0 again.
+Decision #9 (confirmed): modern kernels permit **exactly one write** to
+`uid_map`/`gid_map` (verified in the v7.2 stable source — the target's
+kernel series; no post-hoc narrowing), so the map is written **once,
+before the mount phase**, carrying both entries:
 
-The kernel allows a **second write** to `/proc/self/uid_map` that *narrows*
-the previous mapping (entries may be removed/ranges shrunk; a previously
-mapped range may not be remapped). We exploit this (the same trick bwrap
-uses for non-root `--uid` targets):
+```
+0 → <real uid>          (lets *us* hold CAP_SYS_ADMIN in the ns for
+                          the mount phase)
+<real uid> → <real uid> (keeps the app's identity)
+1 → <subuid range>      (optional profile flag: files owned by
+                          subuid-range owners)
+```
 
-1. **Initial map:** `0 → <real uid>` **and** `<real uid> → <real uid>`
-   (one write; non-injective mappings are legal). The `0` entry exists
-   solely so *we* hold `CAP_SYS_ADMIN` in the user ns for the mount phase.
-   (Optional profile flag: also map the subuid range `100000–165536 →
-   1–65537` for files owned by subuid-range owners.)
-2. **Mount phase** (as ns-root): build the entire rootfs (§3.3), including
-   `devpts` and `/dev/dri`.
-3. **`setresuid(real uid)` / `setresgid(real uid)`** — permitted as
-   ns-root. Inherited supplementary groups are kept (the user's real
-   groups, e.g. `render` — this is what keeps `/dev/dri` accessible; in
-   the ns view both the node's group and our group collapse to the same
+The mapping is non-injective (the real uid appears under two in-ns
+ids); that is legal and is the pattern bwrap uses.
+
+Sequence (in the forked child — wlsctx itself stays outside the ns):
+
+1. `unshare(CLONE_NEWUSER)`; write `setgroups=deny`; **one write** of
+   `uid_map`/`gid_map` (above).
+2. **Mount phase** (as ns-root): the remaining namespaces (§3.2) and
+   the whole rootfs build (§3.3), including `devpts` and `/dev/dri`.
+3. **`setresuid(real uid)` / `setresgid(real uid)`** — the kernel
+   **clears our capability sets** (we are no longer mapped-0).
+   Inherited supplementary groups are kept (the user's real groups,
+   e.g. `render` — this is what keeps `/dev/dri` accessible; in the
+   ns view both the node's group and our group collapse to the same
    unmapped value, so DAC still matches).
-4. **Narrow the map:** rewrite `uid_map`/`gid_map` **without the 0 entry**.
-   From now on no process in this user ns can ever hold `CAP_SYS_ADMIN`
-   again (ns-uid 0 is unmapped; `setresuid(0)` is impossible). Consequence:
-   the app can never unmount, can never mount into a freshly unshared
-   mount ns, and its nested-userns tricks are contained by landlock (it
-   can only ever bind-mount what landlock lets it open).
+4. The `0` entry is now **inert**: an unprivileged `setresuid` may only
+   pick values from the previous ruid/euid/suid, so no process can
+   ever become ns-0 again — it can never unmount, can never mount into
+   a freshly unshared mount ns, and its nested-userns tricks are
+   contained by landlock (it can only ever bind-mount what landlock
+   lets it open). Phase 4's nono filter additionally *denies* the
+   `setuid`/`setgid`/`setres*`/`sete*` syscalls, so the lock holds
+   structurally as well.
 5. **nono apply** (landlock + seccomp), then **`execve()` the app**.
 
 The app sees itself as its real uid (1000) — no root-in-ns behaviour,
@@ -228,7 +232,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 6 | `wlsctx wayland` subcommand | Keep (already tested; no unit file in repo anymore) |
 | 7 | Cleanup | Delete `docker-bake.hcl`, `systemd/`, `selinux/` (done this round). **`Dockerfile` still to decide** — it only existed to build the container image; propose deleting it in favour of a plain static build recipe. |
 | 8 | systemd integration | In-process D-Bus `StartTransientUnit` scope + raw-cgroup fallback (§4) |
-| 9 | `uid_map` write-once | **Proposed, awaiting confirmation.** Decision 2's two-phase map-narrowing is not supported by modern kernels (write-once; verified in v7.2 source). Replace with a single `0 self` + `self self` write; `setresuid(self)` drops ns caps; nono seccomp locks the uid (denies setuid/setgid/setres*/sete*) so the `0` entry is inert. §3.1 to be rewritten accordingly. |
+| 9 | `uid_map` write-once | **Confirmed.** Modern kernels permit exactly one write to `uid_map`/`gid_map` (verified in the v7.2 stable source and current master), so decision 2's two-phase narrowing is not implementable. Design: single write of `0 self` + `self self` (+ optional subuid range); after the mount phase `setresuid(self)` clears our ns capabilities, and an unprivileged `setresuid` can only pick previous ruid/euid/suid values — so the `0` entry is inert; nono's seccomp (Phase 4) denies the setuid/setgid/setres*/sete* family on top. §3.1 rewritten accordingly. |
 | 10 | Target release | **Fedora 45** (release imminent; machine upgrade in progress). Kernel series 7.x; Landlock ABI ≥ v4 and unprivileged userns expected — Phase 1.4 verifies on the upgraded machine. |
 
 ## 7. Phases & task list
@@ -247,14 +251,17 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 
 ### Phase 1 — User namespace, non-root mapping
 - [ ] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`; `setgroups=deny`;
-      initial `uid_map`/`gid_map` with `0→self` **and** `self→self`
-      (subuid range behind a profile flag)
-- [ ] 1.2 Credential sequence: finish mounts → `setresuid/gid(self)` →
-      rewrite maps without 0 → assert we can no longer `setresuid(0)`
-- [ ] 1.3 `wlsctx run -- <cmd>` ad-hoc path to observe results
-- [ ] 1.4 Verify: `id` inside shows the real uid; `lsns`; kernel's
-      unprivileged-userns enabled; the map-narrowing rule behaves as
-      documented (write a test for it)
+      **single write** of `uid_map`/`gid_map` with `0→self` **and**
+      `self→self` (subuid range behind a profile flag) — decision #9
+- [ ] 1.2 Credential sequence: after the (currently empty) mount phase
+      → `setresuid/gid(self)` → assert CapEff==0 and `setresuid(0)`
+      fails (the `0` entry is inert; decision #9)
+- [ ] 1.3 `wlsctx run -- <cmd>` ad-hoc path to observe results (CLI
+      becomes a subcommand tree: `run`, `wayland`)
+- [ ] 1.4 Verify: `id` inside shows the real uid; `lsns`; unprivileged
+      userns enabled; **write-once probe**: a second write to
+      `uid_map` is rejected and the map is unchanged (the kernel
+      constraint decision #9 relies on)
 
 ### Phase 2 — Remaining namespaces
 - [ ] 2.1 Mount ns (unshare right after user ns; rootfs build lands in

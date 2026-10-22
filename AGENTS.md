@@ -32,12 +32,12 @@ changes** (README.md is stale pending its phase-8 rewrite).
   `nono`) — see PLAN.md.
 - The app runs as its **real uid (non-root)** inside the user namespace.
   The `uid_map` maps both `0` (so the mount phase holds CAP_SYS_ADMIN)
-  and the real uid (so the app keeps its identity). Modern kernels
-  allow **exactly one write** to the map files — there is no
-  post-hoc narrowing (PLAN decision #9, pending confirmation).
-  Whatever the final design, the `0` entry must be kept inert:
-  nono's seccomp denies `setuid`/`setgid`/`setres*`/`sete*` so the app
-  can never become ns-0 again (PLAN §3.1).
+  and the real uid (so the app keeps its identity) and is written
+  **exactly once** — modern kernels do not allow a second write
+  (PLAN decision #9). The `0` entry is then inert: after
+  `setresuid(self)` the kernel clears our ns capabilities (an
+  unprivileged `setresuid` cannot reach 0), and nono's seccomp denies
+  `setuid`/`setgid`/`setres*`/`sete*` on top (PLAN §3.1).
 - The app only sees the **tagged** Wayland socket, never the host
   socket; the reference pipe ("close" fd) must stay open for the
   process lifetime (ownership note in `wayland/context.rs`).
