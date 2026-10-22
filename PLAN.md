@@ -250,17 +250,19 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       drop `keyring`), `toml`, `serde`
 
 ### Phase 1 — User namespace, non-root mapping
-- [ ] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`; `setgroups=deny`;
+- [x] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`; `setgroups=deny`;
       **single write** of `uid_map`/`gid_map` with `0→self` **and**
       `self→self` (subuid range behind a profile flag) — decision #9
-- [ ] 1.2 Credential sequence: after the (currently empty) mount phase
+- [x] 1.2 Credential sequence: after the (currently empty) mount phase
       → `setresuid/gid(self)` → assert CapEff==0 and `setresuid(0)`
       fails (the `0` entry is inert; decision #9)
-- [ ] 1.3 `wlsctx run -- <cmd>` ad-hoc path to observe results (CLI
+- [x] 1.3 `wlsctx run -- <cmd>` ad-hoc path to observe results (CLI
       becomes a subcommand tree: `run`, `wayland`)
-- [ ] 1.4 Verify: `id` inside shows the real uid; `lsns`; unprivileged
-      userns enabled; **write-once probe**: a second write to
-      `uid_map` is rejected and the map is unchanged (the kernel
+- [ ] 1.4 Verify **on the target/VM** (the tests exist and auto-skip
+      in nested-userns environments such as the dev container):
+      `id` inside shows the real uid; `lsns`; unprivileged userns
+      enabled; **write-once probe**: a second write to `uid_map` is
+      rejected with EPERM and the map is unchanged (the kernel
       constraint decision #9 relies on)
 
 ### Phase 2 — Remaining namespaces

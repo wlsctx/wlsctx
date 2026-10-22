@@ -1,9 +1,11 @@
-//! wlsctx — give a Wayland socket an attached security context so the
-//! compositor can identify sandboxed clients.
+//! wlsctx — run commands inside an in-process namespaced sandbox
+//! (`run`), or give a Wayland socket an attached security context so
+//! the compositor can identify sandboxed clients (`wayland`, the
+//! original single-purpose mode).
 //!
-//! For now this is the original single-purpose mode (the future
-//! `wlsctx wayland` subcommand); the rework (PLAN.md) turns this into a
-//! subcommand-based CLI with the in-process sandbox.
+//! The rework (PLAN.md) makes this a subcommand-based CLI: the
+//! in-process sandbox (namespaces, private rootfs, landlock+seccomp
+//! via `nono`) is created by this binary itself, no containers.
 
 mod cli;
 mod profile;
@@ -16,7 +18,7 @@ use clap::Parser;
 use env_logger::Env;
 use log::{Level, info, log_enabled, warn};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command, WaylandArgs};
 use crate::wayland::context::create_security_context;
 use crate::wayland::listener::obtain_listener;
 use crate::wayland::signals::run_signal_loop;
@@ -25,8 +27,26 @@ fn main() -> Result<()> {
     let env = Env::default().default_filter_or("warn");
     env_logger::init_from_env(env);
     let cli = Cli::parse();
-    let (app_id, instance_id, listener) = obtain_listener(&cli)?;
-    let sandbox_engine = cli.sandbox_engine;
+
+    match cli.command {
+        // `run`: exec the command inside the sandbox and exit with
+        // its exit code.
+        Command::Run(args) => {
+            let code = sandbox::run_sandboxed(&args.command)?;
+            info!("Sandboxed command exited with {code}");
+            std::process::exit(code);
+        }
+        Command::Wayland(args) => run_wayland(&args)?,
+    }
+
+    Ok(())
+}
+
+/// The original single-purpose mode (the `wlsctx wayland`
+/// subcommand): create the tagged socket and hold it until shutdown.
+fn run_wayland(args: &WaylandArgs) -> Result<()> {
+    let (app_id, instance_id, listener) = obtain_listener(args)?;
+    let sandbox_engine = args.sandbox_engine.clone();
 
     if log_enabled!(Level::Info)
         && let Ok(local_addr) = listener.local_addr()

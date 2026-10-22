@@ -2,7 +2,7 @@
 //! (LISTEN_FDS) or a self-bound socket, refusing to steal a socket
 //! that a live process still serves.
 
-use crate::cli::Cli;
+use crate::cli::WaylandArgs;
 use anyhow::{Context, Result, bail};
 use log::{error, info, warn};
 use std::fs;
@@ -15,10 +15,10 @@ use std::path;
 /// Get the Unix listener to tag, either from a systemd socket activation
 /// or by binding the socket ourselves (refusing to steal a socket that a
 /// live process still serves). Returns (app_id, instance_id, listener).
-pub fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
-    let app_id = cli.app_id.clone();
-    let instance_id = cli.instance_id.clone();
-    if cli.socket_activation {
+pub fn obtain_listener(args: &WaylandArgs) -> Result<(String, String, UnixListener)> {
+    let app_id = args.app_id.clone();
+    let instance_id = args.instance_id.clone();
+    if args.socket_activation {
         // The IDs come from --app-id/--instance-id (or the
         // WLSCTX_APP_ID / WLSCTX_INSTANCE_ID environment variables). They
         // used to be derived from the fd name, but that only worked for
@@ -55,7 +55,7 @@ pub fn obtain_listener(cli: &Cli) -> Result<(String, String, UnixListener)> {
             ),
         }
     } else {
-        let socket_path = cli.listen.as_ref().ok_or_else(|| {
+        let socket_path = args.listen.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "--listen is required when --socket-activation is not set \
                  (or set WLSCTX_SOCKET_PATH)"
@@ -133,8 +133,8 @@ mod tests {
     use crate::testutil::{LISTEN_FD_LOCK, TmpDir, xdg_runtime_dir, with_env};
     use std::os::fd::{AsRawFd, OwnedFd};
 
-    fn test_cli_listen(listen: &str) -> Cli {
-        Cli {
+    fn test_wayland_listen(listen: &str) -> WaylandArgs {
+        WaylandArgs {
             app_id: "rustrover".into(),
             instance_id: "work".into(),
             sandbox_engine: "podman".into(),
@@ -143,8 +143,8 @@ mod tests {
         }
     }
 
-    fn test_cli_socket_activation() -> Cli {
-        Cli {
+    fn test_wayland_socket_activation() -> WaylandArgs {
+        WaylandArgs {
             app_id: "rustrover".into(),
             instance_id: "work".into(),
             sandbox_engine: "podman".into(),
@@ -225,7 +225,7 @@ mod tests {
         let dir = TmpDir::new("listen-abs");
         let sock = dir.path().join("wayland-1");
         with_env(&[("XDG_RUNTIME_DIR", None)], || {
-            let (_, _, listener) = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+            let (_, _, listener) = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
                 .expect("absolute path must bind");
             assert!(sock.exists());
             assert_eq!(socket_path(&listener), Some(sock));
@@ -241,7 +241,7 @@ mod tests {
         let dir = TmpDir::new("listen-perm");
         let sock = dir.path().join("wayland-1");
         with_env(&[("XDG_RUNTIME_DIR", None)], || {
-            let _ = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+            let _ = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
                 .expect("absolute path must bind");
             let mode = fs::metadata(&sock)
                 .expect("socket exists")
@@ -262,7 +262,7 @@ mod tests {
         leave_stale_socket(stale);
         assert!(sock.exists());
 
-        let (_, _, listener) = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+        let (_, _, listener) = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
             .expect("stale socket replaced");
         // Binding over an existing path fails with EADDRINUSE, so a
         // successful bind proves the old file was removed first.
@@ -279,7 +279,7 @@ mod tests {
         let dir = TmpDir::new("listen-live");
         let sock = dir.path().join("wayland-1");
         let _live = UnixListener::bind(&sock).expect("creating the live socket");
-        let err = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+        let err = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
             .expect_err("a live listener must be left alone");
         let msg = format!("{err:#}");
         assert!(msg.contains("live process"), "{msg}");
@@ -291,7 +291,7 @@ mod tests {
         let dir = TmpDir::new("listen-file");
         let sock = dir.path().join("wayland-1");
         fs::write(&sock, "not a socket").unwrap();
-        let err = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+        let err = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
             .expect_err("a non-socket file must be rejected");
         assert!(
             format!("{err:#}").contains("not a socket"),
@@ -305,7 +305,7 @@ mod tests {
         let dir = TmpDir::new("listen-dir");
         let sock = dir.path().join("wayland-1");
         fs::create_dir(&sock).unwrap();
-        let err = obtain_listener(&test_cli_listen(sock.to_str().unwrap()))
+        let err = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
             .expect_err("a directory must be rejected");
         assert!(
             format!("{err:#}").contains("not a socket"),
@@ -322,7 +322,7 @@ mod tests {
         with_env(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
             || {
-                let err = obtain_listener(&test_cli_listen("")).expect_err("empty path must fail");
+                let err = obtain_listener(&test_wayland_listen("")).expect_err("empty path must fail");
                 assert!(
                     format!("{err:#}").contains("not a socket"),
                     "clear error expected, got: {err:#}"
@@ -341,7 +341,7 @@ mod tests {
             &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
             || {
                 let expected = runtime.path().join("wlsctx/work/wayland-1");
-                let (_, _, listener) = obtain_listener(&test_cli_listen("wlsctx/work/wayland-1"))
+                let (_, _, listener) = obtain_listener(&test_wayland_listen("wlsctx/work/wayland-1"))
                     .expect("relative path must land in the runtime dir");
                 assert_eq!(socket_path(&listener), Some(expected));
                 assert!(runtime.path().join("wlsctx/work").is_dir());
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn listen_relative_path_without_xdg_runtime_dir_fails() {
         with_env(&[("XDG_RUNTIME_DIR", None)], || {
-            let err = obtain_listener(&test_cli_listen("wayland-1"))
+            let err = obtain_listener(&test_wayland_listen("wayland-1"))
                 .expect_err("no runtime dir, no relative placement");
             assert!(
                 format!("{err:#}").contains("XDG_RUNTIME_DIR"),
@@ -366,7 +366,7 @@ mod tests {
         // The XDG spec treats a relative XDG_RUNTIME_DIR as unset; the
         // xdg crate does, and so does the error.
         with_env(&[("XDG_RUNTIME_DIR", Some("relative-run-dir"))], || {
-            let err = obtain_listener(&test_cli_listen("wayland-1"))
+            let err = obtain_listener(&test_wayland_listen("wayland-1"))
                 .expect_err("a relative runtime dir is not a runtime dir");
             assert!(
                 format!("{err:#}").contains("XDG_RUNTIME_DIR"),
@@ -383,7 +383,7 @@ mod tests {
         with_env(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
             || {
-                let err = obtain_listener(&test_cli_listen("wayland-1"))
+                let err = obtain_listener(&test_wayland_listen("wayland-1"))
                     .expect_err("0755 is not a secure runtime dir");
                 assert!(
                     format!("{err:#}").contains("0o700"),
@@ -403,7 +403,7 @@ mod tests {
         with_env(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
             || {
-                let err = obtain_listener(&test_cli_listen(&long_name))
+                let err = obtain_listener(&test_wayland_listen(&long_name))
                     .expect_err("overlong path must fail at bind");
                 assert!(
                     format!("{err:#}").contains("binding"),
@@ -425,7 +425,7 @@ mod tests {
                 ("LISTEN_FDNAMES", None),
             ],
             || {
-                let err = obtain_listener(&test_cli_socket_activation())
+                let err = obtain_listener(&test_wayland_socket_activation())
                     .expect_err("nothing was passed, nothing to tag");
                 assert!(
                     format!("{err:#}")
@@ -449,7 +449,7 @@ mod tests {
                 ("LISTEN_FDNAMES", None),
             ],
             || {
-                let err = obtain_listener(&test_cli_socket_activation())
+                let err = obtain_listener(&test_wayland_socket_activation())
                     .expect_err("a pid mismatch must not adopt a foreign fd");
                 assert!(
                     format!("{err:#}")
@@ -496,7 +496,7 @@ mod tests {
                 ("LISTEN_FDNAMES", Some("a:b")), // 2 names, 1 fd
             ],
             || {
-                let err = obtain_listener(&test_cli_socket_activation())
+                let err = obtain_listener(&test_wayland_socket_activation())
                     .expect_err("fdname count mismatch must fail before any fd is adopted");
                 assert!(
                     format!("{err:#}")
@@ -557,7 +557,7 @@ mod tests {
                 ("LISTEN_FDNAMES", Some("a:b")),
             ],
             || {
-                let err = obtain_listener(&test_cli_socket_activation())
+                let err = obtain_listener(&test_wayland_socket_activation())
                     .expect_err("more than one fd must be rejected");
                 let msg = format!("{err:#}");
                 assert!(msg.contains("tags exactly one"), "{msg}");
@@ -596,7 +596,7 @@ mod tests {
             ],
             || {
                 let (app_id, instance_id, listener) =
-                    obtain_listener(&test_cli_socket_activation())
+                    obtain_listener(&test_wayland_socket_activation())
                         .expect("the passed fd must be adopted");
                 assert_eq!(app_id, "rustrover");
                 assert_eq!(instance_id, "work");
