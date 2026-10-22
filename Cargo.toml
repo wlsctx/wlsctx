@@ -7,12 +7,19 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 env_logger = "0.11.11"
-log = "0.4.34"
-nix = { version = "0.31.3", features = ["signal", "process"] }
-sd-notify = "0.5.0"
 # Direct dependency (not just transitive): the bounded roundtrip polls
 # the upstream Wayland socket with poll(2) against a deadline.
 libc = "0.2"
+log = "0.4.34"
+nix = { version = "0.31.3", features = ["signal", "process"] }
+# Landlock + seccomp confinement for the sandboxed app (PLAN.md phase 4).
+# default-features off: drops the system-keyring integration, which the
+# sandbox does not use.
+nono = { version = "0.80.0", default-features = false }
+sd-notify = "0.5.0"
+# App-profile serialization (PLAN.md phase 3).
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 xdg = "3.0.0"

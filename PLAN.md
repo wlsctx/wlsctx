@@ -231,7 +231,8 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 - [x] 0.3 Restructure `src/` into a binary crate with modules:
       `cli.rs`, `wayland/{mod,listener,context,signals}.rs` (move current
       code + all its tests, no behaviour change), `sandbox/`, `profile/`
-- [ ] 0.4 Add deps: `nono` (pinned), `toml`, `serde`
+- [x] 0.4 Add deps: `nono` (pinned at 0.80.0, default-features off to
+      drop `keyring`), `toml`, `serde`
 
 ### Phase 1 — User namespace, non-root mapping
 - [ ] 1.1 `sandbox/userns.rs`: fork + `CLONE_NEWUSER`; `setgroups=deny`;
