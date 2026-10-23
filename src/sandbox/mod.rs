@@ -111,9 +111,10 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     // process down on a default-action SIGTERM before the forwarder
     // could service it. Blocked here, the three signals stay pending
     // on every thread of the process; the forwarder (S branch,
-    // below) routes each to the app (decision #33). A, forked later,
-    // unblocks them again so the app keeps its historical (unblocked)
-    // behavior.
+    // below) routes each to the app (decision #33). A keeps the
+    // block (it must survive a group-wide signal until it has
+    // reaped B); B unblocks before exec, so the app keeps its
+    // historical (unblocked) behavior.
     let mut fwd_mask = nix::sys::signal::SigSet::empty();
     for sig in [
         nix::sys::signal::Signal::SIGTERM,
@@ -269,17 +270,14 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 sa,
                 aw
             );
-            // The app keeps its historical (unblocked) signal
-            // behavior: undo the pre-fork block (inherited from the
-            // supervisor's thread) so B, the app, receives
-            // TERM/INT/HUP normally.
-            if let Some(m) = &fwd_mask {
-                if let Err(e) = m.thread_unblock() {
-                    log::warn!(
-                        "A: unblocking the forwardable signals failed: {e}"
-                    );
-                }
-            }
+            // A *keeps* the pre-fork block on the forwardable
+            // signals: it must survive a group-wide TERM/INT/HUP
+            // (Ctrl-C, `timeout`, systemd's kill) until it has
+            // reaped B — if A died first, S would end the run while
+            // the app is still alive and the supervisor is gone,
+            // and the app's trapped syscalls would all fail,
+            // freezing it on screen (B unblocks them before exec,
+            // below).
             if let Err(e) = userns::enter_userns(&creds) {
                 error!("user namespace setup failed: {e:#}");
                 std::process::exit(126);
@@ -331,6 +329,20 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         pw,
                         ar
                     );
+                    // The app keeps its historical (unblocked)
+                    // signal behavior: undo the inherited pre-fork
+                    // block so the exec'd app receives TERM/INT/HUP
+                    // normally (a handler runs only for unblocked
+                    // signals; B is pid 1 of its own pid namespace,
+                    // so default-action delivery is ignored
+                    // regardless — decision #13).
+                    if let Some(m) = &fwd_mask {
+                        if let Err(e) = m.thread_unblock() {
+                            log::warn!(
+                                "B: unblocking the forwardable signals failed: {e}"
+                            );
+                        }
+                    }
                     // The remaining namespaces, the credential check,
                     // and — Phase 4 — the combined seccomp-notify filter
                     // plus the Landlock floor, then the exec.
