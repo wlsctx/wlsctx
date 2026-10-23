@@ -2750,6 +2750,7 @@ fn run_broker_session(
                         stream,
                         &args,
                         &wlsctx::broker::BrokerCore::new(),
+                        0, // auto mode never registers a prompt; inert
                     );
                 }
                 BrokerOutcome::AutoDeny => {

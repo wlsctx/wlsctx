@@ -170,15 +170,20 @@ write-up.
     --test-threads=1` (wired into CI): it costs ~nothing, since the
     suite is dominated by the `SANDBOX_LOCK`-serialised sandbox tests.
 
-17. **Prompt ids in the broker are assigned in lock-acquisition order,
-    not connection-arrival order — a latent race.** `BrokerCore::
-    add_prompt` locks the queue and hands out `next_id` under it, but
-    each incoming read is handled on its own thread, so *which* thread
-    grabs the lock first decides the id, not which connection arrived
-    first. The `multi_prompt_session_is_listed_and_decided` integration
-    test asserts arrival order (id 1 == the first-connected app) and
-    flakily fails (roughly 1 in many runs, more under load) when the
-    second app's thread wins the race. Pre-existing from the clipboard
-    branch; fixing it means stamping a monotonic sequence at accept
-    time (the main loop is sequential) and ordering by that — its own
-    commit, not the merge.
+17. **A queue filled by concurrent threads is ordered by a sequence
+    stamped at the sequential entry point, never by lock order.**
+    The broker's prompts were registered by per-connection threads
+    (`add_prompt` hands out ids under the queue lock), so *which*
+    thread grabbed the lock first decided the order — not which
+    connection arrived first — and the
+    `multi_prompt_session_is_listed_and_decided` integration test
+    flaked whenever the second app's thread won the race. Fixed by
+    stamping each connection with a monotonic sequence in the
+    broker's `poll(2)` accept loop (the only sequential point) and
+    ordering the queue by `(seq, id)`; ids stay unique (so two
+    prompts from one connection cannot collide in the order), and
+    both the listing and the untargeted decide derive from the
+    sequence. Pre-existing from the clipboard branch; its
+    integration tests build the queue directly, so nothing exercised
+    the thread-race path until the desktop e2e found the sibling
+    allowlist bug and the flake was re-run.

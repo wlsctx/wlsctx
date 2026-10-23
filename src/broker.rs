@@ -549,6 +549,11 @@ pub struct BrokerArgs {
 struct PendingPrompt {
     /// The prompt's id (monotonic per session; what `--prompt` names).
     id: u32,
+    /// The connection's arrival sequence, stamped in the broker's
+    /// accept loop (the only sequential point — LESSONS #17). The
+    /// queue orders by `(seq, id)`, never by the order the
+    /// connection threads happened to register.
+    seq: u32,
     app: String,
     instance: String,
     selection: String,
@@ -614,12 +619,15 @@ impl BrokerCore {
     }
 
     /// Register an interactive prompt (the connection thread calls
-    /// this before announcing and waiting). Returns the record.
-    fn add_prompt(&self, req: &ClipboardRead, timeout: Duration) -> Arc<PendingPrompt> {
+    /// this before announcing and waiting). `seq` is the
+    /// connection's arrival sequence, stamped by the accept loop.
+    /// Returns the record.
+    fn add_prompt(&self, req: &ClipboardRead, timeout: Duration, seq: u32) -> Arc<PendingPrompt> {
         let mut q = self.queue.lock().unwrap();
         q.next_id += 1;
         let prompt = Arc::new(PendingPrompt {
             id: q.next_id,
+            seq,
             app: req.app.clone(),
             instance: req.instance.clone(),
             selection: req.selection.clone(),
@@ -647,7 +655,15 @@ impl BrokerCore {
                 if q.prompts.is_empty() {
                     return Err(REASON_NO_PENDING);
                 }
-                0
+                // The oldest by *arrival* (the accept-time sequence,
+                // LESSONS #17), not by queue position — the threads
+                // register in any order.
+                q.prompts
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, p)| (p.seq, p.id))
+                    .map(|(i, _)| i)
+                    .expect("the queue is non-empty")
             }
         };
         let prompt = q
@@ -663,20 +679,31 @@ impl BrokerCore {
     /// first.
     pub fn pending_view(&self) -> Vec<PendingPromptView> {
         let q = self.queue.lock().unwrap();
-        q.prompts
+        let mut views: Vec<(u32, u32, PendingPromptView)> = q
+            .prompts
             .iter()
-            .map(|p| PendingPromptView {
-                id: p.id,
-                app: p.app.clone(),
-                instance: p.instance.clone(),
-                selection: p.selection.clone(),
-                mime: p.mime.clone(),
-                expires_in_ms: p
-                    .deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis() as u64,
+            .map(|p| {
+                (
+                    p.seq,
+                    p.id,
+                    PendingPromptView {
+                        id: p.id,
+                        app: p.app.clone(),
+                        instance: p.instance.clone(),
+                        selection: p.selection.clone(),
+                        mime: p.mime.clone(),
+                        expires_in_ms: p
+                            .deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis() as u64,
+                    },
+                )
             })
-            .collect()
+            .collect();
+        // Arrival order, oldest first: the accept-time sequence,
+        // never the order the threads registered (LESSONS #17).
+        views.sort_by_key(|(seq, id, _)| (*seq, *id));
+        views.into_iter().map(|(_, _, v)| v).collect()
     }
 
     /// Remove a resolved or expired prompt (the waiting thread calls
@@ -775,6 +802,10 @@ pub fn run(args: &BrokerArgs, listener: UnixListener) -> io::Result<()> {
             args.timeout.as_millis()
         );
     }
+    // The arrival sequence: stamped in this sequential loop, one per
+    // accepted broker connection (LESSONS #17). Decision-socket
+    // accepts do not consume a number — they are not prompts.
+    let mut seq: u32 = 0;
     loop {
         let mut polls = Vec::with_capacity(2);
         polls.push(PollFd::new(&listener, PollFlags::IN));
@@ -801,9 +832,13 @@ pub fn run(args: &BrokerArgs, listener: UnixListener) -> io::Result<()> {
                     match listener.accept() {
                         Ok((stream, addr)) => {
                             info!("broker request from {addr:?}");
+                            // Copied into the thread (u32 is Copy);
+                            // the local keeps counting for the next
+                            // accept.
+                            seq = seq.wrapping_add(1);
                             let args = args.clone();
                             let core = core.clone();
-                            thread::spawn(move || handle_connection(stream, &args, &core));
+                            thread::spawn(move || handle_connection(stream, &args, &core, seq));
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                         Err(e) => {
@@ -908,7 +943,13 @@ fn handle_decider(mut stream: UnixStream, core: &BrokerCore) {
 /// the decision — on the user, via the session decision socket, or on
 /// the deadline) and a *copy-out notification* (`clipboard-write`)
 /// fires a desktop notification and closes with no reply.
-pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs, core: &BrokerCore) {
+///
+/// `seq` is the connection's arrival sequence, stamped by the
+/// caller's accept loop (the broker's main loop in production;
+/// a constant in tests): it orders the prompt in the queue, so
+/// arrival order holds regardless of thread scheduling (LESSONS
+/// #17).
+pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs, core: &BrokerCore, seq: u32) {
     let _ = stream.set_read_timeout(Some(args.timeout));
     let mut line = String::new();
     if read_line(&mut stream, &mut line).is_err() || line.is_empty() {
@@ -933,7 +974,7 @@ pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs, core: &Broke
                     return;
                 }
             };
-            handle_read(&mut stream, &req, args, core);
+            handle_read(&mut stream, &req, args, core, seq);
         }
         // One-way: fire the notification, close, no reply.
         NOTIFY_KIND => {
@@ -954,7 +995,13 @@ pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs, core: &Broke
 }
 
 /// The consent path (a `clipboard-read` request): decide, then answer.
-fn handle_read(stream: &mut UnixStream, req: &ClipboardRead, args: &BrokerArgs, core: &BrokerCore) {
+fn handle_read(
+    stream: &mut UnixStream,
+    req: &ClipboardRead,
+    args: &BrokerArgs,
+    core: &BrokerCore,
+    seq: u32,
+) {
     info!(
         "consent request: app {}/{} wants to read the {} (`{}`; its own reads were never asked about)",
         req.app,
@@ -977,7 +1024,7 @@ fn handle_read(stream: &mut UnixStream, req: &ClipboardRead, args: &BrokerArgs, 
         None if core.is_degraded() => Decision::Deny {
             reason: "no-decision-socket".into(),
         },
-        None => decide_interactive(req, args, core),
+        None => decide_interactive(req, args, core, seq),
     };
 
     let answered = match encode_decision(&decision) {
@@ -1043,8 +1090,13 @@ fn decision_detail(d: &Decision) -> String {
 /// desktop, and wait for the user's decision — recorded by the main
 /// loop on the session decision socket — or the deadline (a timeout
 /// is a deny).
-fn decide_interactive(req: &ClipboardRead, args: &BrokerArgs, core: &BrokerCore) -> Decision {
-    let prompt = core.add_prompt(req, args.timeout);
+fn decide_interactive(
+    req: &ClipboardRead,
+    args: &BrokerArgs,
+    core: &BrokerCore,
+    seq: u32,
+) -> Decision {
+    let prompt = core.add_prompt(req, args.timeout, seq);
     announce(req, prompt.id, &args.runtime_dir.join(DECISION_SOCKET));
 
     // Wait for the user's decision (the main loop records it on the
@@ -1318,7 +1370,7 @@ mod tests {
             auto_decide: None,
             timeout: Duration::from_secs(1),
         };
-        handle_connection(broker_end, &args, &BrokerCore::new());
+        handle_connection(broker_end, &args, &BrokerCore::new(), 1);
 
         // The client must see a clean EOF, not a decision line.
         let mut reply = String::new();
@@ -1439,10 +1491,15 @@ mod tests {
     #[test]
     fn core_decide_targets_oldest_by_default() {
         let core = BrokerCore::new();
-        let a = core.add_prompt(&read_request("app-a", "text/plain"), Duration::from_secs(5));
+        let a = core.add_prompt(
+            &read_request("app-a", "text/plain"),
+            Duration::from_secs(5),
+            1,
+        );
         let b = core.add_prompt(
             &read_request("app-b", "text/uri-list"),
             Duration::from_secs(5),
+            2,
         );
         assert_eq!(a.id, 1);
         assert_eq!(b.id, 2);
@@ -1459,10 +1516,15 @@ mod tests {
     #[test]
     fn core_decide_targets_explicit_id() {
         let core = BrokerCore::new();
-        core.add_prompt(&read_request("app-a", "text/plain"), Duration::from_secs(5));
+        core.add_prompt(
+            &read_request("app-a", "text/plain"),
+            Duration::from_secs(5),
+            1,
+        );
         core.add_prompt(
             &read_request("app-b", "text/uri-list"),
             Duration::from_secs(5),
+            2,
         );
         // Explicit: the newest first, then the rest is oldest-first.
         assert_eq!(core.decide(Some(2), UserDecision::Allow).unwrap(), 2);
@@ -1485,9 +1547,46 @@ mod tests {
     }
 
     #[test]
+    fn registration_out_of_arrival_order_is_reordered_by_seq() {
+        // The race (LESSONS #17): two connections arrive in order,
+        // but the *later* one's thread grabs the queue lock first —
+        // so the ids follow lock order, not arrival order. The
+        // accept-time sequence must win both in the listing and in
+        // the untargeted decide.
+        let core = BrokerCore::new();
+        let later = core.add_prompt(
+            &read_request("app-b", "text/uri-list"),
+            Duration::from_secs(5),
+            2,
+        );
+        let earlier = core.add_prompt(
+            &read_request("app-a", "text/plain"),
+            Duration::from_secs(5),
+            1,
+        );
+        assert_eq!(later.id, 1); // ids follow lock order…
+        assert_eq!(earlier.id, 2);
+        // …but the listing shows arrival order: app-a (seq 1) first.
+        let view = core.pending_view();
+        assert_eq!(view.iter().map(|v| v.id).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(
+            view.iter().map(|v| v.app.as_str()).collect::<Vec<_>>(),
+            vec!["app-a", "app-b"]
+        );
+        // Untargeted decide resolves the oldest by arrival, not by
+        // queue position or id.
+        assert_eq!(core.decide(None, UserDecision::Allow).unwrap(), 2);
+        assert_eq!(core.decide(None, UserDecision::Deny).unwrap(), 1);
+    }
+
+    #[test]
     fn core_pending_view_and_remove() {
         let core = BrokerCore::new();
-        let p = core.add_prompt(&read_request("app-a", "text/plain"), Duration::from_secs(5));
+        let p = core.add_prompt(
+            &read_request("app-a", "text/plain"),
+            Duration::from_secs(5),
+            1,
+        );
         let view = core.pending_view();
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].id, 1);
@@ -1529,7 +1628,7 @@ mod tests {
         // this function).
         let core_for_thread = core.clone();
         let broker_thread =
-            thread::spawn(move || handle_connection(broker_end, &args, &core_for_thread));
+            thread::spawn(move || handle_connection(broker_end, &args, &core_for_thread, 1));
         // The prompt must be in the queue before the "user" answers;
         // bound the wait so a stuck thread fails the test, not the
         // machine.
@@ -1603,7 +1702,7 @@ mod tests {
             timeout: Duration::from_secs(30),
         };
         let core = BrokerCore::new_degraded();
-        handle_connection(broker_end, &args, &core);
+        handle_connection(broker_end, &args, &core, 1);
         let mut reply = String::new();
         client.read_to_string(&mut reply).unwrap();
         assert_eq!(

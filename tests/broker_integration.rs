@@ -159,30 +159,35 @@ fn multi_prompt_session_is_listed_and_decided() {
     // (bounded) until both prompts are pending.
     wait_until(|| pending_prompts(dir).len() == 2);
     let list = pending_prompts(dir);
+    // The prompt ids are handed out under the queue lock (lock order,
+    // not arrival order); the *listing* must be in arrival order
+    // (LESSONS #17). So assert order by app, and use the listed ids
+    // for the decides below.
     assert_eq!(
-        list.iter().map(|p| p.id).collect::<Vec<_>>(),
-        vec![1, 2],
+        list.iter().map(|p| p.app.as_str()).collect::<Vec<_>>(),
+        vec!["app-a", "app-b"],
         "the listing is in arrival order (oldest first)"
     );
     assert_eq!(
-        (list[0].app.as_str(), list[0].mime.as_str()),
-        ("app-a", "text/plain")
-    );
-    assert_eq!(
-        (list[1].app.as_str(), list[1].mime.as_str()),
-        ("app-b", "text/uri-list")
+        list.iter().map(|p| p.mime.as_str()).collect::<Vec<_>>(),
+        vec!["text/plain", "text/uri-list"]
     );
     // Each prompt has (roughly) its full deadline left.
     assert!(list[0].expires_in_ms >= 2_500);
     assert!(list[1].expires_in_ms >= 2_500);
 
-    // Resolve prompt 1 by id (allow); its proxy gets the answer.
+    // Resolve the first-arrived prompt by id (allow); its proxy gets
+    // the answer.
+    let first = list[0].id;
     let reply = decider_request(
         dir,
-        &encode_decide_request(&UserDecision::Allow, Some(1)).unwrap(),
+        &encode_decide_request(&UserDecision::Allow, Some(first)).unwrap(),
     );
     let resolved = decode_resolution(&reply).unwrap();
-    assert_eq!((resolved.prompt, resolved.decision.as_str()), (1, "allow"));
+    assert_eq!(
+        (resolved.prompt, resolved.decision.as_str()),
+        (first, "allow")
+    );
     assert_eq!(
         proxy_decision(&mut a),
         Decision::Allow {
@@ -190,9 +195,10 @@ fn multi_prompt_session_is_listed_and_decided() {
         }
     );
 
-    // Prompt 2 is still pending: a list now shows just it.
+    // The second prompt is still pending: a list now shows just it.
+    let second = list[1].id;
     let list = pending_prompts(dir);
-    assert_eq!(list.iter().map(|p| p.id).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(list.iter().map(|p| p.id).collect::<Vec<_>>(), vec![second]);
 
     // Untargeted decide resolves the oldest remaining (deny); its
     // proxy gets the answer too.
@@ -201,7 +207,10 @@ fn multi_prompt_session_is_listed_and_decided() {
         &encode_decide_request(&UserDecision::Deny, None).unwrap(),
     );
     let resolved = decode_resolution(&reply).unwrap();
-    assert_eq!((resolved.prompt, resolved.decision.as_str()), (2, "deny"));
+    assert_eq!(
+        (resolved.prompt, resolved.decision.as_str()),
+        (second, "deny")
+    );
     assert_eq!(
         proxy_decision(&mut b),
         Decision::Deny {
