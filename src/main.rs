@@ -10,6 +10,7 @@
 mod cli;
 mod profile;
 mod sandbox;
+mod systemd;
 mod testutil;
 mod wayland;
 

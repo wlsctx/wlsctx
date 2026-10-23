@@ -476,14 +476,26 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       a bind).
 
 ### Phase 6 — systemd integration (revised #35: D-Bus primary)
-- [ ] 6.1 D-Bus session-bus `StartTransientUnit` scope via `zbus` 6
-      blocking: `PIDs=[self]` only (no StopWhenUnneeded/Delegate);
-      on `UnitExists` → `StopUnit` + retry once; after the call A's
-      pre-unshare cgroup capture lands the instance sub-cgroup inside
-      the scope (no A/B change); tier logged. Unit test: with a
-      session bus — attach self, assert moved + child accepts a pid +
-      recursive removal; without — assert raw tier (never a silent
-      skip)
+- [x] 6.1 D-Bus session-bus `StartTransientUnit` scope via `zbus` 5
+      blocking (6.0.0 reworked the runtime API — migrating is a later,
+      small task): `PIDs=[self]` only (no StopWhenUnneeded/Delegate).
+      On `UnitExists` the unit is **adopted, not blindly stopped** —
+      `StopUnit` on a scope *kills its members* (`scope_enter_dead` →
+      `unit_kill_context`, v261 source): already a member → keep;
+      empty (`Tasks==0`) → stop, refresh `PIDs`, start; busy (foreign
+      tasks) → never touched, the run degrades. The call is async
+      (the job is only queued): a ≤3 s poll of `/proc/self/cgroup`
+      confirms the move. After the call A's pre-unshare cgroup
+      capture lands the instance sub-cgroup inside the scope (no A/B
+      change); tier logged. `zbus::blocking::block_on` uses a
+      process-global tokio runtime (OnceLock, never dropped), so the
+      forwardable-signal block (5.4) moved *ahead of the call*: the
+      runtime's worker threads inherit the mask and the forwarder
+      stays the sole consumer; A unblocks again before forking B, so
+      the app keeps its historical (unblocked) signal behavior. Unit
+      test: with a session bus — attach self, assert moved + child
+      accepts a pid + recursive removal; without — assert raw tier
+      (never a silent skip)
 - [ ] 6.2 Raw-cgroup fallback (no session bus / no user systemd /
       call failed): existing #12/#20 path; document degradation
 - [ ] 6.3 `wlsctx wayland` remains usable standalone (socket activation

@@ -17,7 +17,7 @@ pub(crate) mod supervise;
 pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
-use log::error;
+use log::{debug, error};
 use std::os::fd::AsRawFd;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{ForkResult, fork};
@@ -101,6 +101,58 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     }
     let creds =
         userns::Credentials::current().context("reading the current uid/gid (getresuid/getresgid)")?;
+
+    // 5.4, amended in Phase 6: block the forwardable signals
+    // (TERM/INT/HUP) on this thread before anything here may spawn a
+    // thread — notably the session-bus scope call below: `zbus`
+    // `block_on`s on a process-global tokio runtime whose worker
+    // threads are spawned from this thread and inherit its mask, so
+    // without the block an unblocked worker would take the whole
+    // process down on a default-action SIGTERM before the forwarder
+    // could service it. Blocked here, the three signals stay pending
+    // on every thread of the process; the forwarder (S branch,
+    // below) routes each to the app (decision #33). A, forked later,
+    // unblocks them again so the app keeps its historical (unblocked)
+    // behavior.
+    let mut fwd_mask = nix::sys::signal::SigSet::empty();
+    for sig in [
+        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGINT,
+        nix::sys::signal::Signal::SIGHUP,
+    ] {
+        fwd_mask.add(sig);
+    }
+    let fwd_mask = match fwd_mask.thread_block() {
+        Ok(()) => Some(fwd_mask),
+        Err(e) => {
+            log::warn!(
+                "blocking the forwardable signals failed: {e}; \
+                 signal forwarding disabled"
+            );
+            None
+        }
+    };
+
+    // Phase 6 (#35): before any fork, move `S` into a transient
+    // systemd scope on the user session bus. Afterwards both this
+    // function's `sub_cgroup` and A's pre-unshare cgroup capture
+    // (decision #20) root under the scope, and systemd removes the
+    // scope *and its children* recursively when `S` — the last
+    // member — exits. Any failure degrades to the raw-cgroup tier;
+    // a run is never aborted over this.
+    let scope_unit =
+        format!("wlsctx-{}-{}.scope", config.app_id, config.instance_id);
+    match crate::systemd::attach_scope(
+        &scope_unit,
+        &format!("wlsctx sandbox: {}", config.app_id),
+    ) {
+        crate::systemd::ScopeTier::Joined { unit } => {
+            debug!("cgroup accounting: systemd scope {unit}")
+        }
+        crate::systemd::ScopeTier::Unavailable(reason) => {
+            debug!("cgroup accounting: raw cgroup (no systemd unit: {reason})")
+        }
+    }
 
     // The full (host) path of the session cgroup, computed here — `S`
     // never unshares the cgroup namespace — so that after the
@@ -217,6 +269,17 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 sa,
                 aw
             );
+            // The app keeps its historical (unblocked) signal
+            // behavior: undo the pre-fork block (inherited from the
+            // supervisor's thread) so B, the app, receives
+            // TERM/INT/HUP normally.
+            if let Some(m) = &fwd_mask {
+                if let Err(e) = m.thread_unblock() {
+                    log::warn!(
+                        "A: unblocking the forwardable signals failed: {e}"
+                    );
+                }
+            }
             if let Err(e) = userns::enter_userns(&creds) {
                 error!("user namespace setup failed: {e:#}");
                 std::process::exit(126);
@@ -430,33 +493,17 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             unsafe { libc::close(sa) };
             unsafe { libc::close(ar) };
             unsafe { libc::close(aw) };
-            // 5.4: block the forwardable signals (TERM/INT/HUP) on
-            // *this* thread now — before any other thread is spawned,
-            // so the supervisor and forwarder threads inherit the
-            // mask — and so no default-action delivery can kill the
-            // process during the handoff. The forwarder thread (below)
-            // reads them from a signalfd and turns each into a signal
-            // at the app. If the block fails, we continue without
-            // forwarding (the pre-5.4 behavior) — the run itself does
-            // not depend on it.
-            let mut fwd_mask = nix::sys::signal::SigSet::empty();
-            for sig in [
-                nix::sys::signal::Signal::SIGTERM,
-                nix::sys::signal::Signal::SIGINT,
-                nix::sys::signal::Signal::SIGHUP,
-            ] {
-                fwd_mask.add(sig);
-            }
-            let fwd_mask = match fwd_mask.thread_block() {
-                Ok(()) => Some(fwd_mask),
-                Err(e) => {
-                    log::warn!(
-                        "blocking the forwardable signals failed: {e}; \
-                         signal forwarding disabled"
-                    );
-                    None
-                }
-            };
+            // 5.4/Phase 6: this thread already has the forwardable
+            // signals (TERM/INT/HUP) blocked — the block was moved
+            // ahead of the session-bus scope call (before any fork or
+            // thread exists) so that even the zbus/tokio worker
+            // threads inherit it, and no default-action delivery can
+            // kill the process during the handoff. The forwarder
+            // thread (below) reads them from a signalfd and turns
+            // each into a signal at the app; if the earlier block
+            // failed, `fwd_mask` is `None` and forwarding is disabled
+            // (the pre-5.4 behavior) — the run itself does not
+            // depend on it.
             log::debug!(
                 "S[{}]: arm=S (kept ss={}); waiting for the listener",
                 std::process::id(),
@@ -928,8 +975,8 @@ print('CONNECT-OK')";
     /// forwardable signals on itself (no thread may hold a
     /// default-action disposition, or the kernel would pick it
     /// instead of the signalfd); every other thread in the process
-    /// inherits the block from the S branch, so the forwarder's
-    /// signalfd is the sole consumer. The app signals "up" by
+    /// inherits the block from the pre-fork block in `run_sandboxed`
+    /// (Phase 6), so the forwarder's signalfd is the sole consumer. The app signals "up" by
     /// touching a marker in its (in-sandbox) runtime dir — a bind
     /// chain, so the same file appears at the host path the killer
     /// polls (decision #28).
