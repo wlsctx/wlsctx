@@ -121,6 +121,29 @@ fn resolve_listener_path(p: &path::Path) -> Result<path::PathBuf> {
     }
 }
 
+/// The proxy's global-allowlist policy, as given on the CLI.
+///
+/// An absent `--allow-globals` yields an empty list, which must be
+/// the Phase 1 pass-through (every global shown). [`wlsctx::proxy::Policy::from_names`]
+/// alone cannot express that distinction — it always builds an
+/// *active* (filtering) policy, so fed with an empty list it hides
+/// **everything** (the client cannot even bind `wl_compositor`).
+/// Only a non-empty list engages the allowlist; blank entries
+/// (e.g. `--allow-globals "a,,b"`) are ignored, mirroring
+/// [`wlsctx::proxy::Policy::from_csv`].
+fn policy_from_cli(names: Vec<String>) -> wlsctx::proxy::Policy {
+    if names.is_empty() {
+        wlsctx::proxy::Policy::all()
+    } else {
+        wlsctx::proxy::Policy::from_names(
+            names
+                .into_iter()
+                .map(|n| n.trim().to_owned())
+                .filter(|n| !n.is_empty()),
+        )
+    }
+}
+
 /// Tag-and-park: tag the listen socket with the security context,
 /// hold the reference pipe, park until killed. Apps connect to the
 /// tagged socket directly.
@@ -197,7 +220,7 @@ fn run_proxy(args: &WaylandArgs) -> Result<()> {
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
     sd_notify_ready();
 
-    let policy = wlsctx::proxy::Policy::from_names(args.allow_globals.clone());
+    let policy = policy_from_cli(args.allow_globals.clone());
     if policy.is_active() {
         info!(
             "Global allowlist active: showing {} interface(s) to sandboxed clients",
@@ -431,5 +454,43 @@ fn format_secs(ms: u64) -> String {
         format!("{} s", ms / 1000)
     } else {
         format!("{:.1} s", ms as f64 / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::policy_from_cli;
+
+    #[test]
+    fn absent_flag_is_pass_through_not_hide_all() {
+        // Regression (found by the live-desktop e2e): an empty list is
+        // "no flag", and must show every global, not hide all of them.
+        let p = policy_from_cli(Vec::new());
+        assert!(!p.is_active());
+        assert_eq!(p.allow_count(), 0);
+        assert!(p.allows("wl_compositor"));
+        assert!(p.allows("wp_security_context_manager_v1"));
+        assert!(p.allows("anything"));
+    }
+
+    #[test]
+    fn non_empty_flag_engages_the_allowlist() {
+        let p = policy_from_cli(vec!["wl_shm".into(), "wl_compositor".into()]);
+        assert!(p.is_active());
+        assert_eq!(p.allow_count(), 2);
+        assert!(p.allows("wl_shm"));
+        assert!(p.allows("wl_compositor"));
+        assert!(!p.allows("wl_seat"));
+    }
+
+    #[test]
+    fn blank_entries_are_ignored() {
+        // `--allow-globals " wl_shm ,, wl_seat "`: blanks drop out, the
+        // surrounding whitespace is trimmed.
+        let p = policy_from_cli(vec![" wl_shm ".into(), "".into(), " wl_seat ".into()]);
+        assert!(p.is_active());
+        assert_eq!(p.allow_count(), 2);
+        assert!(p.allows("wl_shm"));
+        assert!(p.allows("wl_seat"));
     }
 }
