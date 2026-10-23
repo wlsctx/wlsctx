@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
+use std::time::Instant;
 
 /// The tagged Wayland socket of this run (Phase 5.1), created by S
 /// before the first fork; `None` = no tagged socket.
@@ -362,6 +363,13 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         Ok(Some(num)) => {
                             let ok = match supervise::extract_and_send(child.as_raw(), num, sa) {
                                 Ok(listener) => {
+                                    // 5.4: report B's host-visible pid to S,
+                                    // right after the listener, so S can
+                                    // signal the app (A is outside the new
+                                    // pid ns, so this is the pid S sees).
+                                    // If the send fails the run continues
+                                    // un-signalled: the floors still hold.
+                                    let _ = supervise::send_app_pid(sa, child.as_raw());
                                     drop(listener);
                                     true
                                 }
@@ -422,6 +430,33 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             unsafe { libc::close(sa) };
             unsafe { libc::close(ar) };
             unsafe { libc::close(aw) };
+            // 5.4: block the forwardable signals (TERM/INT/HUP) on
+            // *this* thread now — before any other thread is spawned,
+            // so the supervisor and forwarder threads inherit the
+            // mask — and so no default-action delivery can kill the
+            // process during the handoff. The forwarder thread (below)
+            // reads them from a signalfd and turns each into a signal
+            // at the app. If the block fails, we continue without
+            // forwarding (the pre-5.4 behavior) — the run itself does
+            // not depend on it.
+            let mut fwd_mask = nix::sys::signal::SigSet::empty();
+            for sig in [
+                nix::sys::signal::Signal::SIGTERM,
+                nix::sys::signal::Signal::SIGINT,
+                nix::sys::signal::Signal::SIGHUP,
+            ] {
+                fwd_mask.add(sig);
+            }
+            let fwd_mask = match fwd_mask.thread_block() {
+                Ok(()) => Some(fwd_mask),
+                Err(e) => {
+                    log::warn!(
+                        "blocking the forwardable signals failed: {e}; \
+                         signal forwarding disabled"
+                    );
+                    None
+                }
+            };
             log::debug!(
                 "S[{}]: arm=S (kept ss={}); waiting for the listener",
                 std::process::id(),
@@ -446,9 +481,21 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // block in `waitpid` for A. It services B's trapped
             // syscalls; S itself never installs the filter.
             let stop = Arc::new(AtomicBool::new(false));
+            let flags = Arc::new(AppSignalFlags::default());
             let mut supervisor: Option<std::thread::JoinHandle<()>> = None;
-            match supervise::recv_fd(ss) {
+            // Assigned in both arms below (armed or not).
+            let forwarder: Option<std::thread::JoinHandle<()>>;
+            let handoff_ok = match supervise::recv_fd(ss) {
                 Ok(Some(notify)) => {
+                    // 5.4: A reported B's host-visible pid right after
+                    // the listener (same socket, same order).
+                    let app_pid = match supervise::recv_app_pid(ss) {
+                        Ok(Some(p)) => Some(p),
+                        _ => {
+                            log::debug!("S: no app pid reported; forwarding disabled");
+                            None
+                        }
+                    };
                     unsafe { libc::close(ss) };
                     log::debug!("S[{}]: got the listener (fd {})", std::process::id(), notify.as_raw_fd());
                     match policy::capability_set(&config, std::path::Path::new(&sandbox_runtime)) {
@@ -469,6 +516,16 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                             );
                         }
                     }
+                    // 5.4: the forwarder thread (see its docs).
+                    forwarder = arm_signal_forwarder(fwd_mask.as_ref(), app_pid, Arc::clone(&flags), Arc::clone(&stop));
+                    // 5.4: sd-notify — the app is running (or about
+                    // to exec), so the unit is up. No-op (and
+                    // `Ok`) when `$NOTIFY_SOCKET` is unset; a send
+                    // failure (socket gone) is logged, not fatal.
+                    if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+                        log::debug!("sd-notify READY=1: {e}");
+                    }
+                    true
                 }
                 _ => {
                     // EOF (B died before the handoff) or a recv error:
@@ -476,8 +533,15 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     // whatever B ran.
                     unsafe { libc::close(ss) };
                     log::debug!("S: no supervisor (handoff did not complete)");
+                    // 5.4: arm the forwarder anyway (there is no app
+                    // pid to signal): a TERM/INT in this short window
+                    // is a clean shutdown (S exits 0, below) rather
+                    // than a signal stuck blocked, and a HUP keeps
+                    // its 129.
+                    forwarder = arm_signal_forwarder(fwd_mask.as_ref(), None, Arc::clone(&flags), Arc::clone(&stop));
+                    false
                 }
-            }
+            };
 
             // Reap A, which carries B's status.
             let code =
@@ -491,12 +555,23 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         ))
                     }
                 };
-            // The app (and A) are gone: tell the supervisor to stop and
-            // join it (it exits within one poll tick).
+            // The app (and A) are gone: tell the supervisor and the
+            // forwarder to stop and join them (each exits within one
+            // poll tick; the forwarder's signalfd closes with its
+            // thread).
             stop.store(true, Ordering::Relaxed);
             if let Some(t) = supervisor {
                 let _ = t.join();
             }
+            if let Some(t) = forwarder {
+                let _ = t.join();
+            }
+            // 5.2/5.4: the tagged Wayland socket closes exactly now
+            // that the app is dead: dropping S's listener copy and
+            // the reference pipe is what triggers the compositor's
+            // untag (the pipe's EOF), and that happens no later than
+            // this point.
+            drop(tagged);
             // Best-effort cleanup of the per-instance sub-cgroup: the
             // app is dead, so it is empty (a parallel instance sharing
             // the name may still hold it — that just makes the rmdir
@@ -520,9 +595,158 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             if let Some(parent) = std::path::Path::new(&scratch).parent() {
                 let _ = std::fs::remove_dir(parent);
             }
+            // 5.4: the per-instance runtime dir is no longer needed
+            // (the tagged socket, and whatever the app created in
+            // it). The step-1 carry is a *bind*, so the dir is still
+            // at its host path (decision #28).
+            if let Err(e) = std::fs::remove_dir_all(&runtime_dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("cleaning up the runtime dir {runtime_dir} failed: {e}");
+                }
+            }
+            // 5.4: the signals S was asked to stop on override the
+            // app's status: HUP keeps the historical `wlsctx`
+            // semantics — 129 (128+SIGHUP) — and a TERM/INT that
+            // reached S with no app to forward to (handoff failure)
+            // is a clean shutdown (0). When the app ran, its status
+            // (possibly after the forwarded-and-escalated stop) wins.
+            let code = if flags.hup.load(Ordering::Relaxed) {
+                129
+            } else if flags.term.load(Ordering::Relaxed) && !handoff_ok {
+                0
+            } else {
+                code
+            };
             Ok(code)
         }
     }
+}
+
+/// The signals S was asked to stop on, as seen by the forwarder
+/// thread (Phase 5.4): read by S after the app is reaped to choose
+/// the exit status (HUP → 129; TERM/INT with no app → 0).
+#[derive(Default)]
+struct AppSignalFlags {
+    term: AtomicBool,
+    hup: AtomicBool,
+}
+
+/// The signal-forwarder thread (Phase 5.4).
+///
+/// S has blocked SIGTERM/SIGINT/SIGHUP on every thread of the
+/// `wlsctx` process (the S main thread before it spawned anyone,
+/// every spawned thread inherits it), so the kernel delivers them
+/// to the signalfd instead of acting on them. Each one becomes a
+/// stop request for the **app**:
+///
+/// * TERM/INT — a courtesy TERM to the app, then an escalation to
+///   SIGKILL if the app is still alive after a 2s grace: the app is
+///   PID 1 of its own pid namespace and **ignores** default-action
+///   signals that come from outside the namespace (decision #13), so
+///   the escalation is the actual stop. The `term` flag is set
+///   regardless (S exits 0 when no app was running to forward to).
+/// * HUP — the same termination, plus the `hup` flag: S exits with
+///   129 (128+SIGHUP), the long-standing `wlsctx` semantics.
+///
+/// The thread exits when `stop` is set (the app is reaped); the
+/// signalfd closes with the thread (`O_CLOEXEC`).
+fn app_signal_forwarder(
+    fd: nix::sys::signalfd::SignalFd,
+    app_pid: Option<i32>,
+    flags: Arc<AppSignalFlags>,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let sig = match fd.read_signal() {
+            Ok(Some(si)) => si.ssi_signo as i32,
+            Ok(None) => {
+                // EAGAIN (SFD_NONBLOCK): no signal yet.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                log::warn!("signal forwarder: signalfd read failed: {e}");
+                break;
+            }
+        };
+        match sig {
+            libc::SIGHUP => flags.hup.store(true, Ordering::Relaxed),
+            libc::SIGTERM | libc::SIGINT => flags.term.store(true, Ordering::Relaxed),
+            // Only the blocked set can arrive; anything else is a
+            // programming error and ignored on purpose.
+            _ => continue,
+        }
+        if let Some(pid) = app_pid {
+            terminate_app(pid, &stop);
+        }
+    }
+}
+
+/// Stop the app: a courtesy TERM, then — because the app is PID 1
+/// of its own pid namespace and ignores default-action signals from
+/// outside it (decision #13) — a SIGKILL escalation after a 2s
+/// grace, bounded by `stop` (the app was reaped meanwhile).
+fn terminate_app(pid: i32, stop: &Arc<AtomicBool>) {
+    // SAFETY: signalling a pid that was valid when reported; a
+    // failure (ESRCH: already gone) is exactly the desired state.
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: as above; 0 = probe.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ESRCH) {
+                return; // gone
+            }
+            // A probe failure other than ESRCH (EPERM: should be
+            // impossible — we created this process): keep polling
+            // rather than escalating on a spurious error.
+            if Instant::now() >= deadline {
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+        if Instant::now() >= deadline {
+            // The courtesy TERM was ignored (pid-ns init): escalate.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Spawn the signal-forwarder thread (Phase 5.4). `None` when
+/// forwarding is disabled (the signal block failed — the run keeps
+/// the pre-5.4 behavior) or the signalfd could not be created.
+fn arm_signal_forwarder(
+    mask: Option<&nix::sys::signal::SigSet>,
+    app_pid: Option<i32>,
+    flags: Arc<AppSignalFlags>,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mask = mask?;
+    let fd = match nix::sys::signalfd::SignalFd::with_flags(
+        mask,
+        nix::sys::signalfd::SfdFlags::SFD_CLOEXEC | nix::sys::signalfd::SfdFlags::SFD_NONBLOCK,
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::warn!("signal forwarder: signalfd failed: {e}; forwarding disabled");
+            return None;
+        }
+    };
+    Some(std::thread::spawn(move || {
+        app_signal_forwarder(fd, app_pid, flags, stop)
+    }))
 }
 
 /// The app's environment (Phase 5.3): the profile's variables, plus
@@ -575,8 +799,6 @@ mod tests {
     use crate::sandbox::userns::tests::run_in_child;
     use std::ffi::OsString;
     use std::io::Write;
-    use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::UnixStream;
 
     /// The tagged-socket run used by the live test below.
     fn tagged_config() -> SandboxConfig {
@@ -687,25 +909,206 @@ print('CONNECT-OK')";
             "the app could not connect to the tagged socket:\n{out}\n{err}"
         );
 
-        // 5.2: the run is over and with it S's listener copy and the
-        // reference pipe: the file remains (nothing unlinks it) but
-        // no longer serves.
+        // 5.2/5.4: the run is over and with it S's listener copy and
+        // the reference pipe: the compositor's untag (the pipe's
+        // EOF) happened when S dropped them, and the run's cleanup
+        // removed the per-instance runtime dir — the socket file is
+        // gone (it was carried by a *bind*, decision #28, so the
+        // host-side copy is the one that is removed).
         assert!(
-            std::fs::symlink_metadata(&host_socket)
-                .map(|m| m.file_type().is_socket())
-                .unwrap_or(false),
-            "the socket file {host_socket} is gone after the run (it should remain, stale)"
+            !std::path::Path::new(&host_runtime).exists(),
+            "the per-instance runtime dir {host_runtime} remains after the run \
+             (5.4 cleanup failed)"
         );
-        match UnixStream::connect(&host_socket) {
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-            other => panic!(
-                "the tagged socket still serves after the run (the tag was \
-                 not released): {other:?}"
-            ),
-        }
+    }
 
-        // Tidy: the stale socket and the per-instance dir.
-        let _ = std::fs::remove_file(&host_socket);
-        let _ = std::fs::remove_dir_all(&host_runtime);
+    /// Phase 5.4: run a long-lived app and, from *inside* the run
+    /// (standing in for the user), send `sig` to the S process once
+    /// the app is up. The in-run killer thread blocks the
+    /// forwardable signals on itself (no thread may hold a
+    /// default-action disposition, or the kernel would pick it
+    /// instead of the signalfd); every other thread in the process
+    /// inherits the block from the S branch, so the forwarder's
+    /// signalfd is the sole consumer. The app signals "up" by
+    /// touching a marker in its (in-sandbox) runtime dir — a bind
+    /// chain, so the same file appears at the host path the killer
+    /// polls (decision #28).
+    fn signal_run(sig: i32) -> (Option<i32>, String, String) {
+        let _env_lock = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _sb_lock = crate::testutil::SANDBOX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = SandboxConfig {
+            app_id: "sig".to_string(),
+            instance_id: "1".to_string(),
+            network: NetworkMode::Shared,
+            profile: {
+                let mut p = crate::profile::Profile::adhoc();
+                p.env.insert(
+                    "MARKER".to_string(),
+                    format!("{}/ready", mounts::sandbox_instance_dir(&SandboxConfig {
+                        app_id: "sig".to_string(),
+                        instance_id: "1".to_string(),
+                        network: NetworkMode::Shared,
+                        profile: crate::profile::Profile::adhoc(),
+                        gpu: false,
+                        wayland: None,
+                    })),
+                );
+                p
+            },
+            gpu: false,
+            wayland: None,
+        };
+        let host_marker = format!(
+            "{}/ready",
+            mounts::instance_runtime_dir(&config)
+        );
+        let _ = std::fs::remove_dir_all(&mounts::instance_runtime_dir(&config));
+
+        // A *single* process (the `exec` replaces sh): killing it
+        // kills the whole pid ns, so nothing strays out of the
+        // namespace to hold the run_in_child pipes (or the test
+        // harness' stdout) open — decision #14 says the kernel's
+        // zap of a dead pid ns's strays is a no-op on this kernel.
+        let command = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("echo ok > \"$MARKER\"; exec sleep 30"),
+        ];
+        let host_marker2 = host_marker.clone();
+        run_in_child(move |o| {
+            // The "user": block the forwardable signals on this
+            // thread, wait for the app's marker, signal S.
+            std::thread::spawn(move || {
+                let mut mask = nix::sys::signal::SigSet::empty();
+                for s in [
+                    nix::sys::signal::Signal::SIGTERM,
+                    nix::sys::signal::Signal::SIGINT,
+                    nix::sys::signal::Signal::SIGHUP,
+                ] {
+                    mask.add(s);
+                }
+                let _ = mask.thread_block();
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(30);
+                while !std::path::Path::new(&host_marker2).exists() {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // SAFETY: signalling our own process.
+                unsafe { libc::kill(std::process::id() as i32, sig) };
+                // We die with the process; no join required.
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            });
+            match run_sandboxed(&command, &config) {
+                Ok(code) => code,
+                Err(e) => {
+                    let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                    2
+                }
+            }
+        })
+    }
+
+    /// Phase 5.4: a TERM to the `wlsctx` process stops the app. The
+    /// app is PID 1 of its own pid namespace, so the courtesy TERM
+    /// from outside the ns is ignored (decision #13) and the stop
+    /// lands as the SIGKILL escalation — S (and this child) reports
+    /// 128+9. The per-instance runtime dir is cleaned up.
+    #[test]
+    fn term_is_forwarded_to_the_app_and_exits_137() {
+        let (code, out, err) = signal_run(libc::SIGTERM);
+        assert_eq!(
+            code,
+            Some(137),
+            "the app was not stopped by the forwarded TERM (escalates \
+             to SIGKILL, 128+9):\n{out}\n{err}"
+        );
+        let config = SandboxConfig {
+            app_id: "sig".to_string(),
+            instance_id: "1".to_string(),
+            network: NetworkMode::Shared,
+            profile: crate::profile::Profile::adhoc(),
+            gpu: false,
+            wayland: None,
+        };
+        assert!(
+            !std::path::Path::new(&mounts::instance_runtime_dir(&config)).exists(),
+            "the runtime dir remains after the run (5.4 cleanup failed)"
+        );
+    }
+
+    /// Phase 5.4: a HUP keeps the historical `wlsctx` semantics —
+    /// the app is killed and the process exits with 129
+    /// (128+SIGHUP), no restart.
+    #[test]
+    fn hup_is_forwarded_to_the_app_and_exits_129() {
+        let (code, out, err) = signal_run(libc::SIGHUP);
+        assert_eq!(
+            code,
+            Some(129),
+            "HUP must exit 129 (128+SIGHUP), the historical wlsctx \
+             semantics:\n{out}\n{err}"
+        );
+    }
+
+    /// Phase 5.4: sd-notify — with `$NOTIFY_SOCKET` set (as systemd
+    /// does), the run sends `READY=1` when the app is up.
+    #[test]
+    fn sd_notify_reports_ready_when_the_app_runs() {
+        let _sb_lock = crate::testutil::SANDBOX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = crate::testutil::TmpDir::new("sd-notify");
+        let sock_path = tmp.path().join("notify.sock");
+        let datagram = std::os::unix::net::UnixDatagram::bind(&sock_path)
+            .expect("binding the notify datagram");
+
+        let config = SandboxConfig {
+            app_id: "sdr".to_string(),
+            instance_id: "1".to_string(),
+            network: NetworkMode::Shared,
+            profile: crate::profile::Profile::adhoc(),
+            gpu: false,
+            wayland: None,
+        };
+        let command = vec![OsString::from("/bin/true")];
+        let sock_str = sock_path.to_string_lossy().into_owned();
+        // `with_env` takes `ENV_LOCK` itself (do not hold it here —
+        // the lock is not reentrant).
+        let mut result: (Option<i32>, String, String) =
+            (None, String::new(), String::new());
+        crate::testutil::with_env(&[("NOTIFY_SOCKET", Some(&sock_str))], || {
+            result = run_in_child(move |o| match run_sandboxed(&command, &config) {
+                Ok(code) => code,
+                Err(e) => {
+                    let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                    2
+                }
+            });
+        });
+        let (code, out, err) = result;
+        assert_eq!(
+            code,
+            Some(0),
+            "the trivial run failed:\n{out}\n{err}"
+        );
+        let mut buf = [0u8; 128];
+        let (n, _from) = datagram
+            .recv_from(&mut buf)
+            .expect("receiving the sd-notify datagram");
+        let msg = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            msg.contains("READY=1"),
+            "the notify message is not READY=1: {msg:?}"
+        );
     }
 }

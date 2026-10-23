@@ -158,6 +158,58 @@ pub(crate) fn send_ack(w: RawFd, ack: u8) -> Result<()> {
     Ok(())
 }
 
+/// A: report B's **host-visible** pid to S, right after the listener
+/// message on the S↔A socketpair (Phase 5.4).
+///
+/// A is *outside* the new pid namespace (it is the one that
+/// unshared it), so the pid it reports is the one S — the host
+/// process — can `kill(2)`: S can signal the app directly, and the
+/// TERM→SIGKILL escalation (decision #13: the pid-ns init ignores
+/// default-action signals from outside the ns) needs no
+/// namespace-local sender.
+pub(crate) fn send_app_pid(sock: RawFd, b_pid: i32) -> Result<()> {
+    let buf = b_pid.to_ne_bytes();
+    let mut off = 0;
+    while off < buf.len() {
+        // SAFETY: a byte slice we own; the stream socketpair cannot
+        // interleave (A is the only writer).
+        let n = unsafe {
+            libc::write(
+                sock,
+                buf[off..].as_ptr() as *const libc::c_void,
+                buf.len() - off,
+            )
+        };
+        if n <= 0 {
+            return Err(io_err("sending the app pid to the supervisor"));
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
+/// S: read the app pid A reported, immediately after the listener
+/// `SCM_RIGHTS` message (same socket, same order). `None` = A is
+/// gone (EOF or a short read) — nothing to forward to.
+pub(crate) fn recv_app_pid(sock: RawFd) -> Result<Option<i32>> {
+    let mut buf = [0u8; 4];
+    let mut off = 0;
+    while off < buf.len() {
+        // SAFETY: a buffer we own.
+        let n = unsafe {
+            libc::read(sock, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off)
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        if n < 0 {
+            return Err(io_err("reading the app pid from the handoff child"));
+        }
+        off += n as usize;
+    }
+    Ok(Some(i32::from_ne_bytes(buf)))
+}
+
 /// B: block (up to `timeout_ms`) for A's handoff verdict.
 ///
 /// The verdict must be deterministic (decision #26): the listener is
@@ -707,12 +759,16 @@ mod tests {
         // The app writes to the instance dir's *in-sandbox* path
         // (the fresh /run's systemd-standard location, decision #28)
         // — equal to the host path for the default XDG — and the
-        // write crosses the bind mount to the host dir.
+        // write crosses the bind mount to the host dir. The app is
+        // the *only* process issuing trapped syscalls: no `$(...)`
+        // subshell, because a child of the app (PID 1 of the pidns)
+        // is not the process the supervisor's mediation is armed for
+        // (decision #25) and its openat would deadlock the handoff.
+        // `cat` runs as a plain top-level command instead.
         let sandbox_inst = mounts::sandbox_instance_dir(&config);
-        let ctrl_host = mounts::instance_runtime_dir(&config);
         let ctrl_app = format!("{sandbox_inst}/p4-ctrl");
         let script = format!(
-            "echo x > {denied} 2>/dev/null; a=$?; echo ctrl > {ctrl_app} 2>/dev/null; b=$?; echo a=$a b=$b"
+            "echo x > {denied} 2>/dev/null; a=$?; echo ctrl > {ctrl_app} 2>/dev/null; b=$?; cat {ctrl_app} 2>/dev/null; echo a=$a b=$b"
         );
         let (code, out, err) =
             run_cmd(&["/bin/sh".into(), "-c".into(), script], &config);
@@ -729,10 +785,13 @@ mod tests {
             out.contains("b=0"),
             "the write into the instance dir must be allowed, got:\n{out}\n{err}"
         );
-        // The allowed write crossed the bind mount to the host.
-        let host_ctrl = std::fs::read_to_string(format!("{ctrl_host}/p4-ctrl"))
-            .unwrap_or_else(|e| panic!("reading the host-side copy: {e}"));
-        assert_eq!(host_ctrl.trim(), "ctrl", "got {host_ctrl:?}");
+        // The instance-dir write is readable back by the app itself
+        // (the 5.4 cleanup removes the host dir after the run, so
+        // the readback must happen in-run, as a plain `cat`).
+        assert!(
+            out.contains("ctrl"),
+            "the instance-dir write must be readable back from the app, got:\n{out}\n{err}"
+        );
         // The denied write never materialized.
         assert!(
             !std::path::Path::new(&denied).exists(),

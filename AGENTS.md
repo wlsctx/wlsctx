@@ -21,8 +21,10 @@ changes** (README.md is stale pending its phase-8 rewrite).
 - `src/sandbox/` — the in-process sandbox: `userns`, `namespaces`
   (mount/pid/cgroup/ipc/uts/net), `mounts` (private rootfs builder),
   `policy` (the nono `CapabilitySet` + three-stage apply, #27),
-  `supervise` (notify-fd handoff, verdict pipe, the S-side supervisor
-  loop, #23/#25/#26), `mod` (S→A→B pipeline, `run_sandboxed`)
+  `supervise` (notify-fd handoff, app-pid report, verdict pipe, the
+  S-side supervisor loop, #23/#25/#26), `mod` (S→A→B pipeline,
+  `run_sandboxed`, the S-side signal forwarder / `terminate_app`,
+  sd-notify, #33)
 - `src/profile/` — per-app TOML profiles (`gpu`, `ro_binds`, `rw_binds`,
   `mask`, `env`; `deny_unknown_fields`)
 - `src/testutil.rs` — shared `#[cfg(test)]` helpers (env locking, TmpDir)
@@ -69,6 +71,15 @@ changes** (README.md is stale pending its phase-8 rewrite).
   canonical genfs labels.
 - SIGHUP exits with status 129 (128+SIGHUP) by design — no restart
   logic in the binary (intentional).
+- The app is the **only** process the supervisor arms: it mediates for
+  B's pid (decision #25). A *child* of the app issuing a trapped syscall
+  is never serviced and deadlocks the handoff (decision #32) — so a
+  shell app that spawns subshells (e.g. `$(...)`) will hang; the
+  reference app is single-process.
+- SIGTERM/SIGINT are **forwarded to the app** (SIGTERM, then SIGKILL
+  after 2 s, since pidns-init ignores default-action signals, #13/#33);
+  SIGHUP also terminates the app and exits 129. S sends `READY=1` to
+  systemd after the handoff and untags the Wayland socket on teardown.
 - Rust edition 2024; deps are pinned in Cargo.lock. `nono` is
   Apache-2.0 (compatible with this repo's AGPL-3.0); its docs are thin,
   the crate source is the reference.

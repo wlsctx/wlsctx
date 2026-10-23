@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.5 — Phase 4 done (nono landlock+seccomp, notify-fd handoff, supervisor; decisions #22–#29); Phase 5 (wayland + pipeline) next** (2026-10-22)
+Status: **v2.6 — Phase 5 done (tagged-wayland pipeline, sd-notify, signal forwarding, exit status, `/run` cleanup; decisions #30–#33); E2E (5.5) + Phase 6 (systemd) next** (2026-10-23)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -403,16 +403,43 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       tuning of the filter, if needed, happens there).
 
 ### Phase 5 — Wayland + full pipeline
-- [ ] 5.1 Tagged-socket creation moves ahead of the fork (supervisor side,
-      reusing the existing listener/roundtrip/context code)
-- [ ] 5.2 Reference pipe handed to the app (socket lives while the app
+- [x] 5.1 Tagged-socket creation moves ahead of the fork (supervisor
+      side, reusing the existing listener/roundtrip/context code)
+- [x] 5.2 Reference pipe handed to the app (socket lives while the app
       lives; app death invalidates it — clean lifecycle)
-- [ ] 5.3 `wlsctx run <app-id>`: profile → env → `execve`
-- [ ] 5.4 sd-notify (READY on child spawn), signal forwarding
+- [x] 5.3 `wlsctx run <app-id>`: profile → env → `execve`
+- [x] 5.4 sd-notify (READY on child spawn), signal forwarding
       (TERM/INT to app; keep SIGHUP→129 semantics), exit-status
       propagation, `/run` dir cleanup
 - [ ] 5.5 E2E on target: RustRover and LibreWolf run; `wlsinfo` diff vs
       host matches the old acceptance checklist
+
+**Phase 5 decisions.**
+- **30 — In-sandbox path grants.** The `CapabilitySet` and the app's env are
+      built from the *in-sandbox* path (`/run/user/<uid>/wlsctx/<inst>`,
+      decision #28's carry), not the host path: the app presents sandbox-side
+      strings to its trapped syscalls, so the grants must match those strings.
+      The wayland socket is granted by its tagged path. CLI: `run` gains
+      `--wayland/--listen/--socket-activation/--sandbox-engine`.
+- **31 — `open` ≠ `connect` on a unix socket.** `open(2)` on a unix socket
+      returns `ENXIO` (bash `exec 3<>` does `open`); the app must `connect(2)`.
+- **32 — The app is the only armed process.** The supervisor mediates for the
+      app's (B's) pid only (decision #25). A *child* of the pidns-init app
+      (e.g. a `$(...)` subshell in a shell script) issuing a trapped syscall is
+      never serviced → handoff deadlock (observed: the openat-write test hung
+      with the subshell stuck in `unix_stream_data_wait`). Reference app
+      scripts stay single-process; a multi-process app needs the supervisor to
+      arm per-pid (open question, Phase 6+).
+- **33 — Signal forwarding & shutdown.** S blocks `SIGTERM/SIGINT/SIGHUP`
+      before spawning any thread (all threads inherit the block). A forwarder
+      reads them from a `signalfd`: TERM/INT → `kill(SIGTERM)` to the app then
+      `SIGKILL` after a 2 s grace (decision #13 — pidns-init ignores
+      default-action signals); HUP → same, exit status 129. The app's host pid
+      is reported A→S over the S↔A socketpair (A is in the parent pidns). After
+      the handoff S sends `READY=1` (no-op without `$NOTIFY_SOCKET`). Teardown
+      joins both threads, drops the tagged socket (untag), and `remove_dir_all`s
+      the per-instance runtime dir (still at its host path — the step-1 carry is
+      a bind).
 
 ### Phase 6 — systemd integration
 - [ ] 6.1 D-Bus `StartTransientUnit` scope (Delegate=app,
