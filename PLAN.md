@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.6 — Phase 5 done (tagged-wayland pipeline, sd-notify, signal forwarding, exit status, `/run` cleanup; decisions #30–#33); E2E (5.5) + Phase 6 (systemd) next** (2026-10-23)
+Status: **v2.7 — Phase 5 done (tagged-wayland pipeline, sd-notify, signal forwarding, exit status, `/run` cleanup; decisions #30–#33); Phase 6 design fixed: Varlink `StartTransient` primary (systemd ≥ 261), D-Bus fallback, raw-cgroup last resort (#34)** (2026-10-23)
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -191,26 +191,39 @@ cannot bypass the security context.
 All of this happens **before** nono is applied, so seccomp never needs to
 permit `mount`/`mknod`/`unshare` for the app.
 
-## 4. systemd integration (least-intrusive: D-Bus, no `systemd-run`)
+## 4. systemd integration (least-intrusive: one in-process call, no `systemd-run`)
 
-`wlsctx run` attempts, in order:
+`wlsctx run` attempts, in order, and logs which tier it landed on:
 
-1. **D-Bus to the user systemd** (`org.freedesktop.systemd1.Manager`,
-   over the session bus; `zbus` or `dbus` crate — pick in Phase 6):
-   `StartTransientUnit("wlsctx-<app>-<instance>.scope", "replace",
-   { Delegate: "app", StopWhenUnneeded: "yes", Pids: [self] }, {})`.
-   `systemd` moves **wlsctx itself** into the new scope's cgroup; we then
-   create the delegated `app` sub-cgroup below it. (Same mechanism
-   rootless podman uses for its scopes — `Delegate` on a scope is
-   supported.) With `StopWhenUnneeded`, the scope dies when both the
-   supervisor and the app exit; `systemctl --user status` sees the unit.
-2. **Fallback (no systemd / D-Bus call failed):** no unit at all. Create
-   the `wlsctx-<app>` and `wlsctx-<app>/app` sub-cgroups with plain file
-   writes under the cgroup wlsctx is currently in (user-slice leaves are
-   writable by the user; creating child cgroups under a populated cgroup
-   is legal in cgroup v2 — the no-internal-process rule only blocks
-   enabling *controllers* there, which we don't need for a cgroup ns),
-   and proceed. Documented degradation: no unit visibility/accounting.
+1. **Varlink to the user systemd** (`io.systemd.Unit.StartTransient`,
+   over `/run/user/<uid>/systemd/io.systemd.Manager`) — **systemd ≥ 261**
+   (added in commit 913b81735e; the `io.systemd.Unit`/`io.systemd.Manager`
+   skeletons themselves date from 258). A user-level socket: no polkit.
+   The `UnitContext` carries `ID: "wlsctx-<app>-<instance>.scope"`,
+   `Type: "scope"`, `Pids: [self]`, `Description`, `Delegate: "app"`,
+   `StopWhenUnneeded: "yes"`. `systemd` moves **wlsctx itself** into the
+   new scope's cgroup; we then create the delegated `app` sub-cgroup
+   below it. (Same mechanism rootless podman uses for its scopes —
+   `Delegate` on a scope is supported.) With `StopWhenUnneeded`, the
+   scope dies when both the supervisor and the app exit;
+   `systemctl --user status` sees the unit.
+   **Distro coverage (pkgs.org, 2026-10):** Ubuntu 26.10, Fedora 45+,
+   Arch, OpenSUSE **Tumbleweed** (not LEAP), Wolfi.
+2. **D-Bus fallback — *future task* (6.1b), for systemd < 261:**
+   `org.freedesktop.systemd1.Manager.StartTransientUnit(name, "replace",
+   { Delegate: "app", StopWhenUnneeded: "yes", Pids: [self] }, {})` over
+   the session bus, via `zbus` 6 (`zbus::blocking`). Needed for Debian
+   13, **Ubuntu 26.04 LTS**, RHEL/EPEL/Rocky/Alma/CentOS. Semantics are
+   identical to tier 1 (same unit, same effect), only the wire protocol
+   differs.
+3. **Raw-cgroup fallback (no systemd / both calls failed):** no unit at
+   all. Create the `wlsctx-<app>` and `wlsctx-<app>/app` sub-cgroups
+   with plain file writes under the cgroup wlsctx is currently in
+   (user-slice leaves are writable by the user; creating child cgroups
+   under a populated cgroup is legal in cgroup v2 — the
+   no-internal-process rule only blocks enabling *controllers* there,
+   which we don't need for a cgroup ns), and proceed. Documented
+   degradation: no unit visibility/accounting.
 
 `cgroup.subtree_control` writes (resource limits for the `app` sub-cgroup)
 are a later optional extension, not required for namespacing to work.
@@ -239,7 +252,7 @@ hardening phase, out of scope for now.
 **App profiles** replace the quadlet drop-ins: TOML in
 `~/.config/wlsctx/apps/<app-id>.toml` (ro binds, rw binds, masked paths,
 env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
-`toml`, `serde`, and a D-Bus crate in Phase 6.
+`toml`, `serde`, and — for the Phase 6.1b D-Bus fallback only — `zbus`.
 
 ## 6. Decisions log
 
@@ -252,7 +265,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 5 | App distribution | *Open* — run host-installed apps (`/opt/<app>` ro-bind) for now; GPG/fetch story undecided |
 | 6 | `wlsctx wayland` subcommand | Keep (already tested; no unit file in repo anymore) |
 | 7 | Cleanup | Delete `docker-bake.hcl`, `systemd/`, `selinux/` (done this round). **`Dockerfile` still to decide** — it only existed to build the container image; propose deleting it in favour of a plain static build recipe. |
-| 8 | systemd integration | In-process D-Bus `StartTransientUnit` scope + raw-cgroup fallback (§4) |
+| 8 | systemd integration | In-process unit-start call (Varlink `StartTransient` primary, systemd ≥ 261; D-Bus fallback; raw-cgroup last resort) — §4, #34 |
 | 9 | `uid_map` write-once | **Confirmed.** Modern kernels permit exactly one write to `uid_map`/`gid_map` (verified in the v7.2 stable source and current master). The original design (single write of `0 self` + `self self`) turned out to be invalid — superseded by #10, which keeps write-once but makes the map a single extent. |
 | 10 | Map shape: single extent | **`<self> <self> 1`** (one extent, uid and gid). Kernel constraints: write-once (#9); an unprivileged creator may only write one extent of count 1 equal to its own uid/gid (`new_idmap_permitted()` fast path); two extents sharing a parent id are rejected by `mappings_overlap()` — so the two-entry `0 self; self self` map is EINVAL (bwrap uses the setuid `newuidmap` helper for more; we don't). Consequences: the identity is the real uid from the start, 0 is unmapped (`setresuid(0)` is EINVAL), the full ns cap set is held at exec — safe by construction of the map (§3.1) — and locked by nono in Phase 4. Subuid range for file ownership deferred (needs a setuid helper). Verified on 7.2.11-300.fc45; §3.1 rewritten; Phase 1 done. |
 | 11 | Target release | **Fedora 45** (machine upgraded; running 7.2.11-300.fc45). Kernel series 7.x; Landlock ABI ≥ v4 and unprivileged userns — verified on this machine (Phase 1.4). |
@@ -442,11 +455,17 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       a bind).
 
 ### Phase 6 — systemd integration
-- [ ] 6.1 D-Bus `StartTransientUnit` scope (Delegate=app,
-      StopWhenUnneeded, Pids=self) — pick `zbus` vs `dbus` crate;
-      verify `systemctl --user status` shows the scope, no "unexpected
-      process" warnings, scope dies with the instance
-- [ ] 6.2 Raw-cgroup fallback (no systemd / call failed): create
+- [ ] 6.1 Varlink `io.systemd.Unit.StartTransient` scope (systemd ≥ 261;
+      #34): hand-rolled blocking JSON client over
+      `/run/user/<uid>/systemd/io.systemd.Manager` (no new dep for the
+      primary path); prototype the exact call with `varlinkctl` first;
+      unit test; verify `systemctl --user status` shows the scope, no
+      "unexpected process" warnings, scope dies with the instance
+- [ ] 6.1b *(added 2026-10-23)* D-Bus fallback for systemd < 261
+      (Debian 13, **Ubuntu 26.04 LTS**, RHEL/EPEL): `zbus` 6
+      (`zbus::blocking`) calling `StartTransientUnit` on the session
+      bus; runtime tier detection: try varlink → D-Bus → raw-cgroup
+- [ ] 6.2 Raw-cgroup fallback (no systemd / both calls failed): create
       sub-cgroups under the current cgroup, proceed; document degradation
 - [ ] 6.3 `wlsctx wayland` remains usable standalone (socket activation
       is up to the user's own units — repo ships none)
@@ -505,3 +524,4 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 27 | nono's three-stage prepare/apply — the filter must never precede landlock's *prepare* | nono's `apply_landlock` calls `open_path_rule` → `open(O_PATH)` for every rule path. Installing the seccomp-notify filter *first* traps those opens: B blocks in a notification wait with no supervisor running yet — a hard deadlock (observed: 300 s timeout, zero output). The working order is nono's own prepare/apply split: `prepare_landlock_with_abi` (opens all rule paths, while unfiltered) → install the combined filter → `apply_raw` (consumes the prepared fds; opens nothing). #22's "the filter must precede landlock" survives as *the filter must precede landlock's **apply***. |
 | 28 | The rootfs scratch lives on `/var/tmp`; the runtime dir is carried before the `/run` mask | The scratch must stay resolvable through every build step, so it cannot sit under any masked tree. The old location (inside the per-instance runtime dir) is under `/run` for the default `XDG_RUNTIME_DIR=/run/user/<uid>` — and a bind *source* resolved after the fresh-`/run` mask hits the fresh tmpfs's empty stand-in directory: a **silent self-bind no-op** that never crosses to the host (writes "succeed" into the throwaway tmpfs; the app-side socket is invisible). New layout: the scratch is `/var/tmp/.wlsctx/<inst>` (mode 0700, not in the capability set; hidden from the app by the `/var` mask of step 8 *and* the Landlock floor), and the per-instance runtime dir is carried into it in step 1 — the only point where its host path is still resolvable — then bound onto the fresh `/run`'s instance dir in step 5. S removes the scratch (and its parent) on exit. |
 | 29 | Raw pidfd syscalls: explicit zero flags; the *host* pid is the right argument | `libc` 0.2 (gnu x86_64) exposes `SYS_pidfd_open`/`SYS_pidfd_getfd` as numbers only, so they are called via `syscall(2)`. The kernel does `if (flags) return -EINVAL` for both, and a short `syscall(2)` call leaves the flags register uninitialised → spurious `EINVAL` (observed on `pidfd_open`). Pass `0` explicitly. Also, `pidfd_open` resolves the pid *globally* (`find_get_pid` → `find_vpid`, the init-namespace hash), so A — inside the fresh pidns — must pass B's **host** pid, which is exactly what `fork()` returns (`clone` returns `pid_vnr` = `level[0].nr`, never the caller-namespace-local pid; B's local pid `1` would be the wrong argument). |
+| 34 | Varlink first, D-Bus as fallback | `wlsctx run` starts the scope via **Varlink** `io.systemd.Unit.StartTransient` on the *user* manager socket (`/run/user/<uid>/systemd/io.systemd.Manager`) — JSON over a unix socket, one request/response, no polkit, hand-rolled (~60 lines, no dep on the primary path). Requires **systemd ≥ 261** (`StartTransient` added in commit 913b81735e; the `io.systemd.Unit`/`io.systemd.Manager` skeletons from 258). Distro coverage (pkgs.org check, 2026-10): Ubuntu 26.10, Fedora 45+, Arch, OpenSUSE Tumbleweed, Wolfi. Older stacks (Debian 13, **Ubuntu 26.04 LTS**, RHEL/EPEL) fall back to **D-Bus** `org.freedesktop.systemd1.Manager.StartTransientUnit` on the session bus (`zbus` 6, `zbus::blocking` — chosen over `dbus` 0.9: zbus is the maintained, stable, widely-used crate). Tier order at runtime: varlink → D-Bus → raw-cgroup; the outcome is logged. The `varlink` crate (13.0.0) was considered but not adopted for the one-shot call. |
