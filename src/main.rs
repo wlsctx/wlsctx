@@ -47,15 +47,28 @@ fn main() -> Result<()> {
             } else {
                 profile.gpu
             };
+            // The tagged Wayland socket (Phase 5.1): enabled by any of
+            // --wayland / --listen / --socket-activation.
+            let wayland =
+                if args.wayland || args.listen.is_some() || args.socket_activation {
+                    Some(sandbox::WaylandSpec {
+                        listen: args.listen.map(|p| p.to_string_lossy().into_owned()),
+                        socket_activation: args.socket_activation,
+                        sandbox_engine: args.sandbox_engine,
+                    })
+                } else {
+                    None
+                };
             let config = sandbox::SandboxConfig {
-                app_id: args.app_id,
-                instance_id: args.instance_id,
+                app_id: args.app_id.clone(),
+                instance_id: args.instance_id.clone(),
                 network: match args.network.as_str() {
                     "none" => sandbox::namespaces::NetworkMode::None,
                     _ => sandbox::namespaces::NetworkMode::Shared,
                 },
                 profile,
                 gpu,
+                wayland,
             };
             let code = sandbox::run_sandboxed(&args.command, &config)?;
             info!("Sandboxed command exited with {code}");

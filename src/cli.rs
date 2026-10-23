@@ -58,6 +58,26 @@ pub(crate) struct RunArgs {
     /// Skip the GPU even if the app profile enables it
     #[arg(long, overrides_with = "gpu")]
     pub(crate) no_gpu: bool,
+    /// Create a tagged Wayland socket for the app (default name
+    /// `wayland-1` in the per-instance runtime dir; the app's
+    /// `WAYLAND_DISPLAY` points at it and it never sees the host's
+    /// socket). Needs a running wlroots compositor providing
+    /// `wp_security_context_manager_v1`
+    #[arg(long)]
+    pub(crate) wayland: bool,
+    /// Path of the tagged Wayland socket: an absolute path as given,
+    /// a relative path in the per-instance runtime dir. Implies
+    /// `--wayland`
+    #[arg(long, conflicts_with = "socket_activation")]
+    pub(crate) listen: Option<path::PathBuf>,
+    /// Adopt the tagged Wayland socket from systemd socket activation
+    /// (LISTEN_FDS) instead of binding a path. Implies `--wayland`
+    #[arg(long, conflicts_with = "listen")]
+    pub(crate) socket_activation: bool,
+    /// The value the tagged socket is tagged with
+    /// (`wp_security_context_v1.set_sandbox_engine`)
+    #[arg(long, default_value = "wlsctx")]
+    pub(crate) sandbox_engine: String,
     /// Command and its arguments, run inside the sandbox
     /// (everything after `--`; e.g. `wlsctx run -- /bin/sh -c 'id'`)
     #[arg(trailing_var_arg = true, required = true)]
@@ -583,12 +603,11 @@ mod tests {
     #[test]
     fn run_rejects_wlsctx_flags_before_the_command() {
         without_wlsctx_env(|| {
-            // A wlsctx flag *before* the command (no `--` separator) is
-            // parsed in the `run` context, which has no flags of its
-            // own: `--listen` (a `wayland` flag) must be rejected, not
-            // silently routed into the command.
-            let err = Cli::try_parse_from(["wlsctx", "run", "--listen", "/bin/sh"])
-                .expect_err("a wlsctx flag before the command must be rejected");
+            // A flag *before* the command (no `--` separator) that
+            // `run` does not know must be rejected, not silently
+            // routed into the command.
+            let err = Cli::try_parse_from(["wlsctx", "run", "--no-such-flag", "/bin/sh"])
+                .expect_err("an unknown flag before the command must be rejected");
             assert_eq!(err.kind(), ErrorKind::UnknownArgument);
         });
     }

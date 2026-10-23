@@ -26,6 +26,22 @@ use std::sync::Arc;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 
+/// The tagged Wayland socket of this run (Phase 5.1), created by S
+/// before the first fork; `None` = no tagged socket.
+#[derive(Clone, Debug, Default)]
+pub struct WaylandSpec {
+    /// The socket path: an absolute path as given; a relative path —
+    /// or no path at all (default name `wayland-1`) — in the
+    /// per-instance runtime dir.
+    pub listen: Option<String>,
+    /// Adopt the listener from systemd socket activation (LISTEN_FDS)
+    /// instead of binding a path.
+    pub socket_activation: bool,
+    /// The value the socket is tagged with
+    /// (`wp_security_context_v1.set_sandbox_engine`).
+    pub sandbox_engine: String,
+}
+
 /// The per-instance identity and mode of a sandboxed run (PLAN §5).
 #[derive(Clone, Debug)]
 pub(crate) struct SandboxConfig {
@@ -41,6 +57,8 @@ pub(crate) struct SandboxConfig {
     /// The final GPU decision: the profile's value unless overridden
     /// by `--gpu`/`--no-gpu`.
     pub gpu: bool,
+    /// The tagged Wayland socket (Phase 5.1); `None` = none.
+    pub wayland: Option<WaylandSpec>,
 }
 
 /// Run `command` inside the full namespace set, as our real uid
@@ -104,6 +122,51 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     let runtime_dir = mounts::instance_runtime_dir(&config);
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("creating the per-instance runtime dir {runtime_dir}"))?;
+    // The same dir's path *inside the sandbox* (the fresh `/run`'s
+    // systemd-standard location, decision #28). The policy grants
+    // and the app's env use this string: it is the one the app sees,
+    // and it equals the host path only for the default XDG.
+    let sandbox_runtime = mounts::sandbox_instance_dir(&config);
+
+    // Phase 5.1: the tagged Wayland socket is created *here*, ahead
+    // of the first fork: the rootfs build's step-1 carry (which runs
+    // in A immediately after the fork) must already see the socket
+    // file, and the tagging roundtrip must complete before A masks
+    // anything. S keeps its listener copy and the reference pipe
+    // open until this function returns (5.2) — the compositor drops
+    // the tag when they close, which the process exit guarantees.
+    // On a tagging failure the bound file is unlinked by the
+    // preparation itself, and we remove the runtime dir (no fork
+    // happened, so nothing will clean it up).
+    let tagged = if let Some(spec) = &config.wayland {
+        let t = match crate::wayland::prepare_tagged_socket(
+            &config.app_id,
+            &config.instance_id,
+            &runtime_dir,
+            spec.listen.as_deref(),
+            spec.socket_activation,
+            &spec.sandbox_engine,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&runtime_dir);
+                return Err(e).context("creating the tagged Wayland socket");
+            }
+        };
+        if log::log_enabled!(log::Level::Info)
+            && let Ok(local_addr) = t.listener.local_addr()
+        {
+            log::info!(
+                "Tagged Wayland socket at {local_addr:?} (engine: {}, app: {}, instance: {})",
+                spec.sandbox_engine,
+                config.app_id,
+                config.instance_id
+            );
+        }
+        Some(t)
+    } else {
+        None
+    };
 
     // The supervisor handoff channels, created before the first fork so
     // both S and A (and, down to B) inherit them (decisions #23, #26):
@@ -222,8 +285,9 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         // drives both floors, install the combined
                         // filter first, then the Landlock floor (the
                         // filter must precede Landlock — decision #22).
-                        let caps = policy::capability_set(&config, std::path::Path::new(&runtime_dir))
-                            .context("building the app's capability set")?;
+                        let caps =
+                            policy::capability_set(&config, std::path::Path::new(&sandbox_runtime))
+                                .context("building the app's capability set")?;
                         let notify = policy::apply(&caps)
                             .context("installing the seccomp-notify filter + Landlock floor")?;
                         // Hand the listener up to the supervisor
@@ -258,7 +322,7 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         error!("sandbox setup failed: {e:#}");
                         std::process::exit(126);
                     }
-                    exec_app(command, &config.profile.env);
+                    exec_app(command, &app_env(&config, &runtime_dir));
                 }
                 ForkResult::Parent { child } => {
                     // A is done with the B→A pipe's write end (B holds
@@ -363,6 +427,20 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 std::process::id(),
                 ss
             );
+            // 5.2: the tagged Wayland socket is held *by this branch*
+            // (S, the supervisor) from here until the process exits:
+            // the listener copy and the reference pipe ("close" fd)
+            // drop only when `run_sandboxed` returns, and their
+            // close — the compositor's untag trigger — happens no
+            // later than the app's death (which is what ends this
+            // function).
+            if let Some(t) = &tagged {
+                log::debug!(
+                    "S: holding the tagged Wayland socket {} (close_fd {})",
+                    t.host_path,
+                    t.close_fd.as_raw_fd()
+                );
+            }
 
             // The supervisor runs on a side thread so this one can
             // block in `waitpid` for A. It services B's trapped
@@ -373,7 +451,7 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 Ok(Some(notify)) => {
                     unsafe { libc::close(ss) };
                     log::debug!("S[{}]: got the listener (fd {})", std::process::id(), notify.as_raw_fd());
-                    match policy::capability_set(&config, std::path::Path::new(&runtime_dir)) {
+                    match policy::capability_set(&config, std::path::Path::new(&sandbox_runtime)) {
                         Ok(caps) => {
                             let stop2 = Arc::clone(&stop);
                             supervisor = Some(std::thread::spawn(move || {
@@ -447,6 +525,29 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     }
 }
 
+/// The app's environment (Phase 5.3): the profile's variables, plus
+/// — when this run has a tagged Wayland socket — the per-instance
+/// runtime dir as `XDG_RUNTIME_DIR` and the socket's name as
+/// `WAYLAND_DISPLAY`. The app thereby reaches *only* the tagged
+/// socket: the host's Wayland socket sits directly under the host
+/// XDG dir, which the fresh (mostly empty) `/run` in the sandbox
+/// hides.
+///
+/// `XDG_RUNTIME_DIR` is the *in-sandbox* instance dir (the
+/// step-5 location, decision #28), so the bare socket name
+/// resolves inside the sandbox even when the host's XDG is not
+/// systemd's default.
+fn app_env(config: &SandboxConfig, runtime_dir: &str) -> std::collections::BTreeMap<String, String> {
+    let mut env = config.profile.env.clone();
+    if let Some(spec) = &config.wayland {
+        let host_path = crate::wayland::resolve_socket_path(runtime_dir, spec.listen.as_deref());
+        let name = host_path.rsplit('/').next().unwrap_or("wayland-1");
+        env.insert("XDG_RUNTIME_DIR".into(), mounts::sandbox_instance_dir(config));
+        env.insert("WAYLAND_DISPLAY".into(), name.to_string());
+    }
+    env
+}
+
 /// Replace this (child) process with `command`, adding the profile's
 /// environment variables on top of the session environment. Never
 /// returns on success; on failure the error is logged and the child
@@ -464,4 +565,147 @@ fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, Strin
     let e = cmd.exec();
     error!("exec of {command:?} failed: {e}");
     std::process::exit(126);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run_sandboxed, SandboxConfig, WaylandSpec};
+    use crate::sandbox::mounts;
+    use crate::sandbox::namespaces::NetworkMode;
+    use crate::sandbox::userns::tests::run_in_child;
+    use std::ffi::OsString;
+    use std::io::Write;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream;
+
+    /// The tagged-socket run used by the live test below.
+    fn tagged_config() -> SandboxConfig {
+        SandboxConfig {
+            app_id: "wlt".to_string(),
+            instance_id: "1".to_string(),
+            network: NetworkMode::Shared,
+            profile: crate::profile::Profile::adhoc(),
+            gpu: false,
+            wayland: Some(WaylandSpec {
+                listen: Some("wl-probe".to_string()),
+                socket_activation: false,
+                sandbox_engine: "wlsctx-test".to_string(),
+            }),
+        }
+    }
+
+    /// Phase 5.1/5.2/5.3, end to end against the running compositor:
+    /// the tagged Wayland socket is created by S *ahead of the fork*
+    /// (5.1), carried into the sandbox by the rootfs build, and the
+    /// app's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` point at it (5.3),
+    /// so the app reaches only the tagged socket; the app's
+    /// `connect(2)` succeeds (the compositor holds the listener, the
+    /// supervisor mediates the allow). When the run ends, S's
+    /// listener copy and the reference pipe close with the process
+    /// (5.2): the socket file remains (nothing unlinks it) but no
+    /// longer serves — a host-side `connect(2)` is refused.
+    ///
+    /// Needs a running wlroots compositor providing
+    /// `wp_security_context_v1` (this project's target desktop,
+    /// sway): without one the tagging fails before the fork and the
+    /// run exits non-zero — an honest failure, not a skip.
+    #[test]
+    fn tagged_socket_is_carried_reachable_and_untagged() {
+        // The test relies on the session's real XDG/WAYLAND
+        // environment; serialise against env-mutating tests and
+        // against other full-sandbox runs (per-instance host state).
+        let _env_lock = crate::testutil::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _sb_lock = crate::testutil::SANDBOX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tagged_config();
+        let host_runtime = mounts::instance_runtime_dir(&config);
+        let host_socket = format!("{host_runtime}/wl-probe");
+        let sandbox_runtime = mounts::sandbox_instance_dir(&config);
+
+        // A fresh start: no stale dir or socket from a previous run.
+        let _ = std::fs::remove_dir_all(&host_runtime);
+        assert!(
+            !std::path::Path::new(&host_socket).exists(),
+            "{host_socket} exists before the run (stale state?)"
+        );
+
+        // The app: report the environment `run` set, then connect to
+        // the tagged socket (`connect(2)`; a bare `open(2)` on a unix
+        // socket is not a connect on this kernel).
+        let script = "\
+import os, socket, stat\n\
+print('WD=%s' % os.environ['WAYLAND_DISPLAY'])\n\
+print('XDG=%s' % os.environ['XDG_RUNTIME_DIR'])\n\
+p = os.path.join(os.environ['XDG_RUNTIME_DIR'], os.environ['WAYLAND_DISPLAY'])\n\
+print('FILE-OK' if stat.S_ISSOCK(os.lstat(p).st_mode) else 'FILE-NO')\n\
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+s.connect(p)\n\
+print('CONNECT-OK')";
+        let command = vec![
+            OsString::from("/usr/bin/python3"),
+            OsString::from("-c"),
+            OsString::from(script),
+        ];
+        let (code, out, err) = run_in_child(move |o| match run_sandboxed(&command, &config) {
+            Ok(code) => code,
+            Err(e) => {
+                let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                2
+            }
+        });
+        match code {
+            Some(0) => {}
+            Some(other) => panic!(
+                "the tagged-socket run exited with {other} — with no running \
+                 compositor the tagging fails before the fork and the \
+                 error below says so:\n{out}\n{err}"
+            ),
+            None => panic!("the test harness failed:\n{out}\n{err}"),
+        }
+        // 5.3: the environment `run` gave the app.
+        assert!(
+            out.contains("WD=wl-probe\n")
+                && out.contains(&format!("XDG={sandbox_runtime}\n")),
+            "the app's WAYLAND_DISPLAY/XDG_RUNTIME_DIR are not what run sets \
+             (expected WD=wl-probe, XDG={sandbox_runtime}):\n{out}\n{err}"
+        );
+        // 5.1: the socket file is in the sandbox, at the in-sandbox
+        // instance dir.
+        assert!(
+            out.contains("FILE-OK\n"),
+            "the tagged socket file is not in the sandbox:\n{out}\n{err}"
+        );
+        // The app's connect reached the listener the compositor holds
+        // (the tag succeeded pre-fork) and the supervisor let it
+        // through.
+        assert!(
+            out.contains("CONNECT-OK\n"),
+            "the app could not connect to the tagged socket:\n{out}\n{err}"
+        );
+
+        // 5.2: the run is over and with it S's listener copy and the
+        // reference pipe: the file remains (nothing unlinks it) but
+        // no longer serves.
+        assert!(
+            std::fs::symlink_metadata(&host_socket)
+                .map(|m| m.file_type().is_socket())
+                .unwrap_or(false),
+            "the socket file {host_socket} is gone after the run (it should remain, stale)"
+        );
+        match UnixStream::connect(&host_socket) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            other => panic!(
+                "the tagged socket still serves after the run (the tag was \
+                 not released): {other:?}"
+            ),
+        }
+
+        // Tidy: the stale socket and the per-instance dir.
+        let _ = std::fs::remove_file(&host_socket);
+        let _ = std::fs::remove_dir_all(&host_runtime);
+    }
 }

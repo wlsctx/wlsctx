@@ -79,6 +79,8 @@ pub fn obtain_listener(args: &WaylandArgs) -> Result<(String, String, UnixListen
 /// Bind a listening socket at `path`, refusing to steal a socket that a
 /// live process still serves and only replacing genuinely stale ones.
 ///
+/// `pub(crate)` so the `run` pipeline (Phase 5.1) can bind its tagged
+/// socket from the supervisor side.
 /// A socket file is *stale* only if no process holds its listener open
 /// (connect(2) then fails with ECONNREFUSED). A successful connect means
 /// the path is actively served — including a previous hung wlsctx that
@@ -86,7 +88,7 @@ pub fn obtain_listener(args: &WaylandArgs) -> Result<(String, String, UnixListen
 /// some other service (e.g. the compositor's own wayland-1): unlinking
 /// that would break it, so we bail instead. The probe itself creates one
 /// pending connection on a live listener, which we close immediately.
-fn bind_socket(path: &path::Path) -> Result<UnixListener> {
+pub(crate) fn bind_socket(path: &path::Path) -> Result<UnixListener> {
     match fs::metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => match UnixStream::connect(path) {
             Ok(_) => bail!(

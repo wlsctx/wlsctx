@@ -36,6 +36,15 @@ const BASE_READ: &[&str] = &[
 
 /// The capability set for `config`: the base app grants plus the
 /// profile's binds, sockets, network, signal and IPC modes.
+///
+/// `instance_dir` is the per-instance runtime dir's path **as the
+/// app sees it inside the sandbox** (the fresh `/run`'s
+/// systemd-standard location — `mounts::sandbox_instance_dir`). It
+/// is that string the supervisor matches on (the app presents
+/// sandbox-side paths to its trapped syscalls) and that the
+/// Landlock floor binds in B; for the default XDG it equals the
+/// host path, for a divergent XDG it does not (decision #28, the
+/// Phase-5 path translation).
 pub(crate) fn capability_set(
     config: &SandboxConfig,
     instance_dir: &Path,
@@ -55,8 +64,8 @@ pub(crate) fn capability_set(
     caps = caps
         .allow_path("/tmp", AccessMode::ReadWrite)
         .context("granting /tmp")?;
-    // The per-instance /run dir (future home of the tagged wayland
-    // socket — Phase 5), and its socket subtree.
+    // The per-instance /run dir (the tagged Wayland socket's home —
+    // Phase 5), and its socket subtree.
     caps = caps
         .allow_path(instance_dir, AccessMode::ReadWrite)
         .with_context(|| format!("granting the instance dir {instance_dir:?}"))?;

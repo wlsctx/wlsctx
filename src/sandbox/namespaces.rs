@@ -277,6 +277,7 @@ mod tests {
             // `/dev/dri` build are skipped.
             gpu: false,
             profile: crate::profile::Profile::adhoc(),
+            wayland: None,
         }
     }
 

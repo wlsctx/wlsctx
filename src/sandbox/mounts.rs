@@ -69,6 +69,20 @@ pub(crate) fn rootfs_scratch_dir(cfg: &SandboxConfig) -> String {
     format!("/var/tmp/.wlsctx/{inst}")
 }
 
+/// The per-instance runtime dir's path *inside the sandbox*: the
+/// step-5 bind always places it at the systemd-standard location,
+/// regardless of the host's `XDG_RUNTIME_DIR` (the path-translation
+/// case of decision #28 — the host path and this string agree only
+/// for the default XDG, and the policy grants / the app's env use
+/// *this* string so the two floors mediate the path the app sees).
+pub(crate) fn sandbox_instance_dir(cfg: &SandboxConfig) -> String {
+    let uid = nix::unistd::getuid().as_raw();
+    format!(
+        "/run/user/{uid}/wlsctx/{}",
+        namespaces::cgroup_name_for(&cfg.app_id, &cfg.instance_id)
+    )
+}
+
 pub(crate) fn instance_runtime_dir(cfg: &SandboxConfig) -> String {
     let uid = nix::unistd::getuid().as_raw();
     let xdg = std::env::var("XDG_RUNTIME_DIR")
@@ -424,6 +438,7 @@ mod tests {
             network: NetworkMode::Shared,
             gpu,
             profile: p,
+            wayland: None,
         }
     }
 

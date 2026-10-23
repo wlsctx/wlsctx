@@ -630,6 +630,7 @@ pub(crate) mod tests {
             network: crate::sandbox::namespaces::NetworkMode::Shared,
             profile: crate::profile::Profile::adhoc(),
             gpu: false,
+            wayland: None,
         };
         let (code, out, err) = run_in_child(move |o| {
             match run_sandboxed(&[OsString::from("id")], &config) {

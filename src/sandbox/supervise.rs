@@ -639,6 +639,7 @@ mod tests {
             network: net,
             gpu: false,
             profile: crate::profile::Profile::adhoc(),
+            wayland: None,
         }
     }
 
@@ -694,18 +695,6 @@ mod tests {
         }
     }
 
-    /// The instance dir is bind-mounted into the sandbox's fresh `/run`
-    /// at `/run/user/<uid>/wlsctx/<inst>`. The capability set grants it
-    /// by its *host* path (`$XDG_RUNTIME_DIR/wlsctx/<inst>`), so the two
-    /// strings agree only when XDG is the systemd default (a divergent
-    /// XDG dir is the path-translation problem of Phase 5).
-    fn xdg_runtime_matches_run_user() -> bool {
-        match std::env::var("XDG_RUNTIME_DIR") {
-            Ok(x) => x == format!("/run/user/{}", nix::unistd::getuid().as_raw()),
-            Err(_) => true, // instance_runtime_dir defaults to /run/user/<uid>
-        }
-    }
-
     /// A write outside every granted subtree is denied by the sandbox
     /// itself (DAC alone would allow it), while a write into the
     /// granted instance subtree succeeds and lands on the host through
@@ -714,11 +703,16 @@ mod tests {
     fn openat_write_denied_outside_granted_subtrees() {
         let uid = nix::unistd::getuid().as_raw();
         let config = cfg("app", "1", NetworkMode::Shared);
-        let inst = mounts::instance_runtime_dir(&config);
         let denied = format!("/run/user/{uid}/wlsctx-p4-deny-file");
-        let ctrl = format!("{inst}/p4-ctrl");
+        // The app writes to the instance dir's *in-sandbox* path
+        // (the fresh /run's systemd-standard location, decision #28)
+        // — equal to the host path for the default XDG — and the
+        // write crosses the bind mount to the host dir.
+        let sandbox_inst = mounts::sandbox_instance_dir(&config);
+        let ctrl_host = mounts::instance_runtime_dir(&config);
+        let ctrl_app = format!("{sandbox_inst}/p4-ctrl");
         let script = format!(
-            "echo x > {denied} 2>/dev/null; a=$?; echo ctrl > {ctrl} 2>/dev/null; b=$?; echo a=$a b=$b"
+            "echo x > {denied} 2>/dev/null; a=$?; echo ctrl > {ctrl_app} 2>/dev/null; b=$?; echo a=$a b=$b"
         );
         let (code, out, err) =
             run_cmd(&["/bin/sh".into(), "-c".into(), script], &config);
@@ -736,8 +730,8 @@ mod tests {
             "the write into the instance dir must be allowed, got:\n{out}\n{err}"
         );
         // The allowed write crossed the bind mount to the host.
-        let host_ctrl = std::fs::read_to_string(&ctrl)
-            .unwrap_or_else(|e| panic!("reading the host-side copy of {ctrl:?}: {e}"));
+        let host_ctrl = std::fs::read_to_string(format!("{ctrl_host}/p4-ctrl"))
+            .unwrap_or_else(|e| panic!("reading the host-side copy: {e}"));
         assert_eq!(host_ctrl.trim(), "ctrl", "got {host_ctrl:?}");
         // The denied write never materialized.
         assert!(
@@ -817,15 +811,12 @@ mod tests {
     /// The tagged-socket flow: `connect(2)` to a socket inside the
     /// granted instance subtree is mediated *allow* — the connection
     /// reaches the host-side listener and the payload crosses.
+    ///
+    /// The app connects to the instance dir's *in-sandbox* path
+    /// (decision #28); the socket file itself is the host-side
+    /// listener's, carried by the instance dir's bind mount.
     #[test]
     fn connect_to_instance_dir_socket_is_allowed() {
-        if !xdg_runtime_matches_run_user() {
-            eprintln!(
-                "skipping: XDG_RUNTIME_DIR differs from /run/user/<uid>; \
-                 instance-dir path translation is Phase 5"
-            );
-            return;
-        }
         let config = cfg("app", "3", NetworkMode::Shared);
         let inst = mounts::instance_runtime_dir(&config);
         std::fs::create_dir_all(&inst)
@@ -834,9 +825,13 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock)
             .unwrap_or_else(|e| panic!("binding {sock:?}: {e}"));
+        let sock_in_sandbox = format!(
+            "{}/wayland-0",
+            mounts::sandbox_instance_dir(&config)
+        );
         let script = format!(
             "import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); \
-             s.connect({sock:?}); s.sendall(b'P4-OK'); print('CONNECTED')"
+             s.connect({sock_in_sandbox:?}); s.sendall(b'P4-OK'); print('CONNECTED')"
         );
         let (code, out, err) = run_cmd(
             &["/usr/bin/python3".into(), "-c".into(), script],
