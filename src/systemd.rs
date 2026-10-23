@@ -78,6 +78,20 @@ pub(crate) enum ScopeTier {
     /// The supervisor now lives in this transient scope unit.
     Joined { unit: String },
     /// No scope (reason string for the log); proceed raw-cgroup.
+    ///
+    /// The *sandbox itself* is untouched by this — all namespaces,
+    /// the rootfs, the landlock/seccomp policy, and signal forwarding
+    /// are exactly as in the joined case (phase 6.2). What is lost is
+    /// the transient unit's visibility and accounting: the run does
+    /// not appear under `systemctl --user`, and there is no unit to
+    /// `stop` (the supervisor's own signal handling and teardown are
+    /// unaffected and work the same). What still happens: A's
+    /// pre-unshare cgroup capture (decision #20) creates and enters
+    /// the instance sub-cgroup under `S`'s current cgroup, so the
+    /// app's cgroup isolation remains, and the supervisor removes
+    /// that sub-cgroup when the instance dies (best-effort, as
+    /// before). The degradation is a `warn!` here and a `debug!` at
+    /// the call site — one visible line, never an abort.
     Unavailable(String),
 }
 

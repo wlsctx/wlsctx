@@ -521,8 +521,12 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       test: with a session bus — attach self, assert moved + child
       accepts a pid + recursive removal; without — assert raw tier
       (never a silent skip)
-- [ ] 6.2 Raw-cgroup fallback (no session bus / no user systemd /
-      call failed): existing #12/#20 path; document degradation
+- [x] 6.2 Raw-cgroup fallback (no session bus / no user systemd /
+      call failed): the #12/#20 path; the degradation's user-visible
+      semantics are documented on `ScopeTier::Unavailable` (sandbox
+      unchanged; only unit visibility/accounting lost; the instance
+      sub-cgroup still created under `S`'s current cgroup and
+      cleaned up on exit)
 - [ ] 6.3 `wlsctx wayland` remains usable standalone (per-app proxy /
       socket-activation units are up to the user; the repo ships only
       the broker units, re-homed in 7.1)

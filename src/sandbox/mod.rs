@@ -143,8 +143,11 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     // function's `sub_cgroup` and A's pre-unshare cgroup capture
     // (decision #20) root under the scope, and systemd removes the
     // scope *and its children* recursively when `S` — the last
-    // member — exits. Any failure degrades to the raw-cgroup tier;
-    // a run is never aborted over this.
+    // member — exits. Any failure degrades to the raw-cgroup tier:
+    // the sandbox itself is unchanged, the run simply has no unit
+    // visibility/accounting, and the instance sub-cgroup is created
+    // under `S`'s current cgroup instead (see `ScopeTier::
+    // Unavailable`). A run is never aborted over this.
     let scope_unit = format!("wlsctx-{}-{}.scope", config.app_id, config.instance_id);
     match crate::systemd::attach_scope(&scope_unit, &format!("wlsctx sandbox: {}", config.app_id)) {
         crate::systemd::ScopeTier::Joined { unit } => {
