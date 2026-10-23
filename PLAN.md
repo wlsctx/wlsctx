@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.8 — Phase 5 done (tagged-wayland pipeline, sd-notify, signal forwarding, exit status, `/run` cleanup; decisions #30–#33); Phase 6 verified on target and revised: D-Bus session-bus `StartTransientUnit` primary (PIDs only), raw-cgroup fallback, varlink deferred (#34, #35)** (2026-10-23)
+Status: **v2.9 — the clipboard branch is merged (2026-10-23, `21b26dd`): the wayland proxy and the prompt broker (folded in as Phase 6.5) are done and verified on this desktop by a `wayland-info` e2e (the stamp, the nesting guard, the allow-list pass-through, the SIGHUP re-exec), which surfaced two latent bugs — the allow-list pass-through (`1e46e3b`) and the broker's arrival-order race (`9fded8c`, LESSONS #17). Next up: Phase 7 (re-home the proxy/broker deployment units, dbus-proxy, xwayland)**
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -255,8 +255,12 @@ delegated, so no `io` limits from inside the session.
 ```
 wlsctx run  [OPTIONS] <app-id> [APP ARGS...]     # full pipeline, execs app
 wlsctx run  [OPTIONS] -- <command> [ARGS...]     # ad-hoc (no profile)
-wlsctx wayland [OPTIONS]                         # today's behaviour: tagged
-                                                 # socket only (mode A)
+wlsctx wayland [OPTIONS]                         # tagged socket only
+                                                 # (tag-and-park), or
+                                                 # --proxy: the mode A relay
+wlsctx broker  [OPTIONS]                         # the prompt broker daemon
+wlsctx decide  [OPTIONS]                         # list / resolve pending
+                                                 # prompts
 # later phases: dbus-proxy, xwayland, profile show, status/stop
 ```
 
@@ -297,6 +301,20 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 15 | `/sys/class/net` is global | On 7.2 it lists interfaces of **all** netns (a global sysfs tree) — `unshare --net` still shows the host's. Per-netns verification uses `/proc/net/dev` (per-reader view) and netlink (`ip link`); the network tests do exactly that. |
 | 16 | Mount-ns naming/propagation quirks | The mount-ns symlink is `ns/mnt` (not `ns/mount`); `/proc/self/ns/` also contains `pid_for_children`/`time_for_children` entries. In mountinfo the word `private` is **omitted** (it's the default; only `shared:`/`slave:`/`unbindable:` tokens appear — host `/` shows `shared:1`). "View is private" is therefore asserted by *absence* of propagation tokens, gated on a host precondition that `/` is shared. |
 | 17 | The mount-ENOENT "flake" | **Not a kernel bug.** The mount test passed a non-NUL-terminated Rust `&str` to `mount()`/`umount()`; the kernel over-reads until a NUL, and the byte after the heap buffer is usually zero (worked) but occasionally not (garbage-suffixed path → ENOENT, sticky, invisible to `stat()`, stale dir left behind). v7.2 dcache/namei audited and exonerated (incl. the 98b6cf102b35 negative-dentry fix — a real but different bug). Fixed `6d255d1`. Rule: **every path handed to a C interface is NUL-terminated** (`dir_c` pattern). |
+| 18 | Binding mount roots | Binding the **mount root** of devtmpfs/sysfs/ext4 (e.g. `/dev`, `/sys` themselves) is EINVAL unprivileged on 7.2.11; any **subpath** or file binds fine. Hence `/dev`/`/sys` are rebuilt as fresh tmpfs + subpath binds (the scratch dir carries the node files out of the tree before the self-bind). |
+| 19 | `mknod` unprivileged | Unprivileged `mknod` of device nodes is EPERM on 7.2.11 (SELinux enforcing). `/dev` nodes and `/dev/dri` are therefore **bind-mounted** (canonical genfs SELinux labels preserved), never mknod'd. |
+| 20 | Cgroup ns root | The ns root is the unsharing task's cgroup **at unshare time**, so the instance sub-cgroup must be entered *before* `unshare(CLONE_NEWCGROUP)`: the app sees `0::/` (its own cgroup is the root; 7.2 renders it with a trailing slash). The Phase-2 order (unshare → move) rooted the ns at the session cgroup (`0::/app-N`) and is corrected; it must still precede the rootfs build (cgroup2 goes ro with the self-bind). |
+| 21 | ro-binds are unattainable | On 7.2.11 `MS_BIND\|MS_RDONLY` **silently drops the ro flag** on a bind of a foreign superblock (probed on `/`, on files, and in both one-shot and make-private variants); the two-step bind → `MS_REMOUNT\|MS_RDONLY` is EPERM (the sb's `s_user_ns` is init — we can remount only our *own* fs). §3.3 corrected: `/` and the `/sys` subpaths are plain binds; read-only *semantics* for the app come from its real uid (root-owned trees unwritable) plus the nono landlock/seccomp policy (Phase 4). The test's former `ROOTWR` probe was a false positive (EACCES ≠ EROFS) and the `/proc/mounts` `head -1` read the *bottom* of the mount stack — the topmost entry is the last line. |
+| 22 | One notify listener per thread | Linux allows a single `SECCOMP_FILTER_FLAG_NEW_LISTENER` filter per thread, so nono's AF_UNIX mediation filter (traps all `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg` — the family is checked in userspace, BPF cannot dereference) and the openat-logging filter must be one combined program (`PreparedSeccompNotifyFilter::with_openat_notifications`). Consequence: every `sendmsg` of the app (incl. all wayland/TCP traffic) is a supervisor round-trip — the supervisor must stay a tight, responsive loop or the app stalls. The filter is installed **before** `apply_landlock` (nono's requirement: the supervisor must see paths Landlock would block). |
+| 23 | Notify-fd handoff without SCM_RIGHTS from B | B's `sendmsg` is trapped by its own filter, so B cannot hand the listener fd to S via `SCM_RIGHTS` after install. Handoff: B writes the listener's *fd number* to a pre-made B→A pipe; A (unfiltered, B's parent, same uid) does `pidfd_open(B)`+`pidfd_getfd(num)` to take its own copy, then sends it to S over a pre-made S↔A socketpair. All three channels are created in S **before** the first fork and distributed at the forks (A closes the S-side copies, B closes the A-side copies). A dead B (zombie has no fd table) → handoff fails → S falls back to plain `waitpid` (landlock still enforced). |
+| 24 | Landlock needs explicit ancestor grants on Linux | A landlock rule is a default-deny floor: to reach a granted subtree the app also needs refer/traverse on every ancestor. nono's `path_metadata_dirs` (ancestor metadata grants) is macOS-only — on Linux the policy itself must grant `/` Read (and any other ancestor chains). Consistent with the current rootfs: the self-bind of `/` already shows the app every top-level directory, so Read-on-`/` adds no visibility. |
+| 25 | Supervisor decides (auto-deny), never expands | The supervisor's role in Phase 4 is mediation+logging, not expansion: openat/AF_UNIX notifications are answered continue (allowlisted) or EACCES (denied + logged); there is no fd injection, no approval flow. Abstract/unnamed AF_UNIX sockets are denied (nono's default for pathname mediation) — GUI apps that use abstract-socket IPC (e.g. Chromium-style) may need a per-profile relaxation, to be added if Phase 5's E2E hits it. |
+| 26 | Deterministic handoff: the verdict pipe | The seccomp listener is allocated `O_CLOEXEC` in B's table by the kernel (`get_unused_fd_flags(O_CLOEXEC)`, `kernel/seccomp.c`), and `pidfd_getfd` on B succeeds only while B is still dumpable — i.e. *pre-exec* (after exec the credential change fails `task_still_dumpable` → `EPERM`). If B started execing while A was still extracting, the dynamic loader's `openat`s would pile up on the dying listener: `seccomp_notify_free` completes every pending notification with `-ENOSYS` (observed: `Error 38` on `libtinfo.so.6`). Hence B blocks on an A→B **verdict pipe** before exec (`1` = exec, `0` = exit 126 — never an unsupervised exec); A sends it only after the extract + `SCM_RIGHTS` to S have completed. Two close-order invariants: B must *inherit* the verdict read end, so A closes its copy only *after* the second fork (closing it before the fork left B polling a dangling fd number — the "hang" that gdb showed as B-in-poll/A-in-wait4); and A ignores `SIGPIPE` after the fork, because a failure-path verdict can hit a pipe whose reader is already gone and must not kill A before it reaps B. |
+| 27 | nono's three-stage prepare/apply — the filter must never precede landlock's *prepare* | nono's `apply_landlock` calls `open_path_rule` → `open(O_PATH)` for every rule path. Installing the seccomp-notify filter *first* traps those opens: B blocks in a notification wait with no supervisor running yet — a hard deadlock (observed: 300 s timeout, zero output). The working order is nono's own prepare/apply split: `prepare_landlock_with_abi` (opens all rule paths, while unfiltered) → install the combined filter → `apply_raw` (consumes the prepared fds; opens nothing). #22's "the filter must precede landlock" survives as *the filter must precede landlock's **apply***. |
+| 28 | The rootfs scratch lives on `/var/tmp`; the runtime dir is carried before the `/run` mask | The scratch must stay resolvable through every build step, so it cannot sit under any masked tree. The old location (inside the per-instance runtime dir) is under `/run` for the default `XDG_RUNTIME_DIR=/run/user/<uid>` — and a bind *source* resolved after the fresh-`/run` mask hits the fresh tmpfs's empty stand-in directory: a **silent self-bind no-op** that never crosses to the host (writes "succeed" into the throwaway tmpfs; the app-side socket is invisible). New layout: the scratch is `/var/tmp/.wlsctx/<inst>` (mode 0700, not in the capability set; hidden from the app by the `/var` mask of step 8 *and* the Landlock floor), and the per-instance runtime dir is carried into it in step 1 — the only point where its host path is still resolvable — then bound onto the fresh `/run`'s instance dir in step 5. S removes the scratch (and its parent) on exit. |
+| 29 | Raw pidfd syscalls: explicit zero flags; the *host* pid is the right argument | `libc` 0.2 (gnu x86_64) exposes `SYS_pidfd_open`/`SYS_pidfd_getfd` as numbers only, so they are called via `syscall(2)`. The kernel does `if (flags) return -EINVAL` for both, and a short `syscall(2)` call leaves the flags register uninitialised → spurious `EINVAL` (observed on `pidfd_open`). Pass `0` explicitly. Also, `pidfd_open` resolves the pid *globally* (`find_get_pid` → `find_vpid`, the init-namespace hash), so A — inside the fresh pidns — must pass B's **host** pid, which is exactly what `fork()` returns (`clone` returns `pid_vnr` = `level[0].nr`, never the caller-namespace-local pid; B's local pid `1` would be the wrong argument). |
+| 34 | Varlink first, D-Bus as fallback | `wlsctx run` starts the scope via **Varlink** `io.systemd.Unit.StartTransient` on the *user* manager socket (`/run/user/<uid>/systemd/io.systemd.Manager`) — JSON over a unix socket, one request/response, no polkit, hand-rolled (~60 lines, no dep on the primary path). Requires **systemd ≥ 261** (`StartTransient` added in commit 913b81735e; the `io.systemd.Unit`/`io.systemd.Manager` skeletons from 258). Distro coverage (pkgs.org check, 2026-10): Ubuntu 26.10, Fedora 45+, Arch, OpenSUSE Tumbleweed, Wolfi. Older stacks (Debian 13, **Ubuntu 26.04 LTS**, RHEL/EPEL) fall back to **D-Bus** `org.freedesktop.systemd1.Manager.StartTransientUnit` on the session bus (`zbus` — chosen over `dbus` 0.9: zbus is the maintained, stable, widely-used crate). Tier order at runtime: varlink → D-Bus → raw-cgroup; the outcome is logged. The `varlink` crate (13.0.0) was considered but not adopted for the one-shot call. |
+| 35 | D-Bus primary, varlink deferred (supersedes #34) | Hands-on verification on the Fedora 45 target (systemd 261) overturned the varlink-first plan. (a) `io.systemd.Unit.StartTransient` exists since 261 but is **service-only** (`ID`/`Description`/`Service{Type,ExecStart,RemainAfterExit}`); `SetUnitProperties` accepts `Markers` only; a scope created without PIDs **refuses to start** ("Scope has no PIDs. Refusing"). A scope context with `PIDs` (json pidref) exists only on `main` (abde7e80d0, 2026-10-16 — after v262), so no *released* systemd can do the operation via varlink. (b) D-Bus `StartTransientUnit` works on every user-systemd stack (scopes since v252), needs no polkit on the session bus, and the exact call is: unit `*.scope`, mode `replace`, properties `{ PIDs: <au> [self] }` — property name is `PIDs` (since v252), value an array of uint32; reply type is `(o)`, not `(uo)`. (c) `StopWhenUnneeded=true` is **harmful** on v261 scopes: `unit_is_unneeded()` stops any active, jobless, unpinned scope immediately (verified: scope removed in the same second, member alive, cgroup `(deleted)`). Not needed anyway — a scope auto-stops and is removed **recursively** when its last member leaves (verified: supervisor in scope, app in a user-mkdir'd child; supervisor exits last → whole subtree gone). (d) `Delegate=` is unnecessary: the entire user-session cgroup subtree (`user.slice/user-<uid>.slice/user@<uid>.service/`, incl. manager-created scopes) is **owned by the user** (delegation of `user@.service` chowns it), so the user can `mkdir`/write `cgroup.procs` inside the scope without any unit-level delegation. The user manager also lands transient scopes in `app.slice` (not directly under `user@.service`) — hence the instance sub-cgroup's parent is read from `/proc/self/cgroup` after the call, never assumed. Net: D-Bus (`zbus`, driven on a fresh local tokio runtime per call — never the process-global `OnceLock` runtime, which is dead in a forked child; see `src/systemd.rs`) is the primary tier for all distros (incl. Ubuntu 26.04 LTS, Debian 13 — the very distros that motivated the fallback); varlink becomes a future tier (6.4) once a release ships scope-with-PIDs. The raw-cgroup path remains the last resort (and is what A already does in #12/#20 — the only change is that S's D-Bus call moves S (and thus A's inherited cgroup) into the scope before the forks). |
 
 ## 7. Phases & task list
 
@@ -505,16 +523,102 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       (never a silent skip)
 - [ ] 6.2 Raw-cgroup fallback (no session bus / no user systemd /
       call failed): existing #12/#20 path; document degradation
-- [ ] 6.3 `wlsctx wayland` remains usable standalone (socket activation
-      is up to the user's own units — repo ships none)
+- [ ] 6.3 `wlsctx wayland` remains usable standalone (per-app proxy /
+      socket-activation units are up to the user; the repo ships only
+      the broker units, re-homed in 7.1)
 - [ ] 6.4 *(future, #35)* varlink tier once a released systemd ships a
       scope context with `PIDs` in `io.systemd.Unit.StartTransient`
       (main only as of 2026-10-16, after v262)
 
-### Phase 7 — Sidecars (deferred)
-- [ ] 7.1 `wlsctx dbus-proxy <instance>`: host-side `xdg-dbus-proxy`
+### Phase 6.5 — Wayland proxy & prompt broker (clipboard branch, merged `21b26dd`)
+
+The clipboard branch built the `--proxy` relay and the host-side
+broker as its own workstream (its phases 1–9, tracked in its own
+TASKS.md); the 2026-10-23 merge folded that work in here. All of it
+is integration-tested (`tests/proxy_integration.rs`,
+`tests/broker_integration.rs`):
+
+- [x] 6.5.1 Mode A relay (`wayland --proxy`): convention-adaptive
+      object bookkeeping between the app's connections and fresh
+      tagged security-context connections (`src/proxy/`; the fd
+      misrouting defect and its fix:
+      `docs/postmortems/fd-swap-fix-plan.md`). SIGHUP is a rebuild,
+      not a stub: an in-place re-exec of `/proc/self/exe` in
+      `--listen` mode (same pid; re-binds and re-tags the freed
+      socket) and a clean exit for a systemd restart when
+      socket-activated.
+- [x] 6.5.2 Global allow-list (`--allow-globals`): filters the
+      `wl_registry` globals and rejects binds of non-allowlisted
+      interfaces. **Absent flag = pass-through** (`Policy::all()`).
+      The branch-era code mapped *absent* to an *active-but-empty*
+      allow-list (hides everything) — the desktop e2e caught it;
+      fixed in `1e46e3b`.
+- [x] 6.5.3 Clipboard receive-gate (`--clipboard-policy=deny`): a
+      dropped read becomes a consent request to the broker (allow =
+      a 1500 ms intent window; deny and every failure path fail
+      closed); clipboard/primary writes are audited, and
+      `--notify-copy-out` fires a one-way `clipboard-write`
+      notification (fire-and-forget, fail-open, rate-limited to one
+      per selection per second per app — the window is anchored on
+      the *fired* notification, so a continuous stream never
+      starves).
+- [x] 6.5.4 Prompt broker (`wlsctx broker` + `wlsctx decide`):
+      N-D-JSON over the broker socket; a session decision socket
+      (`$XDG_RUNTIME_DIR/wlsctx/decision.sock`, bound once for the
+      life of the session, chmod 0600) so several prompts can be
+      pending at once — FIFO, `--prompt <id>` targets — and
+      `decide` without `--decision` lists them. `notify-send`
+      announces with a ready-made reply command; a timeout is a
+      deny; a failed decision-socket bind degrades interactive
+      prompts to a deny at once (`no-decision-socket`) while copy-out
+      notifications keep working; `--auto-decide` never binds the
+      socket.
+- [x] 6.5.5 Selection audit log (branch phase 9): one `key=value`
+      record per `set`/`read`/`clear`/`serve` event to the **host
+      journal** (the relay logs to stderr); payload recorded as
+      **size only, never content**; no rate-limiting (a persistent
+      record, not a digest). Open follow-up: extend to drag-and-drop
+      (`start_drag` is not audited yet).
+- [x] 6.5.6 Protocol-table CI (branch deferred refinement):
+      `scripts/gen_interface_table.py` regenerates `interfaces.rs`
+      from `protocols/*.xml` and CI diffs the result
+      (`git diff --exit-code`); `wlr_tables.rs` is the compiler's
+      sync check (the `wayland_scanner::generate_interfaces!` macro
+      expands the same XML at build time).
+- [x] 6.5.7 Broker arrival order (`9fded8c`): prompts are ordered by
+      a sequence stamped in the broker's sequential `poll(2)` accept
+      loop, never by the order the per-connection threads happened to
+      take the queue lock (LESSONS #17).
+
+**Desktop e2e (this machine, sway; 2026-10-23).** `wayland-info` on
+the *tagged* socket sees 35 of the host's 56 globals, and
+`wp_security_context_manager_v1` is absent — the nesting guard the
+spec requires (a tagged client must not be able to stamp again); on
+the host socket the manager is present (name 34). Through the proxy
+the same checks hold: after `1e46e3b`, all 35 (before the fix: 0). A
+SIGHUP on the proxy re-execs in place (same pid, re-binds and
+re-tags, still 35). Still open from here: 5.5 (RustRover/LibreWolf
+running *sandboxed*, the full S→A→B pipeline on target) and the full
+chain (a sandboxed app through the proxy into sway).
+
+**Branch TASKS.md follow-ups:** the zbus 5→6 migration (6.1 already
+drives the 6-shaped async API) and the drag-and-drop audit (6.5.5).
+
+### Phase 7 — Re-homing the deployment units + sidecars (**next up**)
+- [ ] 7.1 Re-home the proxy/broker deployment for the
+      containerless world: `systemd/user/wlsctx-broker.{socket,service}`
+      still carry the branch-era global-flag forms (`wlsctx --broker
+      --socket-activation`, `wlsctx --decide`) — rewrite the
+      ExecStarts and the comments for the merged subcommand CLI
+      (`wlsctx broker --socket-activation`, `wlsctx decide`); wire
+      the audit sink (the relay's stderr → journal:
+      `StandardError=journal`, `LogDriver=passthrough`); a
+      per-app proxy unit (`wlsctx wayland --proxy --listen`) or
+      documented manual runs; sweep the remaining quadlet-era
+      references
+- [ ] 7.2 `wlsctx dbus-proxy <instance>`: host-side `xdg-dbus-proxy`
       (per-instance; decide socket-unit vs direct spawn in this phase)
-- [ ] 7.2 (optional) `wlsctx xwayland` host-side satellite
+- [ ] 7.3 (optional) `wlsctx xwayland` host-side satellite
 
 ### Phase 8 — Docs, SELinux, hardening
 - [ ] 8.1 Rewrite `README.md`: architecture, threat model (what changed
@@ -553,17 +657,3 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
   children, never enable controllers under a populated cgroup — safe),
   and how the user-slice delegation behaves in Phase 6.1 — fallback
   path covers any surprise.
-| 18 | Binding mount roots | Binding the **mount root** of devtmpfs/sysfs/ext4 (e.g. `/dev`, `/sys` themselves) is EINVAL unprivileged on 7.2.11; any **subpath** or file binds fine. Hence `/dev`/`/sys` are rebuilt as fresh tmpfs + subpath binds (the scratch dir carries the node files out of the tree before the self-bind). |
-| 19 | `mknod` unprivileged | Unprivileged `mknod` of device nodes is EPERM on 7.2.11 (SELinux enforcing). `/dev` nodes and `/dev/dri` are therefore **bind-mounted** (canonical genfs SELinux labels preserved), never mknod'd. |
-| 20 | Cgroup ns root | The ns root is the unsharing task's cgroup **at unshare time**, so the instance sub-cgroup must be entered *before* `unshare(CLONE_NEWCGROUP)`: the app sees `0::/` (its own cgroup is the root; 7.2 renders it with a trailing slash). The Phase-2 order (unshare → move) rooted the ns at the session cgroup (`0::/app-N`) and is corrected; it must still precede the rootfs build (cgroup2 goes ro with the self-bind). |
-| 21 | ro-binds are unattainable | On 7.2.11 `MS_BIND\|MS_RDONLY` **silently drops the ro flag** on a bind of a foreign superblock (probed on `/`, on files, and in both one-shot and make-private variants); the two-step bind → `MS_REMOUNT\|MS_RDONLY` is EPERM (the sb's `s_user_ns` is init — we can remount only our *own* fs). §3.3 corrected: `/` and the `/sys` subpaths are plain binds; read-only *semantics* for the app come from its real uid (root-owned trees unwritable) plus the nono landlock/seccomp policy (Phase 4). The test's former `ROOTWR` probe was a false positive (EACCES ≠ EROFS) and the `/proc/mounts` `head -1` read the *bottom* of the mount stack — the topmost entry is the last line. |
-| 22 | One notify listener per thread | Linux allows a single `SECCOMP_FILTER_FLAG_NEW_LISTENER` filter per thread, so nono's AF_UNIX mediation filter (traps all `connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg` — the family is checked in userspace, BPF cannot dereference) and the openat-logging filter must be one combined program (`PreparedSeccompNotifyFilter::with_openat_notifications`). Consequence: every `sendmsg` of the app (incl. all wayland/TCP traffic) is a supervisor round-trip — the supervisor must stay a tight, responsive loop or the app stalls. The filter is installed **before** `apply_landlock` (nono's requirement: the supervisor must see paths Landlock would block). |
-| 23 | Notify-fd handoff without SCM_RIGHTS from B | B's `sendmsg` is trapped by its own filter, so B cannot hand the listener fd to S via `SCM_RIGHTS` after install. Handoff: B writes the listener's *fd number* to a pre-made B→A pipe; A (unfiltered, B's parent, same uid) does `pidfd_open(B)`+`pidfd_getfd(num)` to take its own copy, then sends it to S over a pre-made S↔A socketpair. All three channels are created in S **before** the first fork and distributed at the forks (A closes the S-side copies, B closes the A-side copies). A dead B (zombie has no fd table) → handoff fails → S falls back to plain `waitpid` (landlock still enforced). |
-| 24 | Landlock needs explicit ancestor grants on Linux | A landlock rule is a default-deny floor: to reach a granted subtree the app also needs refer/traverse on every ancestor. nono's `path_metadata_dirs` (ancestor metadata grants) is macOS-only — on Linux the policy itself must grant `/` Read (and any other ancestor chains). Consistent with the current rootfs: the self-bind of `/` already shows the app every top-level directory, so Read-on-`/` adds no visibility. |
-| 25 | Supervisor decides (auto-deny), never expands | The supervisor's role in Phase 4 is mediation+logging, not expansion: openat/AF_UNIX notifications are answered continue (allowlisted) or EACCES (denied + logged); there is no fd injection, no approval flow. Abstract/unnamed AF_UNIX sockets are denied (nono's default for pathname mediation) — GUI apps that use abstract-socket IPC (e.g. Chromium-style) may need a per-profile relaxation, to be added if Phase 5's E2E hits it. |
-| 26 | Deterministic handoff: the verdict pipe | The seccomp listener is allocated `O_CLOEXEC` in B's table by the kernel (`get_unused_fd_flags(O_CLOEXEC)`, `kernel/seccomp.c`), and `pidfd_getfd` on B succeeds only while B is still dumpable — i.e. *pre-exec* (after exec the credential change fails `task_still_dumpable` → `EPERM`). If B started execing while A was still extracting, the dynamic loader's `openat`s would pile up on the dying listener: `seccomp_notify_free` completes every pending notification with `-ENOSYS` (observed: `Error 38` on `libtinfo.so.6`). Hence B blocks on an A→B **verdict pipe** before exec (`1` = exec, `0` = exit 126 — never an unsupervised exec); A sends it only after the extract + `SCM_RIGHTS` to S have completed. Two close-order invariants: B must *inherit* the verdict read end, so A closes its copy only *after* the second fork (closing it before the fork left B polling a dangling fd number — the "hang" that gdb showed as B-in-poll/A-in-wait4); and A ignores `SIGPIPE` after the fork, because a failure-path verdict can hit a pipe whose reader is already gone and must not kill A before it reaps B. |
-| 27 | nono's three-stage prepare/apply — the filter must never precede landlock's *prepare* | nono's `apply_landlock` calls `open_path_rule` → `open(O_PATH)` for every rule path. Installing the seccomp-notify filter *first* traps those opens: B blocks in a notification wait with no supervisor running yet — a hard deadlock (observed: 300 s timeout, zero output). The working order is nono's own prepare/apply split: `prepare_landlock_with_abi` (opens all rule paths, while unfiltered) → install the combined filter → `apply_raw` (consumes the prepared fds; opens nothing). #22's "the filter must precede landlock" survives as *the filter must precede landlock's **apply***. |
-| 28 | The rootfs scratch lives on `/var/tmp`; the runtime dir is carried before the `/run` mask | The scratch must stay resolvable through every build step, so it cannot sit under any masked tree. The old location (inside the per-instance runtime dir) is under `/run` for the default `XDG_RUNTIME_DIR=/run/user/<uid>` — and a bind *source* resolved after the fresh-`/run` mask hits the fresh tmpfs's empty stand-in directory: a **silent self-bind no-op** that never crosses to the host (writes "succeed" into the throwaway tmpfs; the app-side socket is invisible). New layout: the scratch is `/var/tmp/.wlsctx/<inst>` (mode 0700, not in the capability set; hidden from the app by the `/var` mask of step 8 *and* the Landlock floor), and the per-instance runtime dir is carried into it in step 1 — the only point where its host path is still resolvable — then bound onto the fresh `/run`'s instance dir in step 5. S removes the scratch (and its parent) on exit. |
-| 29 | Raw pidfd syscalls: explicit zero flags; the *host* pid is the right argument | `libc` 0.2 (gnu x86_64) exposes `SYS_pidfd_open`/`SYS_pidfd_getfd` as numbers only, so they are called via `syscall(2)`. The kernel does `if (flags) return -EINVAL` for both, and a short `syscall(2)` call leaves the flags register uninitialised → spurious `EINVAL` (observed on `pidfd_open`). Pass `0` explicitly. Also, `pidfd_open` resolves the pid *globally* (`find_get_pid` → `find_vpid`, the init-namespace hash), so A — inside the fresh pidns — must pass B's **host** pid, which is exactly what `fork()` returns (`clone` returns `pid_vnr` = `level[0].nr`, never the caller-namespace-local pid; B's local pid `1` would be the wrong argument). |
-| 34 | Varlink first, D-Bus as fallback | `wlsctx run` starts the scope via **Varlink** `io.systemd.Unit.StartTransient` on the *user* manager socket (`/run/user/<uid>/systemd/io.systemd.Manager`) — JSON over a unix socket, one request/response, no polkit, hand-rolled (~60 lines, no dep on the primary path). Requires **systemd ≥ 261** (`StartTransient` added in commit 913b81735e; the `io.systemd.Unit`/`io.systemd.Manager` skeletons from 258). Distro coverage (pkgs.org check, 2026-10): Ubuntu 26.10, Fedora 45+, Arch, OpenSUSE Tumbleweed, Wolfi. Older stacks (Debian 13, **Ubuntu 26.04 LTS**, RHEL/EPEL) fall back to **D-Bus** `org.freedesktop.systemd1.Manager.StartTransientUnit` on the session bus (`zbus` — chosen over `dbus` 0.9: zbus is the maintained, stable, widely-used crate). Tier order at runtime: varlink → D-Bus → raw-cgroup; the outcome is logged. The `varlink` crate (13.0.0) was considered but not adopted for the one-shot call. |
-| 35 | D-Bus primary, varlink deferred (supersedes #34) | Hands-on verification on the Fedora 45 target (systemd 261) overturned the varlink-first plan. (a) `io.systemd.Unit.StartTransient` exists since 261 but is **service-only** (`ID`/`Description`/`Service{Type,ExecStart,RemainAfterExit}`); `SetUnitProperties` accepts `Markers` only; a scope created without PIDs **refuses to start** ("Scope has no PIDs. Refusing"). A scope context with `PIDs` (json pidref) exists only on `main` (abde7e80d0, 2026-10-16 — after v262), so no *released* systemd can do the operation via varlink. (b) D-Bus `StartTransientUnit` works on every user-systemd stack (scopes since v252), needs no polkit on the session bus, and the exact call is: unit `*.scope`, mode `replace`, properties `{ PIDs: <au> [self] }` — property name is `PIDs` (since v252), value an array of uint32; reply type is `(o)`, not `(uo)`. (c) `StopWhenUnneeded=true` is **harmful** on v261 scopes: `unit_is_unneeded()` stops any active, jobless, unpinned scope immediately (verified: scope removed in the same second, member alive, cgroup `(deleted)`). Not needed anyway — a scope auto-stops and is removed **recursively** when its last member leaves (verified: supervisor in scope, app in a user-mkdir'd child; supervisor exits last → whole subtree gone). (d) `Delegate=` is unnecessary: the entire user-session cgroup subtree (`user.slice/user-<uid>.slice/user@<uid>.service/`, incl. manager-created scopes) is **owned by the user** (delegation of `user@.service` chowns it), so the user can `mkdir`/write `cgroup.procs` inside the scope without any unit-level delegation. The user manager also lands transient scopes in `app.slice` (not directly under `user@.service`) — hence the instance sub-cgroup's parent is read from `/proc/self/cgroup` after the call, never assumed. Net: D-Bus (`zbus`, driven on a fresh local tokio runtime per call — never the process-global `OnceLock` runtime, which is dead in a forked child; see `src/systemd.rs`) is the primary tier for all distros (incl. Ubuntu 26.04 LTS, Debian 13 — the very distros that motivated the fallback); varlink becomes a future tier (6.4) once a release ships scope-with-PIDs. The raw-cgroup path remains the last resort (and is what A already does in #12/#20 — the only change is that S's D-Bus call moves S (and thus A's inherited cgroup) into the scope before the forks). |
