@@ -527,9 +527,12 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       unchanged; only unit visibility/accounting lost; the instance
       sub-cgroup still created under `S`'s current cgroup and
       cleaned up on exit)
-- [ ] 6.3 `wlsctx wayland` remains usable standalone (per-app proxy /
+- [x] 6.3 `wlsctx wayland` remains usable standalone (per-app proxy /
       socket-activation units are up to the user; the repo ships only
-      the broker units, re-homed in 7.1)
+      the broker units, re-homed in 7.1). Verified on this desktop
+      2026-10-23: both the tag-and-park and `--proxy` modes run with
+      `--listen` with no units at all (the e2e of the merge session);
+      the socket-activation path is unit-tested
 - [ ] 6.4 *(future, #35)* varlink tier once a released systemd ships a
       scope context with `PIDs` in `io.systemd.Unit.StartTransient`
       (main only as of 2026-10-16, after v262)
