@@ -1,27 +1,26 @@
-# Socket-activated half of the prompt broker (Phase 4).
+# Socket-activated half of the prompt broker (phase 6.5).
 #
-# Owns $XDG_RUNTIME_DIR/wlsctx-broker, the Unix stream socket a wlsctx
-# PROXY connects to. Each connection carries one N-D-JSON line of one
-# of two kinds (dispatched on the `kind` field): a `clipboard-read`
-# request/response (the gate dropped a foreign read and wants the
-# user's consent) or a one-way `clipboard-write` notification (the app
-# wrote to a selection; the broker notifies and never answers — Phase
-# 6). The activated service runs the broker itself (see
-# wlsctx-broker.service).
+# Owns $XDG_RUNTIME_DIR/wlsctx-broker, the Unix stream socket a
+# wlsctx proxy (`wlsctx wayland --proxy`) connects to. Each
+# connection carries one N-D-JSON line of one of two kinds
+# (dispatched on the `kind` field): a `clipboard-read`
+# request/response (the clipboard gate dropped a foreign read and
+# wants the user's consent) or a one-way `clipboard-write`
+# notification (the app wrote to a selection; the broker notifies
+# and never answers). The activated service runs the broker itself
+# (see wlsctx-broker.service).
 #
 # The broker is a host-side, in-session service on purpose: it must
-# reach the session bus (notify-send) and must outlive any one
-# sandbox. It is *not* socket-activated into a container — the
-# scratch wlsctx image has no bus and no notify-send, so the prompt
-# could never actually reach the user.
+# reach the session bus (notify-send) and must outlive any one app
+# instance.
 #
 # The session decision socket the broker binds at startup (while it
 # waits for the user) lives in $XDG_RUNTIME_DIR/wlsctx, the same
-# user-private directory the mode-A socket unit owns. A keybinding /
-# notification action / any program answers with:
-#   wlsctx --decide                     # list the pending prompts
-#   wlsctx --decide --decision allow    # (or =deny; --prompt <id>
-#                                       # targets a named one)
+# user-private directory the per-instance runtime dirs live in. A
+# keybinding / notification action / any program answers with:
+#   wlsctx decide                        # list the pending prompts
+#   wlsctx decide --decision allow       # (or =deny; --prompt <id>
+#                                        # targets a named one)
 # A timeout (default 30 s) is a deny. Every failure path fails closed.
 [Unit]
 Description=wlsctx prompt broker socket

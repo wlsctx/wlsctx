@@ -612,17 +612,21 @@ chain (a sandboxed app through the proxy into sway).
 drives the 6-shaped async API) and the drag-and-drop audit (6.5.5).
 
 ### Phase 7 — Re-homing the deployment units + sidecars (**next up**)
-- [ ] 7.1 Re-home the proxy/broker deployment for the
-      containerless world: `systemd/user/wlsctx-broker.{socket,service}`
-      still carry the branch-era global-flag forms (`wlsctx --broker
-      --socket-activation`, `wlsctx --decide`) — rewrite the
-      ExecStarts and the comments for the merged subcommand CLI
-      (`wlsctx broker --socket-activation`, `wlsctx decide`); wire
-      the audit sink (the relay's stderr → journal:
-      `StandardError=journal`, `LogDriver=passthrough`); a
-      per-app proxy unit (`wlsctx wayland --proxy --listen`) or
-      documented manual runs; sweep the remaining quadlet-era
-      references
+- [x] 7.1 Re-home the broker deployment for the containerless
+      world: `systemd/user/wlsctx-broker.{socket,service}` rewritten
+      from the branch-era global-flag forms (`wlsctx --broker
+      --socket-activation`, `wlsctx --decide`) to the merged
+      subcommand CLI (`wlsctx broker --socket-activation`,
+      `wlsctx decide`); verified with `systemd-analyze --user
+      verify` and by running the exact ExecStart line. *Decision:*
+      per-app proxies stay **documented manual runs**, not a unit —
+      the proxy's public socket path must match the app profile's
+      env (`XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`), which is
+      per-instance coordination a template instance cannot derive.
+      The deployment recipe (incl. the audit sink: the relay's
+      stderr → journal via `StandardError=journal` /
+      `LogDriver=passthrough` in any unit the user writes) lands
+      with the README rewrite in 8.1
 - [ ] 7.2 `wlsctx dbus-proxy <instance>`: host-side `xdg-dbus-proxy`
       (per-instance; decide socket-unit vs direct spawn in this phase)
 - [ ] 7.3 (optional) `wlsctx xwayland` host-side satellite

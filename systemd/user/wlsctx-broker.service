@@ -1,40 +1,40 @@
-# Broker (Phase 4 consent prompt; Phase 6 copy-out notification): the
-# host-side service for the clipboard receive-gate.
+# The prompt broker (clipboard consent prompts; copy-out
+# notifications): the host-side service for the clipboard
+# receive-gate.
 #
-# Runs in the user's desktop session (NOT in a container): it must
-# reach the session bus for notify-send and it must be the thing that
-# waits for *the user*, so it is a plain user service, not a quadlet.
-# The binary is expected at /usr/local/bin/wlsctx (build it with
-# `cargo build --release`, or extract it from the
-# ghcr.io/wlsctx/wlsctx image — it is a static binary); override
-# ExecStart in a drop-in if yours lives elsewhere.
+# Runs in the user's desktop session: it must reach the session bus
+# for notify-send and it must be the thing that waits for *the
+# user*, so it is a plain user service.
 #
 # Socket-activated by wlsctx-broker.socket: systemd passes the
 # listening socket via LISTEN_FDS and this service consumes it with
-# --socket-activation. The first dropped foreign read from any proxy
-# wakes it; when no proxy has asked for a while it stays dormant.
+# --socket-activation. The first dropped foreign read from any
+# proxy wakes it; when no proxy has asked for a while it stays
+# dormant.
 #
-# The binary path is deliberately plain (systemd does not expand
-# `${VAR:-default}` in ExecStart): move /wlsctx to /usr/local/bin
-# (or override ExecStart in a drop-in) if yours lives elsewhere.
+# The binary is expected at /usr/local/bin/wlsctx (build it with
+# `cargo build --release`); override ExecStart in a drop-in if yours
+# lives elsewhere. (systemd does not expand `${VAR:-default}` in
+# ExecStart, so the path is plain.)
 #
 # What one request does: the broker decodes the proxy's JSON request
 # line (app, instance, mime), announces it with notify-send (the
 # prompt's id and a ready-made reply command in the body), and waits
 # for the user. The user's answer goes to the broker's session
 # decision socket ($XDG_RUNTIME_DIR/wlsctx/decision.sock) — bound
-# once, for the life of the session, at startup — so several prompts
-# can be pending at once and any of them can be targeted by id:
+# once, for the life of the session, at startup — so several
+# prompts can be pending at once and any of them can be targeted by
+# id:
 #
-#   wlsctx --decide                          # list the pending prompts
-#   wlsctx --decide --decision allow         # resolve the oldest (or =deny)
-#   wlsctx --decide --prompt 3 --decision allow  # resolve a named one
+#   wlsctx decide                        # list the pending prompts
+#   wlsctx decide --decision allow       # resolve the oldest (or =deny)
+#   wlsctx decide --prompt 3 --decision allow   # resolve a named one
 # Allow answers the proxy with a 1500 ms intent window (the proxy
 # opens the gate for that burst); deny and every failure (missing
 # binary, lost bus, unreadable answer, timeout) answer a deny or are
 # dropped — the read never flows without a real, in-window allow.
 #
-# The second kind is one-way (`clipboard-write`, Phase 6, from
+# The second kind is one-way (`clipboard-write`, from the proxy's
 # --notify-copy-out): the proxy fired it because the app wrote to the
 # clipboard or primary selection. The broker runs notify-send and
 # closes with no reply — no decision socket, no wait, no consent. It
@@ -50,7 +50,7 @@ BindsTo=wlsctx-broker.socket
 After=wlsctx-broker.socket
 
 [Service]
-ExecStart=/usr/local/bin/wlsctx --broker --socket-activation
+ExecStart=/usr/local/bin/wlsctx broker --socket-activation
 NotifyAccess=main
 # The broker talks to (a) the proxies' connections on its own socket
 # and (b) the user's one-shot decision writers — both Unix sockets.
