@@ -1,9 +1,15 @@
 //! Shared test utilities: environment-mutating helpers and temporary
 //! directories, used across the crate's test modules.
 //!
-//! clap reads the process environment for its `env` attributes, and
-//! tests run in parallel, so environment-mutating tests must be
-//! serialised against each other.
+//! **These helpers are only safe because the test binary is run
+//! single-threaded** (`cargo test -- --test-threads=1`; see the CI
+//! workflow and LESSONS.md). `std::env::set_var`/`remove_var` are the
+//! C `setenv`/`unsetenv` and are undefined behaviour when *any* other
+//! thread touches the environment concurrently — not just other
+//! `with_env` callers, but plain readers like `temp_dir`, xdg, and
+//! clap `getenv`. `ENV_LOCK` serialises the `with_env` callers
+//! against each other; the single-threaded run is what keeps
+//! arbitrary readers out of the env at the same time.
 #![cfg(test)]
 
 use std::fs;
@@ -128,6 +134,11 @@ pub fn without_wlsctx_env(f: impl FnOnce()) {
             ("WLSCTX_INSTANCE_ID", None),
             ("WLSCTX_SANDBOX_ENGINE", None),
             ("WLSCTX_SOCKET_PATH", None),
+            ("WLSCTX_ALLOW_GLOBALS", None),
+            ("WLSCTX_CLIPBOARD_POLICY", None),
+            ("WLSCTX_BROKER_SOCKET", None),
+            ("WLSCTX_NOTIFY_COPY_OUT", None),
+            ("WLSCTX_BROKER_TIMEOUT_MILLIS", None),
         ],
         f,
     );

@@ -31,17 +31,16 @@
 //! the floor already allows.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use nono::capability::{CapabilitySet, UnixSocketOp};
 use nono::sandbox::{
-    classify_access_from_flags, continue_notif, read_msghdr_dest,
-    read_mmsghdr_dests, read_notif_path, read_notif_sockaddr, read_open_how, recv_notif,
-    resolve_notif_path, respond_notif_errno, validate_openat2_size, SeccompNotif,
-    UnixSocketKind, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG, SYS_SENDMSG,
-    SYS_SENDTO,
+    SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO,
+    SeccompNotif, UnixSocketKind, classify_access_from_flags, continue_notif, read_mmsghdr_dests,
+    read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how, recv_notif,
+    resolve_notif_path, respond_notif_errno, validate_openat2_size,
 };
 
 /// A seccomp-notify listener has exactly one reader at a time; the
@@ -76,7 +75,12 @@ pub(crate) fn create_socketpair() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-slot out array for socketpair(2).
     if unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr())
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
     } != 0
     {
         return Err(io_err("socketpair"));
@@ -197,7 +201,11 @@ pub(crate) fn recv_app_pid(sock: RawFd) -> Result<Option<i32>> {
     while off < buf.len() {
         // SAFETY: a buffer we own.
         let n = unsafe {
-            libc::read(sock, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off)
+            libc::read(
+                sock,
+                buf[off..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - off,
+            )
         };
         if n == 0 {
             return Ok(None);
@@ -478,7 +486,10 @@ fn handle_notif(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result
         // other number is a surprise (a kernel/BPF drift) — let it run
         // so the Landlock floor remains the last line of defence.
         other => {
-            log::debug!("supervisor: untrapped syscall {other} (pid {}): continuing", notif.pid);
+            log::debug!(
+                "supervisor: untrapped syscall {other} (pid {}): continuing",
+                notif.pid
+            );
             continue_notif(fd, notif.id).map_err(anyhow::Error::from)
         }
     }
@@ -491,21 +502,15 @@ fn handle_open(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
     let dirfd = notif.data.args[0];
     let path_ptr = notif.data.args[1];
 
-    let raw = read_notif_path(pid, path_ptr).with_context(|| {
-        format!(
-            "reading the open path from pid {pid} (notif {})",
-            notif.id
-        )
-    })?;
+    let raw = read_notif_path(pid, path_ptr)
+        .with_context(|| format!("reading the open path from pid {pid} (notif {})", notif.id))?;
     let resolved = resolve_notif_path(pid, dirfd, &raw)?;
 
     let access = if notif.data.nr == SYS_OPENAT2 {
         let size = notif.data.args[3] as usize;
         if !validate_openat2_size(size) {
             // A malformed openat2 — refuse to read a partial struct.
-            log::info!(
-                "supervisor: deny openat2 {resolved:?} (bad how size {size}): EACCES"
-            );
+            log::info!("supervisor: deny openat2 {resolved:?} (bad how size {size}): EACCES");
             return respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from);
         }
         let how = read_open_how(pid, notif.data.args[2])
@@ -519,9 +524,7 @@ fn handle_open(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
         log::debug!("supervisor: allow {access} {resolved:?}");
         continue_notif(fd, notif.id).map_err(anyhow::Error::from)
     } else {
-        log::info!(
-            "supervisor: deny {access} {resolved:?} (not a granted subtree): EACCES"
-        );
+        log::info!("supervisor: deny {access} {resolved:?} (not a granted subtree): EACCES");
         respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from)
     }
 }
@@ -537,7 +540,11 @@ fn handle_connect_bind(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) ->
     } else {
         UnixSocketOp::Connect
     };
-    let op_name = if notif.data.nr == SYS_BIND { "bind" } else { "connect" };
+    let op_name = if notif.data.nr == SYS_BIND {
+        "bind"
+    } else {
+        "connect"
+    };
 
     match read_notif_sockaddr(pid, addr_ptr, addrlen) {
         Ok(sa) => match sa.family as i32 {
@@ -551,7 +558,8 @@ fn handle_connect_bind(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) ->
                             continue_notif(fd, notif.id).map_err(anyhow::Error::from)
                         } else {
                             log::info!("supervisor: deny {op_name} {path:?} (not granted): EACCES");
-                            respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from)
+                            respond_notif_errno(fd, notif.id, libc::EACCES)
+                                .map_err(anyhow::Error::from)
                         }
                     }
                     (kind, _) => {
@@ -562,9 +570,7 @@ fn handle_connect_bind(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) ->
                                 UnixSocketKind::Pathname => "pathname",
                             })
                             .unwrap_or("unclassified");
-                        log::info!(
-                            "supervisor: deny {op_name} (non-pathname {k} AF_UNIX): EACCES"
-                        );
+                        log::info!("supervisor: deny {op_name} (non-pathname {k} AF_UNIX): EACCES");
                         respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from)
                     }
                 }
@@ -593,8 +599,9 @@ fn handle_send(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
     let dests: Vec<Option<(u64, u64)>> = match notif.data.nr {
         SYS_SENDTO => vec![Some((notif.data.args[3], notif.data.args[4]))],
         SYS_SENDMSG => vec![read_msghdr_dest(pid, notif.data.args[1]).unwrap_or(None)],
-        SYS_SENDMMSG => read_mmsghdr_dests(pid, notif.data.args[1], notif.data.args[2])
-            .unwrap_or_default(),
+        SYS_SENDMMSG => {
+            read_mmsghdr_dests(pid, notif.data.args[1], notif.data.args[2]).unwrap_or_default()
+        }
         _ => Vec::new(),
     };
     let op_name = match notif.data.nr {
@@ -611,23 +618,27 @@ fn handle_send(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
         if *namelen == 0 {
             continue;
         }
+        // The family `match` is a deliberate `if AF_UNIX` shape: the
+        // fallthrough arm is the "pass" case (non-UNIX sends are
+        // governed by network mode) and its comment is load-bearing,
+        // so the single-match lint is opted out rather than the
+        // structure rewritten.
+        #[allow(clippy::single_match)]
         match read_notif_sockaddr(pid, *name_ptr, *namelen) {
             Ok(sa) => match sa.family as i32 {
                 libc::AF_UNIX => match (sa.unix_kind, sa.unix_path.as_ref()) {
                     (Some(UnixSocketKind::Pathname), Some(path)) => {
                         if !caps.unix_socket_allowed(path, UnixSocketOp::Send) {
-                            log::info!(
-                                "supervisor: deny {op_name} {path:?} (not granted): EACCES"
-                            );
-                            return respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from);
+                            log::info!("supervisor: deny {op_name} {path:?} (not granted): EACCES");
+                            return respond_notif_errno(fd, notif.id, libc::EACCES)
+                                .map_err(anyhow::Error::from);
                         }
                     }
                     _ => {
                         // Non-pathname AF_UNIX send: denied (#25).
-                        log::info!(
-                            "supervisor: deny {op_name} (non-pathname AF_UNIX): EACCES"
-                        );
-                        return respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from);
+                        log::info!("supervisor: deny {op_name} (non-pathname AF_UNIX): EACCES");
+                        return respond_notif_errno(fd, notif.id, libc::EACCES)
+                            .map_err(anyhow::Error::from);
                     }
                 },
                 // Non-UNIX send: pass (network mode governs it).
@@ -636,7 +647,8 @@ fn handle_send(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
             Err(e) => {
                 // We cannot even read the address: fail closed.
                 log::info!("supervisor: deny {op_name} (unreadable sockaddr: {e}): EACCES");
-                return respond_notif_errno(fd, notif.id, libc::EACCES).map_err(anyhow::Error::from);
+                return respond_notif_errno(fd, notif.id, libc::EACCES)
+                    .map_err(anyhow::Error::from);
             }
         }
     }
@@ -655,8 +667,8 @@ mod tests {
     use super::*;
     use crate::sandbox::mounts;
     use crate::sandbox::namespaces::NetworkMode;
-    use crate::sandbox::userns::tests::{run_in_child, ChildOut};
-    use crate::sandbox::{run_sandboxed, SandboxConfig};
+    use crate::sandbox::userns::tests::{ChildOut, run_in_child};
+    use crate::sandbox::{SandboxConfig, run_sandboxed};
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
@@ -670,7 +682,13 @@ mod tests {
             true
         }
         fn log(&self, r: &log::Record) {
-            let _ = writeln!(std::io::stderr(), "[{}] {} {}", r.level(), r.target(), r.args());
+            let _ = writeln!(
+                std::io::stderr(),
+                "[{}] {} {}",
+                r.level(),
+                r.target(),
+                r.args()
+            );
         }
         fn flush(&self) {}
     }
@@ -705,13 +723,15 @@ mod tests {
             .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
         let command: Vec<OsString> = command.iter().map(OsString::from).collect();
         let config = config.clone();
-        run_in_child(move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
-            Ok(code) => code,
-            Err(e) => {
-                let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
-                2
-            }
-        })
+        run_in_child(
+            move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
+                Ok(code) => code,
+                Err(e) => {
+                    let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                    2
+                }
+            },
+        )
     }
 
     /// True when the failure is "the environment cannot create the
@@ -724,7 +744,9 @@ mod tests {
             );
         }
         if err.contains("rootfs construction failed") || err.contains("sandbox setup failed") {
-            panic!("a setup step failed inside the namespaces (a real failure, not an environment skip):\n{err}");
+            panic!(
+                "a setup step failed inside the namespaces (a real failure, not an environment skip):\n{err}"
+            );
         }
         eprintln!("skipping (environment cannot create the namespaces):\n{err}");
         true
@@ -770,8 +792,7 @@ mod tests {
         let script = format!(
             "echo x > {denied} 2>/dev/null; a=$?; echo ctrl > {ctrl_app} 2>/dev/null; b=$?; cat {ctrl_app} 2>/dev/null; echo a=$a b=$b"
         );
-        let (code, out, err) =
-            run_cmd(&["/bin/sh".into(), "-c".into(), script], &config);
+        let (code, out, err) = run_cmd(&["/bin/sh".into(), "-c".into(), script], &config);
         if expect_ok(code, &out, &err, "openat write probe").is_err() {
             return;
         }
@@ -834,8 +855,8 @@ mod tests {
         let home = std::env::home_dir().expect("the test needs $HOME");
         let sock = home.join(".wlsctx-p4-deny.sock");
         let _ = std::fs::remove_file(&sock);
-        let _listener = UnixListener::bind(&sock)
-            .unwrap_or_else(|e| panic!("binding {sock:?}: {e}"));
+        let _listener =
+            UnixListener::bind(&sock).unwrap_or_else(|e| panic!("binding {sock:?}: {e}"));
         let script = format!(
             "import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); \
              s.connect({:?}); print('CONNECTED')",
@@ -878,24 +899,17 @@ mod tests {
     fn connect_to_instance_dir_socket_is_allowed() {
         let config = cfg("app", "3", NetworkMode::Shared);
         let inst = mounts::instance_runtime_dir(&config);
-        std::fs::create_dir_all(&inst)
-            .unwrap_or_else(|e| panic!("creating {inst:?}: {e}"));
+        std::fs::create_dir_all(&inst).unwrap_or_else(|e| panic!("creating {inst:?}: {e}"));
         let sock = format!("{inst}/wayland-0");
         let _ = std::fs::remove_file(&sock);
-        let listener = UnixListener::bind(&sock)
-            .unwrap_or_else(|e| panic!("binding {sock:?}: {e}"));
-        let sock_in_sandbox = format!(
-            "{}/wayland-0",
-            mounts::sandbox_instance_dir(&config)
-        );
+        let listener =
+            UnixListener::bind(&sock).unwrap_or_else(|e| panic!("binding {sock:?}: {e}"));
+        let sock_in_sandbox = format!("{}/wayland-0", mounts::sandbox_instance_dir(&config));
         let script = format!(
             "import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); \
              s.connect({sock_in_sandbox:?}); s.sendall(b'P4-OK'); print('CONNECTED')"
         );
-        let (code, out, err) = run_cmd(
-            &["/usr/bin/python3".into(), "-c".into(), script],
-            &config,
-        );
+        let (code, out, err) = run_cmd(&["/usr/bin/python3".into(), "-c".into(), script], &config);
         let _ = std::fs::remove_file(&sock);
         if expect_ok(code, &out, &err, "instance-dir connect").is_err() {
             return;
@@ -912,14 +926,16 @@ mod tests {
         // SAFETY: `fd` is a valid fd of this process.
         let rc = unsafe { libc::poll(&mut pfd, 1, 2000) };
         assert_eq!(
-            rc,
-            1,
+            rc, 1,
             "no pending connection after the app's connect: the supervisor did not mediate an allow"
         );
         let (mut conn, _) = listener.accept().expect("accepting the app's connection");
         let mut buf = [0u8; 5];
         conn.read_exact(&mut buf)
             .expect("reading the app's payload over the mediated connection");
-        assert_eq!(&buf, b"P4-OK", "the payload must cross the sandbox boundary");
+        assert_eq!(
+            &buf, b"P4-OK",
+            "the payload must cross the sandbox boundary"
+        );
     }
 }

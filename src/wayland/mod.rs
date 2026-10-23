@@ -10,7 +10,6 @@
 pub mod context;
 pub mod listener;
 pub mod roundtrip;
-pub mod signals;
 
 use crate::cli::WaylandArgs;
 use anyhow::{Context, Result};
@@ -76,6 +75,12 @@ pub(crate) fn prepare_tagged_socket(
             sandbox_engine: sandbox_engine.to_string(),
             listen: None,
             socket_activation: true,
+            proxy: false,
+            tagged_socket: None,
+            allow_globals: vec![],
+            clipboard_policy: "allow".into(),
+            broker_socket: None,
+            notify_copy_out: false,
         };
         // `listener::` here is the module (the local binding shares
         // its name but lives in the value namespace).
@@ -97,13 +102,12 @@ pub(crate) fn prepare_tagged_socket(
         )
     };
     let close_fd = context::create_security_context(&listener, sandbox_engine, app_id, instance_id)
-        .map_err(|e| {
+        .inspect_err(|_e| {
             // The tag failed: unbind the path we created (an
             // socket-activated file belongs to systemd — leave it).
             if !socket_activation {
                 let _ = std::fs::remove_file(&host_path);
             }
-            e
         })?;
     Ok(TaggedWayland {
         host_path,

@@ -109,7 +109,7 @@ pub(crate) fn enter_mountns() -> Result<()> {
     if unsafe {
         libc::mount(
             std::ptr::null(),
-            b"/\0".as_ptr().cast(),
+            c"/".as_ptr(),
             std::ptr::null(),
             libc::MS_REC | libc::MS_PRIVATE,
             std::ptr::null(),
@@ -209,8 +209,10 @@ pub(crate) fn enter_cgroupns(name: &str) -> Result<String> {
 
     // Move ourselves in: the forked app inherits the membership.
     let procs = format!("{sub}/cgroup.procs");
-    let mut f =
-        std::fs::OpenOptions::new().write(true).open(&procs).with_context(|| {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&procs)
+        .with_context(|| {
             format!(
                 "opening {procs} for writing (requires CAP_SYS_ADMIN in our user ns \
                  over the user-owned scope)"
@@ -258,15 +260,13 @@ pub(crate) fn enter_netns() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::run_sandboxed;
-    use std::os::unix::fs::MetadataExt;
-    use crate::sandbox::userns::tests::{
-        run_in_child, enter_or_classify, creds, ChildOut,
-    };
     use crate::sandbox::SandboxConfig;
+    use crate::sandbox::run_sandboxed;
+    use crate::sandbox::userns::tests::{ChildOut, creds, enter_or_classify, run_in_child};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
 
     fn cfg(app: &str, inst: &str, net: NetworkMode) -> SandboxConfig {
         SandboxConfig {
@@ -298,13 +298,15 @@ mod tests {
             .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
         let command: Vec<OsString> = command.iter().map(OsString::from).collect();
         let config = config.clone();
-        run_in_child(move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
-            Ok(code) => code,
-            Err(e) => {
-                let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
-                2
-            }
-        })
+        run_in_child(
+            move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
+                Ok(code) => code,
+                Err(e) => {
+                    let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                    2
+                }
+            },
+        )
     }
 
     /// True when the failure is "the environment cannot create the
@@ -312,10 +314,14 @@ mod tests {
     /// rejected our map (a design failure, never a skip).
     fn skip_if_unsupported(err: &str) -> bool {
         if err.contains("uid_map") || err.contains("gid_map") {
-            panic!("the kernel rejected the single-extent map (design failure, not an environment skip):\n{err}");
+            panic!(
+                "the kernel rejected the single-extent map (design failure, not an environment skip):\n{err}"
+            );
         }
         if err.contains("rootfs construction failed") || err.contains("sandbox setup failed") {
-            panic!("a setup step failed inside the namespaces (a real failure, not an environment skip):\n{err}");
+            panic!(
+                "a setup step failed inside the namespaces (a real failure, not an environment skip):\n{err}"
+            );
         }
         eprintln!("skipping (environment cannot create the namespaces):\n{err}");
         true
@@ -360,11 +366,12 @@ mod tests {
         // below discriminates on. (systemd's host `/` is `shared:1`
         // on Fedora; a hard fail here means this environment
         // changed and the test needs adjusting, not skipping.)
-        let host_mountinfo =
-            std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let host_mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let host_optional = root_optional_fields(&host_mountinfo);
         if !host_optional.contains("shared") {
-            panic!("precondition: the host's `/` is not a shared mount (no `shared:` token, optional fields: {host_optional:?}); the private-view assertion cannot discriminate");
+            panic!(
+                "precondition: the host's `/` is not a shared mount (no `shared:` token, optional fields: {host_optional:?}); the private-view assertion cannot discriminate"
+            );
         }
 
         let (code, out, err) = run_in_child(|o| {
@@ -426,9 +433,9 @@ mod tests {
             let dir_c = format!("{}\0", dir.to_str().unwrap());
             let st = unsafe {
                 libc::mount(
-                    b"tmpfs\0".as_ptr().cast(),
+                    c"tmpfs".as_ptr(),
                     dir_c.as_ptr().cast::<libc::c_char>(),
-                    b"tmpfs\0".as_ptr().cast(),
+                    c"tmpfs".as_ptr(),
                     0,
                     std::ptr::null(),
                 )
@@ -449,8 +456,7 @@ mod tests {
                 let _ = writeln!(
                     o,
                     "FAIL mounting tmpfs in the private view: {e}; pre-mount stat: {pre_s}; post-mount stat dir: {}; parent {:?}: {}; /tmp line: {mi}",
-                    post
-                        .as_ref()
+                    post.as_ref()
                         .map(|s| format!("ok (ino {})", s.ino()))
                         .unwrap_or_else(|e| format!("GONE: {e}")),
                     std::env::temp_dir(),
@@ -495,7 +501,9 @@ mod tests {
                 }
             }
             Some(42) => {}
-            Some(other) => panic!("pid ns propagation failed (exit {other}, expected 42):\n{out}\n{err}"),
+            Some(other) => {
+                panic!("pid ns propagation failed (exit {other}, expected 42):\n{out}\n{err}")
+            }
             None => panic!("test harness failed"),
         }
         assert!(
@@ -524,7 +532,8 @@ mod tests {
                 continue;
             };
             // Fields after the last ')': state ppid ...
-            let Some(ppid) = stat.rfind(')')
+            let Some(ppid) = stat
+                .rfind(')')
                 .map(|c| stat[c + 1..].split_whitespace().nth(1).unwrap_or_default())
                 .and_then(|t| t.parse::<i32>().ok())
             else {
@@ -580,18 +589,19 @@ mod tests {
             }
         });
 
-        let (code, out, err) = run_in_child(move |o: &mut ChildOut| {
-            match run_sandboxed(&command, &config) {
-                Ok(c) => {
-                    let _ = writeln!(o, "status={c}");
-                    0
-                }
-                Err(e) => {
-                    let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
-                    2
-                }
-            }
-        });
+        let (code, out, err) =
+            run_in_child(
+                move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
+                    Ok(c) => {
+                        let _ = writeln!(o, "status={c}");
+                        0
+                    }
+                    Err(e) => {
+                        let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                        2
+                    }
+                },
+            );
         let _ = killer.join();
         let b_pid = rx.recv().unwrap_or(-1);
         match code {
@@ -632,7 +642,10 @@ mod tests {
                 .count()
         })
         .unwrap_or(0);
-        assert_eq!(strays, 0, "a `sleep` process survived the namespace teardown");
+        assert_eq!(
+            strays, 0,
+            "a `sleep` process survived the namespace teardown"
+        );
     }
 
     #[test]
@@ -646,8 +659,15 @@ mod tests {
         }
         let inner = out.trim();
         // Kernel format: `ipc:[<inum>]` (the kind is *before* the brackets).
-        assert!(inner.starts_with("ipc:["), "inner ns identity; got {inner:?}");
-        assert_ne!(inner, &outer_ns("ipc"), "the ipc ns must differ from the host's");
+        assert!(
+            inner.starts_with("ipc:["),
+            "inner ns identity; got {inner:?}"
+        );
+        assert_ne!(
+            inner,
+            &outer_ns("ipc"),
+            "the ipc ns must differ from the host's"
+        );
     }
 
     #[test]
@@ -676,7 +696,10 @@ mod tests {
         assert_eq!(out.trim(), "0::/", "got:\n{out}\n{err}");
         // And the outside world still sees the session's full path.
         let outer = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-        assert!(outer.starts_with("0::/"), "outer view must be the full path: {outer:?}");
+        assert!(
+            outer.starts_with("0::/"),
+            "outer view must be the full path: {outer:?}"
+        );
     }
 
     /// The interface list of the *reader's* netns, from
@@ -717,8 +740,15 @@ mod tests {
         let inner_ns = lines.next().unwrap_or_default();
         let inner_ifs = lines.next().unwrap_or_default();
         let lo_line = lines.next().unwrap_or_default();
-        assert_ne!(inner_ns, &outer_ns("net"), "the net ns must be fresh; got {inner_ns:?}");
-        assert_eq!(inner_ifs, "lo:", "the bare ns must hold only loopback; got:\n{out}\n{err}");
+        assert_ne!(
+            inner_ns,
+            &outer_ns("net"),
+            "the net ns must be fresh; got {inner_ns:?}"
+        );
+        assert_eq!(
+            inner_ifs, "lo:",
+            "the bare ns must hold only loopback; got:\n{out}\n{err}"
+        );
         assert!(
             lo_line.starts_with("1: lo:") && lo_line.contains("LOOPBACK,UP"),
             "loopback must be up in the fresh netns; got: {lo_line:?}"
@@ -740,9 +770,14 @@ mod tests {
         }
         let mut lines = out.trim().lines();
         let inner_ns = lines.next().unwrap_or_default();
-        assert_eq!(inner_ns, &outer_ns("net"), "shared mode must keep the host netns");
-        let inner_ifs: Vec<String> =
-            lines.map(|l| l.trim().trim_end_matches(':').to_string()).collect();
+        assert_eq!(
+            inner_ns,
+            &outer_ns("net"),
+            "shared mode must keep the host netns"
+        );
+        let inner_ifs: Vec<String> = lines
+            .map(|l| l.trim().trim_end_matches(':').to_string())
+            .collect();
         assert_eq!(
             inner_ifs,
             net_dev_interfaces(),

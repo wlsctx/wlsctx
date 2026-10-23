@@ -37,13 +37,13 @@
 //! a C interface goes through [cstr].
 
 use std::io;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use super::namespaces;
 use super::SandboxConfig;
+use super::namespaces;
 
 /// The standard `/dev` node files carried over by bind (not
 /// `mknod`): a bind keeps the node's canonical genfs SELinux label
@@ -85,8 +85,7 @@ pub(crate) fn sandbox_instance_dir(cfg: &SandboxConfig) -> String {
 
 pub(crate) fn instance_runtime_dir(cfg: &SandboxConfig) -> String {
     let uid = nix::unistd::getuid().as_raw();
-    let xdg = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{uid}"));
+    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}"));
     format!(
         "{xdg}/wlsctx/{}",
         namespaces::cgroup_name_for(&cfg.app_id, &cfg.instance_id)
@@ -206,8 +205,7 @@ fn in_render_group() -> bool {
 pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     let prof = &cfg.profile;
     let uid = nix::unistd::getuid().as_raw();
-    let home =
-        std::env::var("HOME").context("HOME is required for the XDG rw-binds")?;
+    let home = std::env::var("HOME").context("HOME is required for the XDG rw-binds")?;
     let host_runtime = instance_runtime_dir(cfg);
     let inst_name = namespaces::cgroup_name_for(&cfg.app_id, &cfg.instance_id);
 
@@ -228,8 +226,7 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
         format!("{scratch}/sys/class"),
         format!("{scratch}/runtime"),
     ] {
-        std::fs::create_dir_all(&d)
-            .with_context(|| format!("creating the scratch dir {d}"))?;
+        std::fs::create_dir_all(&d).with_context(|| format!("creating the scratch dir {d}"))?;
     }
     // Other users must not walk the scratch on the host: it carries
     // the per-instance runtime dir (future home of the tagged
@@ -244,18 +241,35 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
         // `mount(2)` bind requires the target to exist; `create_dir_all`
         // made the dirs but not the files.
         let tgt = format!("{scratch}/dev/{n}");
-        std::fs::File::create(&tgt)
-            .with_context(|| format!("creating the bind target {tgt}"))?;
+        std::fs::File::create(&tgt).with_context(|| format!("creating the bind target {tgt}"))?;
         mount(&src, &tgt, "none", libc::MS_BIND, "")?;
     }
-    mount("/sys/devices", &format!("{scratch}/sys/devices"), "none", libc::MS_BIND, "")?;
-    mount("/sys/class", &format!("{scratch}/sys/class"), "none", libc::MS_BIND, "")?;
+    mount(
+        "/sys/devices",
+        &format!("{scratch}/sys/devices"),
+        "none",
+        libc::MS_BIND,
+        "",
+    )?;
+    mount(
+        "/sys/class",
+        &format!("{scratch}/sys/class"),
+        "none",
+        libc::MS_BIND,
+        "",
+    )?;
     // The per-instance runtime dir, carried the same way: for the
     // default XDG location it sits under `/run`, which the fresh
     // `/run` tmpfs of step 5 masks — a bind source resolved there
     // would silently hit the fresh tmpfs's empty stand-in directory
     // (a self-bind no-op that never crosses to the host).
-    mount(&host_runtime, &format!("{scratch}/runtime"), "none", libc::MS_BIND, "")?;
+    mount(
+        &host_runtime,
+        &format!("{scratch}/runtime"),
+        "none",
+        libc::MS_BIND,
+        "",
+    )?;
 
     // 2) A new layer over the whole tree (one-shot recursive
     //    self-bind — verified unprivileged on 7.2.11). Not ro:
@@ -270,8 +284,7 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     for n in DEV_NODES {
         // The fresh tmpfs is empty: the bind target must exist first.
         let tgt = format!("/dev/{n}");
-        std::fs::File::create(&tgt)
-            .with_context(|| format!("creating {tgt}"))?;
+        std::fs::File::create(&tgt).with_context(|| format!("creating {tgt}"))?;
         mount(
             &format!("{scratch}/dev/{n}"),
             &tgt,
@@ -338,7 +351,13 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
         .with_context(|| format!("setting the mode of {user_dir}"))?;
     let inst_dir = format!("{user_dir}/wlsctx/{inst_name}");
     std::fs::create_dir_all(&inst_dir).with_context(|| format!("creating {inst_dir}"))?;
-    mount(&format!("{scratch}/runtime"), &inst_dir, "none", libc::MS_BIND, "")?;
+    mount(
+        &format!("{scratch}/runtime"),
+        &inst_dir,
+        "none",
+        libc::MS_BIND,
+        "",
+    )?;
 
     // 6) /tmp: a fresh tmpfs sized by the profile.
     let data = if prof.tmp_size_mib == 0 {
@@ -425,7 +444,7 @@ mod tests {
     use super::*;
     use crate::sandbox::namespaces::NetworkMode;
     use crate::sandbox::run_sandboxed;
-    use crate::sandbox::userns::tests::{run_in_child, ChildOut};
+    use crate::sandbox::userns::tests::{ChildOut, run_in_child};
     use std::ffi::OsString;
     use std::io::Write;
 
@@ -448,13 +467,15 @@ mod tests {
             .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
         let command: Vec<OsString> = command.iter().map(OsString::from).collect();
         let config = config.clone();
-        run_in_child(move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
-            Ok(code) => code,
-            Err(e) => {
-                let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
-                2
-            }
-        })
+        run_in_child(
+            move |o: &mut ChildOut| match run_sandboxed(&command, &config) {
+                Ok(code) => code,
+                Err(e) => {
+                    let _ = writeln!(o.err(), "run_sandboxed: {e:#}");
+                    2
+                }
+            },
+        )
     }
 
     /// Classify a `run_cmd` result whose command must have exited 0.
@@ -469,8 +490,12 @@ mod tests {
                         "the kernel rejected the single-extent map (design failure, not a skip):\n{err}"
                     );
                 }
-                if err.contains("rootfs construction failed") || err.contains("sandbox setup failed") {
-                    panic!("{what}: a setup step failed inside the namespaces (a real failure, not a skip):\n{err}");
+                if err.contains("rootfs construction failed")
+                    || err.contains("sandbox setup failed")
+                {
+                    panic!(
+                        "{what}: a setup step failed inside the namespaces (a real failure, not a skip):\n{err}"
+                    );
                 }
                 eprintln!("skipping {what} (environment cannot create the namespaces):\n{err}");
                 false
@@ -546,7 +571,8 @@ mod tests {
             let line = get(&format!("MNT {m}"));
             let got_fs = line.split_whitespace().next().unwrap_or_default();
             assert_eq!(
-                got_fs, fstype.as_str(),
+                got_fs,
+                fstype.as_str(),
                 "wrong fstype at {m}: {line} (expected {fstype})\n{out}"
             );
         }
@@ -590,11 +616,19 @@ mod tests {
         // home dir is writable from the app.
         let home = std::env::var("HOME").unwrap_or_default();
         let (code2, out2, err2) = run_cmd(
-            &["/bin/sh", "-c", "touch \"$HOME/wlsctx-write-probe\" && rm -f \"$HOME/wlsctx-write-probe\" && echo ok || echo fail"],
+            &[
+                "/bin/sh",
+                "-c",
+                "touch \"$HOME/wlsctx-write-probe\" && rm -f \"$HOME/wlsctx-write-probe\" && echo ok || echo fail",
+            ],
             &cfg("app", "2", false),
         );
         if expect_ok(code2, &out2, &err2, "XDG rw self-bind") {
-            assert_eq!(out2.trim(), "ok", "the XDG rw self-bind must make $HOME writable:\n{out2}");
+            assert_eq!(
+                out2.trim(),
+                "ok",
+                "the XDG rw self-bind must make $HOME writable:\n{out2}"
+            );
         }
         let _ = &home; // (the probe used $HOME from the inherited env)
     }
@@ -619,14 +653,24 @@ mod tests {
 
         if in_render {
             let (code, out, err) = run_cmd(
-                &["/bin/sh", "-c", "ls /dev/dri; for f in /dev/dri/renderD*; do [ -r \"$f\" ] && [ -w \"$f\" ] && echo ACCESS-RW; done"],
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "ls /dev/dri; for f in /dev/dri/renderD*; do [ -r \"$f\" ] && [ -w \"$f\" ] && echo ACCESS-RW; done",
+                ],
                 &cfg("app", "3", true),
             );
             if !expect_ok(code, &out, &err, "gpu build") {
                 return;
             }
-            assert!(out.contains("renderD"), "a render node must be built:\n{out}");
-            assert!(out.contains("ACCESS-RW"), "the render node must be openable r/w by the app:\n{out}");
+            assert!(
+                out.contains("renderD"),
+                "a render node must be built:\n{out}"
+            );
+            assert!(
+                out.contains("ACCESS-RW"),
+                "the render node must be openable r/w by the app:\n{out}"
+            );
         } else {
             let (code, _out, err) = run_cmd(&["/bin/sh", "-c", "id"], &cfg("app", "3", true));
             assert_eq!(

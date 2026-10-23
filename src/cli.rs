@@ -1,18 +1,24 @@
 //! Command-line interface.
 //!
-//! A subcommand tree (PLAN.md §5): `wayland` is the original
-//! single-mode behaviour (a tagged Wayland socket), and `run` is the
-//! sandboxed-execution path (ad-hoc for now; profile-driven in later
-//! phases).
+//! A subcommand tree (PLAN.md §5): `run` is the sandboxed-execution
+//! path (ad-hoc for now; profile-driven in later phases); `wayland`
+//! is the original single-mode behaviour (a tagged Wayland socket),
+//! optionally relayed through the transparent proxy (`--proxy`);
+//! `broker` runs the clipboard prompt broker (a host user service);
+//! and `decide` lists or resolves the broker's pending prompts.
 
 use clap::builder::TypedValueParser;
 use clap::{Args, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 use std::path;
 
+use anyhow::{Result, bail};
+
 /// wlsctx: run commands inside a namespaced, landlock+seccomp
-/// confined sandbox, or tag a Wayland socket with a security context
-/// so the compositor can identify sandboxed clients.
+/// confined sandbox; tag a Wayland socket with a security context so
+/// the compositor can identify sandboxed clients (and optionally
+/// relay clients through the transparent proxy); run the clipboard
+/// prompt broker; or list/resolve the broker's pending prompts.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 pub struct Cli {
@@ -26,9 +32,89 @@ pub(crate) enum Command {
     /// Run a command inside the wlsctx sandbox
     Run(RunArgs),
     /// Set up a Wayland socket with an attached security context
+    /// (or, with --proxy, relay sandboxed clients through the
+    /// transparent proxy)
     ///
     /// See https://wayland.app/protocols/security-context-v1
     Wayland(WaylandArgs),
+    /// Run the clipboard prompt broker (a host user service, outside
+    /// the sandbox)
+    Broker(BrokerArgs),
+    /// List the broker's pending prompts, or send a decision to one
+    /// of them (the oldest, or the one --prompt names) on the
+    /// broker's session decision socket
+    Decide(DecideArgs),
+}
+
+impl Cli {
+    /// Validate the argument combinations clap cannot express:
+    /// the proxy-only `wayland` flags (clap can require
+    /// `--tagged-socket` *when* `--proxy` is set, but not the
+    /// inverse, and neither can test a `--clipboard-policy` value),
+    /// and the `allow`/`deny` decision keywords of the broker and
+    /// decide subcommands.
+    pub(crate) fn validate(&self) -> Result<()> {
+        match &self.command {
+            Command::Wayland(w) => {
+                if !w.proxy && w.tagged_socket.is_some() {
+                    bail!(
+                        "--tagged-socket ({:?}) is only valid together with --proxy; \
+                         in tag-and-park mode the --listen socket itself is the tagged one",
+                        w.tagged_socket,
+                    );
+                }
+                if !w.proxy && !w.allow_globals.is_empty() {
+                    bail!(
+                        "--allow-globals is only valid together with --proxy; \
+                         the tag-and-park mode has no relay to filter"
+                    );
+                }
+                if !w.proxy && w.broker_socket.is_some() {
+                    bail!(
+                        "--broker-socket ({:?}) is only valid together with --proxy; \
+                         the broker socket is only used to ask about dropped reads, \
+                         which only the relay can have",
+                        w.broker_socket,
+                    );
+                }
+                if w.notify_copy_out {
+                    if !w.proxy {
+                        bail!(
+                            "--notify-copy-out is only valid together with --proxy; \
+                             only the relay sees the app's set_selection traffic"
+                        );
+                    }
+                    if w.broker_socket.is_none() {
+                        bail!(
+                            "--notify-copy-out needs --broker-socket: the copy-out \
+                             notification is delivered to the host broker over that socket"
+                        );
+                    }
+                }
+                let clipboard = wlsctx::proxy::ClipboardPolicy::parse(&w.clipboard_policy)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if !w.proxy && clipboard != wlsctx::proxy::ClipboardPolicy::Allow {
+                    bail!(
+                        "--clipboard-policy {} is only valid together with --proxy; \
+                         the tag-and-park mode has no relay to filter",
+                        w.clipboard_policy,
+                    );
+                }
+            }
+            Command::Broker(b) => {
+                if let Some(s) = &b.auto_decide {
+                    wlsctx::broker::parse_decision(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            Command::Decide(d) => {
+                if let Some(s) = &d.decision {
+                    wlsctx::broker::parse_decision(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            Command::Run(_) => {}
+        }
+        Ok(())
+    }
 }
 
 /// Arguments of `wlsctx run`.
@@ -84,7 +170,8 @@ pub(crate) struct RunArgs {
     pub(crate) command: Vec<OsString>,
 }
 
-/// Arguments of `wlsctx wayland` (the original single-mode CLI).
+/// Arguments of `wlsctx wayland` (the original single-mode CLI,
+/// optionally the transparent proxy).
 #[derive(Args, Debug)]
 pub(crate) struct WaylandArgs {
     /// Application ID in security context (must not be empty)
@@ -94,9 +181,15 @@ pub(crate) struct WaylandArgs {
     #[arg(long, env = "WLSCTX_INSTANCE_ID", value_parser = NonEmpty::new("instance-id"))]
     pub(crate) instance_id: String,
     /// Sandbox engine ID in security context (must not be empty)
-    #[arg(long, env = "WLSCTX_SANDBOX_ENGINE", value_parser = NonEmpty::new("sandbox-engine"))]
+    #[arg(
+        long,
+        env = "WLSCTX_SANDBOX_ENGINE",
+        value_parser = NonEmpty::new("sandbox-engine")
+    )]
     pub(crate) sandbox_engine: String,
-    /// Listen on Unix socket
+    /// Listen on Unix socket (required unless --socket-activation is
+    /// set). In proxy mode this is the *public* socket the apps
+    /// connect to; in tag-and-park it is the tagged socket itself
     #[arg(
         long,
         env = "WLSCTX_SOCKET_PATH",
@@ -106,6 +199,106 @@ pub(crate) struct WaylandArgs {
     /// Receive socket via systemd socket activation (LISTEN_FDS)
     #[arg(long, conflicts_with = "listen")]
     pub(crate) socket_activation: bool,
+    /// Run as a transparent Wayland proxy: every connection to the
+    /// listen socket is relayed to the compositor through a
+    /// security-context connection to --tagged-socket, so the
+    /// compositor applies per-context policy to the sandboxed client
+    #[arg(long)]
+    pub(crate) proxy: bool,
+    /// (Proxy mode only) path of the tagged listener: bound here,
+    /// passed to the compositor, and the only socket the proxy
+    /// connects to upstream. It must be unreachable from the
+    /// sandboxed app (e.g. the sidecar's private runtime dir)
+    #[arg(long, required_if_eq("proxy", "true"))]
+    pub(crate) tagged_socket: Option<path::PathBuf>,
+    /// (Proxy mode only) comma-separated list of Wayland interface
+    /// names the sandboxed app may bind. When set, the proxy hides
+    /// every other global from the registry and rejects a bind of any
+    /// name the app was never shown (a `wl_display.error`
+    /// `invalid_object`); when unset the proxy is a pass-through and
+    /// shows all globals (the Phase 1 behaviour)
+    #[arg(
+        long,
+        env = "WLSCTX_ALLOW_GLOBALS",
+        value_delimiter = ',',
+        num_args = 1..,
+        value_name = "INTERFACE"
+    )]
+    pub(crate) allow_globals: Vec<String>,
+    /// (Proxy mode only) clipboard policy for the sandboxed apps:
+    /// `allow` (the default) relays `wl_data_offer.receive` requests
+    /// unchanged; `deny` relays a receive only when it reads data the
+    /// app itself put on the clipboard — every other read is dropped
+    /// silently (the app sees an empty clipboard; its own copy-and-
+    /// paste keeps working). In both policies a receive whose fd is
+    /// not an in-memory channel (memfd/pipe/socket) is a fatal
+    /// protocol error: compositors do not inspect the fd they are
+    /// handed, so the check is what stops an app from directing
+    /// clipboard data into a file
+    #[arg(
+        long,
+        env = "WLSCTX_CLIPBOARD_POLICY",
+        default_value = "allow",
+        value_name = "POLICY"
+    )]
+    pub(crate) clipboard_policy: String,
+    /// (Proxy mode only) path of the prompt broker's socket: when the
+    /// clipboard gate drops a foreign read, the proxy asks the broker
+    /// (which prompts the user on the host); an approved read opens
+    /// the gate's intent window (1500 ms) and goes through. When the
+    /// broker is missing or times out, the read is dropped anyway
+    #[arg(long, env = "WLSCTX_BROKER_SOCKET")]
+    pub(crate) broker_socket: Option<path::PathBuf>,
+    /// (Proxy mode only) notify the host broker — a desktop
+    /// notification — each time a sandboxed app writes to the clipboard
+    /// or the primary selection (a `set_selection`). This is the
+    /// copy-*out* signal: the data the app just placed is now reachable
+    /// by every client on the desktop. Fire-and-forget and fail-open:
+    /// a missing broker only loses the notice; the write is never
+    /// blocked or altered. Requires `--broker-socket` (the notification
+    /// travels over that socket); independent of `--clipboard-policy`
+    /// (a write is always forwarded)
+    #[arg(long, env = "WLSCTX_NOTIFY_COPY_OUT")]
+    pub(crate) notify_copy_out: bool,
+}
+
+/// Arguments of `wlsctx broker`.
+#[derive(Args, Debug)]
+pub(crate) struct BrokerArgs {
+    /// Listen on Unix socket (required unless --socket-activation is
+    /// set; the proxy's --broker-socket points here)
+    #[arg(long, env = "WLSCTX_SOCKET_PATH")]
+    pub(crate) listen: Option<path::PathBuf>,
+    /// Receive socket via systemd socket activation (LISTEN_FDS)
+    #[arg(long, conflicts_with = "listen")]
+    pub(crate) socket_activation: bool,
+    /// Decide every request automatically without prompting — a test
+    /// hook (an interactive broker never binds the decision socket)
+    #[arg(long, value_name = "DECISION")]
+    pub(crate) auto_decide: Option<String>,
+    /// How long to wait for the user's decision, in milliseconds (a
+    /// timeout is a deny)
+    #[arg(
+        long,
+        env = "WLSCTX_BROKER_TIMEOUT_MILLIS",
+        default_value_t = 30_000,
+        value_name = "MS"
+    )]
+    pub(crate) broker_timeout_millis: u64,
+}
+
+/// Arguments of `wlsctx decide` (a one-shot client of the broker's
+/// session decision socket).
+#[derive(Args, Debug)]
+pub(crate) struct DecideArgs {
+    /// The decision to send: allow or deny. Without it, `decide`
+    /// lists the pending prompts.
+    #[arg(long, value_name = "DECISION")]
+    pub(crate) decision: Option<String>,
+    /// The id of the pending prompt to decide (from the listing).
+    /// Omitted: the oldest pending prompt.
+    #[arg(long, value_name = "ID")]
+    pub(crate) prompt: Option<u32>,
 }
 
 /// A value parser that rejects the empty string for the security-context
@@ -155,10 +348,10 @@ impl TypedValueParser for NonEmpty {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, WaylandArgs};
+    use super::{BrokerArgs, Cli, Command, DecideArgs, WaylandArgs};
     use crate::testutil::{with_env, without_wlsctx_env};
-    use clap::error::ErrorKind;
     use clap::Parser;
+    use clap::error::ErrorKind;
 
     /// Parse in `wayland` subcommand form and extract the args.
     fn parse_wayland(argv: &[&str]) -> Result<WaylandArgs, clap::Error> {
@@ -166,6 +359,24 @@ mod tests {
         Ok(match cli.command {
             Command::Wayland(args) => args,
             _ => unreachable!("parse_wayland must only parse the wayland subcommand"),
+        })
+    }
+
+    /// Parse in `broker` subcommand form and extract the args.
+    fn parse_broker(argv: &[&str]) -> Result<BrokerArgs, clap::Error> {
+        let cli = Cli::try_parse_from(argv)?;
+        Ok(match cli.command {
+            Command::Broker(args) => args,
+            _ => unreachable!("parse_broker must only parse the broker subcommand"),
+        })
+    }
+
+    /// Parse in `decide` subcommand form and extract the args.
+    fn parse_decide(argv: &[&str]) -> Result<DecideArgs, clap::Error> {
+        let cli = Cli::try_parse_from(argv)?;
+        Ok(match cli.command {
+            Command::Decide(args) => args,
+            _ => unreachable!("parse_decide must only parse the decide subcommand"),
         })
     }
 
@@ -193,14 +404,29 @@ mod tests {
             assert_eq!(args.instance_id, "work");
             assert_eq!(args.sandbox_engine, "podman");
             assert!(!args.socket_activation);
+            assert!(!args.proxy);
+            assert!(args.tagged_socket.is_none());
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--app-id",
+                "rustrover",
+                "--instance-id",
+                "work",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("tag-and-park validates");
+            cli.validate().expect("tag-and-park validates");
         });
     }
 
     #[test]
     fn requires_subcommand() {
         without_wlsctx_env(|| {
-            let err = Cli::try_parse_from(["wlsctx"])
-                .expect_err("a subcommand is required");
+            let err = Cli::try_parse_from(["wlsctx"]).expect_err("a subcommand is required");
             // Clap answers a missing (required) subcommand by showing
             // the help; the error kind reflects that.
             assert_eq!(
@@ -425,21 +651,24 @@ mod tests {
         // present for clap's conflict check, so a stray env var (e.g. left
         // over from a shell) makes mode A refuse to start instead of
         // silently ignoring the path.
-        with_env(&[("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1"))], || {
-            let err = parse_wayland(&[
-                "wlsctx",
-                "wayland",
-                "--socket-activation",
-                "--app-id",
-                "a",
-                "--instance-id",
-                "i",
-                "--sandbox-engine",
-                "podman",
-            ])
-            .expect_err("--socket-activation must conflict with an env-provided --listen");
-            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
-        });
+        with_env(
+            &[("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1"))],
+            || {
+                let err = parse_wayland(&[
+                    "wlsctx",
+                    "wayland",
+                    "--socket-activation",
+                    "--app-id",
+                    "a",
+                    "--instance-id",
+                    "i",
+                    "--sandbox-engine",
+                    "podman",
+                ])
+                .expect_err("--socket-activation must conflict with an env-provided --listen");
+                assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+            },
+        );
     }
 
     #[test]
@@ -494,8 +723,7 @@ mod tests {
                     argv.push(f);
                     argv.push(if f == flag { "" } else { v });
                 }
-                let err = parse_wayland(&argv)
-                    .expect_err("an empty flag value must be rejected");
+                let err = parse_wayland(&argv).expect_err("an empty flag value must be rejected");
                 assert_eq!(ErrorKind::InvalidValue, err.kind(), "{flag}");
                 let msg = err.to_string();
                 assert!(msg.contains(flag), "{msg}");
@@ -556,14 +784,8 @@ mod tests {
         without_wlsctx_env(|| {
             // After the command starts, `--listen` belongs to the
             // command, not to wlsctx: the command runs with it intact.
-            let cli = Cli::try_parse_from([
-                "wlsctx",
-                "run",
-                "--",
-                "/usr/bin/sleep",
-                "--listen",
-            ])
-            .expect("a flag-like token after `--` is part of the command");
+            let cli = Cli::try_parse_from(["wlsctx", "run", "--", "/usr/bin/sleep", "--listen"])
+                .expect("a flag-like token after `--` is part of the command");
             let Command::Run(args) = cli.command else {
                 unreachable!();
             };
@@ -609,6 +831,384 @@ mod tests {
             let err = Cli::try_parse_from(["wlsctx", "run", "--no-such-flag", "/bin/sh"])
                 .expect_err("an unknown flag before the command must be rejected");
             assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Proxy mode (wayland --proxy): ported from the flat-CLI tests of
+    // the clipboard branch, adapted to the subcommand structure.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn wayland_proxy_requires_tagged_socket() {
+        without_wlsctx_env(|| {
+            let err = parse_wayland(&[
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect_err("--proxy requires --tagged-socket");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+            assert!(err.to_string().contains("--tagged-socket"), "{err}");
+        });
+    }
+
+    #[test]
+    fn wayland_proxy_parses_with_tagged_socket() {
+        without_wlsctx_env(|| {
+            let args = parse_wayland(&[
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/run/user/1000/wlsctx-tagged",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("proxy mode with a tagged socket must parse");
+            assert!(args.proxy);
+            assert_eq!(
+                args.tagged_socket.as_deref(),
+                Some(std::path::Path::new("/run/user/1000/wlsctx-tagged"))
+            );
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/run/user/1000/wlsctx-tagged",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("proxy mode validates");
+            cli.validate().expect("proxy mode validates");
+        });
+    }
+
+    #[test]
+    fn wayland_notify_copy_out_requires_proxy_and_broker_socket() {
+        without_wlsctx_env(|| {
+            // Without --proxy.
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--notify-copy-out",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("clap cannot express 'only with --proxy'; validate() catches it");
+            let err = cli
+                .validate()
+                .expect_err("--notify-copy-out without --proxy must be rejected");
+            assert!(err.to_string().contains("--proxy"), "{err}");
+
+            // With --proxy but no --broker-socket: the notification
+            // has nowhere to travel.
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--notify-copy-out",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("clap cannot express 'needs --broker-socket'; validate() catches it");
+            let err = cli
+                .validate()
+                .expect_err("--notify-copy-out without --broker-socket must be rejected");
+            assert!(err.to_string().contains("--broker-socket"), "{err}");
+
+            // With both: valid.
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--broker-socket",
+                "/tmp/broker.sock",
+                "--notify-copy-out",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("notify-copy-out with --proxy and --broker-socket must parse");
+            cli.validate()
+                .expect("notify-copy-out with both flags validates");
+        });
+    }
+
+    #[test]
+    fn wayland_clipboard_policy_defaults_to_allow_and_accepts_deny() {
+        without_wlsctx_env(|| {
+            let base = [
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ];
+            // Default.
+            let args = parse_wayland(&base).expect("the default policy must parse");
+            assert_eq!(args.clipboard_policy, "allow");
+            let cli = Cli::try_parse_from(base).expect("the default policy validates");
+            cli.validate().expect("the default policy validates");
+            // Explicit deny in proxy mode is fine.
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend(["--clipboard-policy", "deny"]);
+            let args = parse_wayland(&argv).expect("an explicit deny must parse");
+            assert_eq!(args.clipboard_policy, "deny");
+            let cli = Cli::try_parse_from(argv).expect("an explicit deny validates");
+            cli.validate().expect("an explicit deny validates");
+        });
+    }
+
+    #[test]
+    fn wayland_clipboard_policy_deny_requires_proxy() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--clipboard-policy",
+                "deny",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("clap cannot test a flag's value against another flag; validate() does");
+            let err = cli
+                .validate()
+                .expect_err("--clipboard-policy deny without --proxy must be rejected");
+            assert!(err.to_string().contains("--proxy"), "{err}");
+        });
+    }
+
+    #[test]
+    fn wayland_invalid_clipboard_policy_is_rejected() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--proxy",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/tmp/t",
+                "--clipboard-policy",
+                "sometimes",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("the value is free text at parse time; validate() checks it");
+            let err = cli
+                .validate()
+                .expect_err("an unknown policy value must be rejected");
+            assert!(err.to_string().contains("sometimes"), "{err}");
+        });
+    }
+
+    #[test]
+    fn wayland_tagged_socket_without_proxy_is_rejected() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "wayland",
+                "--listen",
+                "/run/pod/wayland-1",
+                "--tagged-socket",
+                "/somewhere",
+                "--app-id",
+                "a",
+                "--instance-id",
+                "i",
+                "--sandbox-engine",
+                "podman",
+            ])
+            .expect("clap cannot express 'only with --proxy'; validate() catches it");
+            let err = cli
+                .validate()
+                .expect_err("--tagged-socket without --proxy must be rejected");
+            assert!(err.to_string().contains("--proxy"), "{err}");
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Broker and decide subcommands (ported from the flat-CLI tests).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn decide_parses_without_listen() {
+        // The decider is a one-shot client of the broker's decision
+        // socket: it never binds one, so nothing is required at all.
+        without_wlsctx_env(|| {
+            let args = parse_decide(&["wlsctx", "decide"]).expect("decide needs no listen socket");
+            assert!(args.decision.is_none());
+            assert!(args.prompt.is_none());
+            let cli = Cli::try_parse_from(["wlsctx", "decide"])
+                .expect("decide mode parses without a listen socket");
+            cli.validate()
+                .expect("decide mode validates without a listen socket");
+        });
+    }
+
+    #[test]
+    fn decide_decision_requires_a_valid_keyword() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from(["wlsctx", "decide", "--decision", "sometimes"])
+                .expect("the keyword is free text at parse time; validate() checks it");
+            let err = cli
+                .validate()
+                .expect_err("an unknown decision keyword must be rejected");
+            assert!(err.to_string().contains("sometimes"), "{err}");
+
+            for d in ["allow", "deny"] {
+                let args = parse_decide(&["wlsctx", "decide", "--decision", d])
+                    .expect("a valid keyword must parse");
+                assert_eq!(args.decision.as_deref(), Some(d));
+                let cli = Cli::try_parse_from(["wlsctx", "decide", "--decision", d])
+                    .expect("a valid keyword must validate");
+                cli.validate().expect("a valid keyword must validate");
+            }
+        });
+    }
+
+    #[test]
+    fn decide_prompt_is_an_optional_id() {
+        without_wlsctx_env(|| {
+            let args =
+                parse_decide(&["wlsctx", "decide", "--prompt", "3"]).expect("--prompt must parse");
+            assert_eq!(args.prompt, Some(3));
+        });
+    }
+
+    #[test]
+    fn broker_requires_listen_without_socket_activation() {
+        // --listen is optional at parse time (the runtime check in
+        // run_broker is the one that fails), but the conflict with
+        // --socket-activation is enforced by clap.
+        without_wlsctx_env(|| {
+            let err = parse_broker(&[
+                "wlsctx",
+                "broker",
+                "--socket-activation",
+                "--listen",
+                "/run/user/1000/wlsctx-broker.sock",
+            ])
+            .expect_err("--socket-activation and --listen must conflict");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        });
+    }
+
+    #[test]
+    fn broker_auto_decide_requires_a_valid_keyword() {
+        without_wlsctx_env(|| {
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "broker",
+                "--listen",
+                "/run/user/1000/wlsctx-broker.sock",
+                "--auto-decide",
+                "sometimes",
+            ])
+            .expect("the keyword is free text at parse time; validate() checks it");
+            let err = cli
+                .validate()
+                .expect_err("an unknown auto-decide keyword must be rejected");
+            assert!(err.to_string().contains("sometimes"), "{err}");
+
+            let args = parse_broker(&[
+                "wlsctx",
+                "broker",
+                "--listen",
+                "/run/user/1000/wlsctx-broker.sock",
+                "--auto-decide",
+                "allow",
+                "--broker-timeout-millis",
+                "1000",
+            ])
+            .expect("a valid auto-decide must parse");
+            assert_eq!(args.auto_decide.as_deref(), Some("allow"));
+            assert_eq!(args.broker_timeout_millis, 1000);
+            let cli = Cli::try_parse_from([
+                "wlsctx",
+                "broker",
+                "--listen",
+                "/run/user/1000/wlsctx-broker.sock",
+                "--auto-decide",
+                "allow",
+            ])
+            .expect("a valid auto-decide must validate");
+            cli.validate().expect("a valid auto-decide must validate");
+        });
+    }
+
+    #[test]
+    fn broker_timeout_defaults_to_thirty_seconds() {
+        without_wlsctx_env(|| {
+            let args = parse_broker(&[
+                "wlsctx",
+                "broker",
+                "--listen",
+                "/run/user/1000/wlsctx-broker.sock",
+            ])
+            .expect("the default timeout must parse");
+            assert_eq!(args.broker_timeout_millis, 30_000);
         });
     }
 }

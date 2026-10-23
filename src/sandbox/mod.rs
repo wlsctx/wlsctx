@@ -18,13 +18,13 @@ pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, error};
-use std::os::fd::AsRawFd;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, fork};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::ffi::OsString;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// The tagged Wayland socket of this run (Phase 5.1), created by S
@@ -99,22 +99,26 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             hostname.len()
         );
     }
-    let creds =
-        userns::Credentials::current().context("reading the current uid/gid (getresuid/getresgid)")?;
+    let creds = userns::Credentials::current()
+        .context("reading the current uid/gid (getresuid/getresgid)")?;
 
     // 5.4, amended in Phase 6: block the forwardable signals
-    // (TERM/INT/HUP) on this thread before anything here may spawn a
-    // thread — notably the session-bus scope call below: `zbus`
-    // `block_on`s on a process-global tokio runtime whose worker
-    // threads are spawned from this thread and inherit its mask, so
-    // without the block an unblocked worker would take the whole
-    // process down on a default-action SIGTERM before the forwarder
-    // could service it. Blocked here, the three signals stay pending
-    // on every thread of the process; the forwarder (S branch,
-    // below) routes each to the app (decision #33). A keeps the
-    // block (it must survive a group-wide signal until it has
-    // reaped B); B unblocks before exec, so the app keeps its
-    // historical (unblocked) behavior.
+    // (TERM/INT/HUP) on this thread before the session-bus scope
+    // call below. That call is driven on a tokio runtime built in
+    // `src/systemd.rs` — a *current-thread* one: a fresh local
+    // runtime per call (never a process-global one), and
+    // current-thread rather than multi-thread so that no background
+    // workers outlive the drop and linger across the fork that
+    // follows (`src/systemd.rs::with_local_runtime`). It therefore
+    // runs on *this* thread, which is why the block must be in place
+    // here: while `S` is blocked inside the D-Bus `block_on`, an
+    // unblocked default-action SIGTERM would take the whole process
+    // down before the forwarder could service it. Blocked here, the
+    // three signals stay pending on every thread of the process; the
+    // forwarder (S branch, below) routes each to the app (decision
+    // #33). A keeps the block (it must survive a group-wide signal
+    // until it has reaped B); B unblocks before exec, so the app
+    // keeps its historical (unblocked) behavior.
     let mut fwd_mask = nix::sys::signal::SigSet::empty();
     for sig in [
         nix::sys::signal::Signal::SIGTERM,
@@ -141,12 +145,8 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     // scope *and its children* recursively when `S` — the last
     // member — exits. Any failure degrades to the raw-cgroup tier;
     // a run is never aborted over this.
-    let scope_unit =
-        format!("wlsctx-{}-{}.scope", config.app_id, config.instance_id);
-    match crate::systemd::attach_scope(
-        &scope_unit,
-        &format!("wlsctx sandbox: {}", config.app_id),
-    ) {
+    let scope_unit = format!("wlsctx-{}-{}.scope", config.app_id, config.instance_id);
+    match crate::systemd::attach_scope(&scope_unit, &format!("wlsctx sandbox: {}", config.app_id)) {
         crate::systemd::ScopeTier::Joined { unit } => {
             debug!("cgroup accounting: systemd scope {unit}")
         }
@@ -173,14 +173,14 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     // The per-instance runtime dir on the host: created before the
     // fork, so A can bind it into the fresh `/run` (it is also the
     // future home of the tagged Wayland socket — Phase 5).
-    let runtime_dir = mounts::instance_runtime_dir(&config);
+    let runtime_dir = mounts::instance_runtime_dir(config);
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("creating the per-instance runtime dir {runtime_dir}"))?;
     // The same dir's path *inside the sandbox* (the fresh `/run`'s
     // systemd-standard location, decision #28). The policy grants
     // and the app's env use this string: it is the one the app sees,
     // and it equals the host path only for the default XDG.
-    let sandbox_runtime = mounts::sandbox_instance_dir(&config);
+    let sandbox_runtime = mounts::sandbox_instance_dir(config);
 
     // Phase 5.1: the tagged Wayland socket is created *here*, ahead
     // of the first fork: the rootfs build's step-1 carry (which runs
@@ -235,8 +235,7 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     // process closes the ends it does not use and leaks the ones it keeps
     // (`supervise::leak`), so an `OwnedFd` drop never closes a shared end.
     let (pipe_read, pipe_write) = supervise::create_pipe().context("creating the B→A pipe")?;
-    let (sock_a, sock_s) =
-        supervise::create_socketpair().context("creating the S↔A socketpair")?;
+    let (sock_a, sock_s) = supervise::create_socketpair().context("creating the S↔A socketpair")?;
     let (ack_read, ack_write) =
         supervise::create_pipe().context("creating the A→B verdict pipe")?;
     let pr = supervise::leak(pipe_read);
@@ -295,13 +294,12 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // the instance sub-cgroup is created and entered here
             // (decision #12). B, a fork of A, inherits the namespace
             // and the membership.
-            let cgroup_name =
-                namespaces::cgroup_name_for(&config.app_id, &config.instance_id);
+            let cgroup_name = namespaces::cgroup_name_for(&config.app_id, &config.instance_id);
             if let Err(e) = namespaces::enter_cgroupns(&cgroup_name) {
                 error!("cgroup namespace setup failed: {e:#}");
                 std::process::exit(126);
             }
-            if let Err(e) = mounts::build_rootfs(&config) {
+            if let Err(e) = mounts::build_rootfs(config) {
                 error!("rootfs construction failed: {e:#}");
                 std::process::exit(126);
             }
@@ -336,12 +334,10 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     // signals; B is pid 1 of its own pid namespace,
                     // so default-action delivery is ignored
                     // regardless — decision #13).
-                    if let Some(m) = &fwd_mask {
-                        if let Err(e) = m.thread_unblock() {
-                            log::warn!(
-                                "B: unblocking the forwardable signals failed: {e}"
-                            );
-                        }
+                    if let Some(m) = &fwd_mask
+                        && let Err(e) = m.thread_unblock()
+                    {
+                        log::warn!("B: unblocking the forwardable signals failed: {e}");
                     }
                     // The remaining namespaces, the credential check,
                     // and — Phase 4 — the combined seccomp-notify filter
@@ -362,7 +358,7 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         // filter first, then the Landlock floor (the
                         // filter must precede Landlock — decision #22).
                         let caps =
-                            policy::capability_set(&config, std::path::Path::new(&sandbox_runtime))
+                            policy::capability_set(config, std::path::Path::new(&sandbox_runtime))
                                 .context("building the app's capability set")?;
                         let notify = policy::apply(&caps)
                             .context("installing the seccomp-notify filter + Landlock floor")?;
@@ -392,13 +388,15 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                                 drop(notify);
                                 Ok(())
                             }
-                            _ => bail!("the supervisor handoff did not complete; refusing to exec an unsupervised process"),
+                            _ => bail!(
+                                "the supervisor handoff did not complete; refusing to exec an unsupervised process"
+                            ),
                         }
                     })() {
                         error!("sandbox setup failed: {e:#}");
                         std::process::exit(126);
                     }
-                    exec_app(command, &app_env(&config, &runtime_dir));
+                    exec_app(command, &app_env(config, &runtime_dir));
                 }
                 ForkResult::Parent { child } => {
                     // A is done with the B→A pipe's write end (B holds
@@ -556,8 +554,12 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         }
                     };
                     unsafe { libc::close(ss) };
-                    log::debug!("S[{}]: got the listener (fd {})", std::process::id(), notify.as_raw_fd());
-                    match policy::capability_set(&config, std::path::Path::new(&sandbox_runtime)) {
+                    log::debug!(
+                        "S[{}]: got the listener (fd {})",
+                        std::process::id(),
+                        notify.as_raw_fd()
+                    );
+                    match policy::capability_set(config, std::path::Path::new(&sandbox_runtime)) {
                         Ok(caps) => {
                             let stop2 = Arc::clone(&stop);
                             supervisor = Some(std::thread::spawn(move || {
@@ -576,7 +578,12 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         }
                     }
                     // 5.4: the forwarder thread (see its docs).
-                    forwarder = arm_signal_forwarder(fwd_mask.as_ref(), app_pid, Arc::clone(&flags), Arc::clone(&stop));
+                    forwarder = arm_signal_forwarder(
+                        fwd_mask.as_ref(),
+                        app_pid,
+                        Arc::clone(&flags),
+                        Arc::clone(&stop),
+                    );
                     // 5.4: sd-notify — the app is running (or about
                     // to exec), so the unit is up. No-op (and
                     // `Ok`) when `$NOTIFY_SOCKET` is unset; a send
@@ -597,23 +604,27 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     // is a clean shutdown (S exits 0, below) rather
                     // than a signal stuck blocked, and a HUP keeps
                     // its 129.
-                    forwarder = arm_signal_forwarder(fwd_mask.as_ref(), None, Arc::clone(&flags), Arc::clone(&stop));
+                    forwarder = arm_signal_forwarder(
+                        fwd_mask.as_ref(),
+                        None,
+                        Arc::clone(&flags),
+                        Arc::clone(&stop),
+                    );
                     false
                 }
             };
 
             // Reap A, which carries B's status.
-            let code =
-                match waitpid(Some(child), None).context("waiting for the sandbox child")? {
-                    WaitStatus::Exited(_, code) => code,
-                    // 128+signal, the shell convention.
-                    WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-                    other => {
-                        return Err(anyhow!(
-                            "unexpected wait status for the sandbox child: {other:?}"
-                        ))
-                    }
-                };
+            let code = match waitpid(Some(child), None).context("waiting for the sandbox child")? {
+                WaitStatus::Exited(_, code) => code,
+                // 128+signal, the shell convention.
+                WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+                other => {
+                    return Err(anyhow!(
+                        "unexpected wait status for the sandbox child: {other:?}"
+                    ));
+                }
+            };
             // The app (and A) are gone: tell the supervisor and the
             // forwarder to stop and join them (each exits within one
             // poll tick; the forwarder's signalfd closes with its
@@ -635,19 +646,19 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // app is dead, so it is empty (a parallel instance sharing
             // the name may still hold it — that just makes the rmdir
             // fail with ENOTEMPTY, which we ignore).
-            if let Err(e) = std::fs::remove_dir(&sub_cgroup) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("cleaning up the sub-cgroup {sub_cgroup} failed: {e}");
-                }
+            if let Err(e) = std::fs::remove_dir(&sub_cgroup)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("cleaning up the sub-cgroup {sub_cgroup} failed: {e}");
             }
             // Best-effort removal of the rootfs scratch (its mounts
             // died with the children's mount ns; the directory
             // itself is a plain host directory on /var/tmp).
-            let scratch = mounts::rootfs_scratch_dir(&config);
-            if let Err(e) = std::fs::remove_dir_all(&scratch) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("cleaning up the rootfs scratch {scratch} failed: {e}");
-                }
+            let scratch = mounts::rootfs_scratch_dir(config);
+            if let Err(e) = std::fs::remove_dir_all(&scratch)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("cleaning up the rootfs scratch {scratch} failed: {e}");
             }
             // The scratch's parent may be left empty (a sibling
             // instance still running makes this ENOTEMPTY — ignored).
@@ -658,10 +669,10 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // (the tagged socket, and whatever the app created in
             // it). The step-1 carry is a *bind*, so the dir is still
             // at its host path (decision #28).
-            if let Err(e) = std::fs::remove_dir_all(&runtime_dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("cleaning up the runtime dir {runtime_dir} failed: {e}");
-                }
+            if let Err(e) = std::fs::remove_dir_all(&runtime_dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("cleaning up the runtime dir {runtime_dir} failed: {e}");
             }
             // 5.4: the signals S was asked to stop on override the
             // app's status: HUP keeps the historical `wlsctx`
@@ -820,12 +831,18 @@ fn arm_signal_forwarder(
 /// step-5 location, decision #28), so the bare socket name
 /// resolves inside the sandbox even when the host's XDG is not
 /// systemd's default.
-fn app_env(config: &SandboxConfig, runtime_dir: &str) -> std::collections::BTreeMap<String, String> {
+fn app_env(
+    config: &SandboxConfig,
+    runtime_dir: &str,
+) -> std::collections::BTreeMap<String, String> {
     let mut env = config.profile.env.clone();
     if let Some(spec) = &config.wayland {
         let host_path = crate::wayland::resolve_socket_path(runtime_dir, spec.listen.as_deref());
         let name = host_path.rsplit('/').next().unwrap_or("wayland-1");
-        env.insert("XDG_RUNTIME_DIR".into(), mounts::sandbox_instance_dir(config));
+        env.insert(
+            "XDG_RUNTIME_DIR".into(),
+            mounts::sandbox_instance_dir(config),
+        );
         env.insert("WAYLAND_DISPLAY".into(), name.to_string());
     }
     env
@@ -852,7 +869,7 @@ fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{run_sandboxed, SandboxConfig, WaylandSpec};
+    use super::{SandboxConfig, WaylandSpec, run_sandboxed};
     use crate::sandbox::mounts;
     use crate::sandbox::namespaces::NetworkMode;
     use crate::sandbox::userns::tests::run_in_child;
@@ -949,8 +966,7 @@ print('CONNECT-OK')";
         }
         // 5.3: the environment `run` gave the app.
         assert!(
-            out.contains("WD=wl-probe\n")
-                && out.contains(&format!("XDG={sandbox_runtime}\n")),
+            out.contains("WD=wl-probe\n") && out.contains(&format!("XDG={sandbox_runtime}\n")),
             "the app's WAYLAND_DISPLAY/XDG_RUNTIME_DIR are not what run sets \
              (expected WD=wl-probe, XDG={sandbox_runtime}):\n{out}\n{err}"
         );
@@ -1008,25 +1024,25 @@ print('CONNECT-OK')";
                 let mut p = crate::profile::Profile::adhoc();
                 p.env.insert(
                     "MARKER".to_string(),
-                    format!("{}/ready", mounts::sandbox_instance_dir(&SandboxConfig {
-                        app_id: "sig".to_string(),
-                        instance_id: "1".to_string(),
-                        network: NetworkMode::Shared,
-                        profile: crate::profile::Profile::adhoc(),
-                        gpu: false,
-                        wayland: None,
-                    })),
+                    format!(
+                        "{}/ready",
+                        mounts::sandbox_instance_dir(&SandboxConfig {
+                            app_id: "sig".to_string(),
+                            instance_id: "1".to_string(),
+                            network: NetworkMode::Shared,
+                            profile: crate::profile::Profile::adhoc(),
+                            gpu: false,
+                            wayland: None,
+                        })
+                    ),
                 );
                 p
             },
             gpu: false,
             wayland: None,
         };
-        let host_marker = format!(
-            "{}/ready",
-            mounts::instance_runtime_dir(&config)
-        );
-        let _ = std::fs::remove_dir_all(&mounts::instance_runtime_dir(&config));
+        let host_marker = format!("{}/ready", mounts::instance_runtime_dir(&config));
+        let _ = std::fs::remove_dir_all(mounts::instance_runtime_dir(&config));
 
         // A *single* process (the `exec` replaces sh): killing it
         // kills the whole pid ns, so nothing strays out of the
@@ -1052,8 +1068,7 @@ print('CONNECT-OK')";
                     mask.add(s);
                 }
                 let _ = mask.thread_block();
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(30);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while !std::path::Path::new(&host_marker2).exists() {
                     if std::time::Instant::now() >= deadline {
                         break;
@@ -1122,10 +1137,6 @@ print('CONNECT-OK')";
     /// does), the run sends `READY=1` when the app is up.
     #[test]
     fn sd_notify_reports_ready_when_the_app_runs() {
-        let _sb_lock = crate::testutil::SANDBOX_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         let tmp = crate::testutil::TmpDir::new("sd-notify");
         let sock_path = tmp.path().join("notify.sock");
         let datagram = std::os::unix::net::UnixDatagram::bind(&sock_path)
@@ -1141,11 +1152,16 @@ print('CONNECT-OK')";
         };
         let command = vec![OsString::from("/bin/true")];
         let sock_str = sock_path.to_string_lossy().into_owned();
-        // `with_env` takes `ENV_LOCK` itself (do not hold it here —
-        // the lock is not reentrant).
-        let mut result: (Option<i32>, String, String) =
-            (None, String::new(), String::new());
+        // `with_env` takes `ENV_LOCK` itself (the lock is not
+        // reentrant), so it is the *outer* guard here: every
+        // full-sandbox test orders the locks ENV_LOCK → SANDBOX_LOCK,
+        // and taking them in the opposite order across parallel tests
+        // deadlocks (ABBA).
+        let mut result: (Option<i32>, String, String) = (None, String::new(), String::new());
         crate::testutil::with_env(&[("NOTIFY_SOCKET", Some(&sock_str))], || {
+            let _sb_lock = crate::testutil::SANDBOX_LOCK
+                .lock()
+                .unwrap_or_else(|e| panic!("SANDBOX_LOCK poisoned: {e}"));
             result = run_in_child(move |o| match run_sandboxed(&command, &config) {
                 Ok(code) => code,
                 Err(e) => {
@@ -1155,11 +1171,7 @@ print('CONNECT-OK')";
             });
         });
         let (code, out, err) = result;
-        assert_eq!(
-            code,
-            Some(0),
-            "the trivial run failed:\n{out}\n{err}"
-        );
+        assert_eq!(code, Some(0), "the trivial run failed:\n{out}\n{err}");
         let mut buf = [0u8; 128];
         let (n, _from) = datagram
             .recv_from(&mut buf)

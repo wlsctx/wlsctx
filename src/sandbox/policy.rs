@@ -6,10 +6,8 @@
 //! Built identically in S and in B from the same pure function (B
 //! re-runs it after the forks — the value itself is not shared).
 
-use anyhow::{bail, Context, Result};
-use nono::capability::{
-    AccessMode, CapabilitySet, IpcMode, SignalMode, UnixSocketMode,
-};
+use anyhow::{Context, Result, bail};
+use nono::capability::{AccessMode, CapabilitySet, IpcMode, SignalMode, UnixSocketMode};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 
@@ -23,15 +21,7 @@ use crate::sandbox::SandboxConfig;
 /// shows the app every top-level directory, so this adds no
 /// visibility.
 const BASE_READ: &[&str] = &[
-    "/",
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/bin",
-    "/sbin",
-    "/etc",
-    "/proc",
-    "/sys",
+    "/", "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/sys",
 ];
 
 /// The capability set for `config`: the base app grants plus the
@@ -45,10 +35,7 @@ const BASE_READ: &[&str] = &[
 /// Landlock floor binds in B; for the default XDG it equals the
 /// host path, for a divergent XDG it does not (decision #28, the
 /// Phase-5 path translation).
-pub(crate) fn capability_set(
-    config: &SandboxConfig,
-    instance_dir: &Path,
-) -> Result<CapabilitySet> {
+pub(crate) fn capability_set(config: &SandboxConfig, instance_dir: &Path) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new();
     for p in BASE_READ {
         caps = caps
@@ -149,14 +136,12 @@ pub(crate) fn apply(caps: &CapabilitySet) -> Result<OwnedFd> {
                 std::io::Error::from_raw_os_error(e.errno())
             )
         })?;
-    prepared
-        .apply_raw()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "applying the Landlock floor failed at {:?} ({})",
-                e.stage(),
-                std::io::Error::from_raw_os_error(e.errno())
-            )
-        })?;
+    prepared.apply_raw().map_err(|e| {
+        anyhow::anyhow!(
+            "applying the Landlock floor failed at {:?} ({})",
+            e.stage(),
+            std::io::Error::from_raw_os_error(e.errno())
+        )
+    })?;
     Ok(unsafe { OwnedFd::from_raw_fd(notify) })
 }

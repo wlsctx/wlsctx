@@ -16,8 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use wayland_client::{
-    Connection, QueueHandle,
-    delegate_noop,
+    Connection, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_callback, wl_registry},
 };

@@ -72,9 +72,10 @@ impl Profile {
     /// The profile of an ad-hoc `run` (no app profile): no GPU by
     /// default, the standard XDG rw-set, the standard masks.
     pub(crate) fn adhoc() -> Self {
-        let mut p = Self::default();
-        p.gpu = false;
-        p
+        Self {
+            gpu: false,
+            ..Self::default()
+        }
     }
 }
 
@@ -98,10 +99,8 @@ pub(crate) fn builtin(app_id: &str) -> Option<Profile> {
 /// config dir (if present — parse errors propagate), else the
 /// built-in default, else `None` (ad-hoc `run` without a profile).
 pub(crate) fn load(app_id: &str) -> Result<Option<Profile>> {
-    let home =
-        std::env::var("HOME").context("HOME is required to locate the profile dir")?;
-    let base =
-        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+    let home = std::env::var("HOME").context("HOME is required to locate the profile dir")?;
+    let base = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
     let path = format!("{base}/wlsctx/apps/{app_id}.toml");
     if std::path::Path::new(&path).is_file() {
         let s = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
@@ -213,11 +212,7 @@ mod tests {
     fn unknown_fields_are_rejected() {
         let tmp = TmpDir::new("config-unknown");
         std::fs::create_dir_all(tmp.path().join("wlsctx/apps")).unwrap();
-        std::fs::write(
-            tmp.path().join("wlsctx/apps/unk.toml"),
-            "typos = true\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("wlsctx/apps/unk.toml"), "typos = true\n").unwrap();
         with_env(
             &[(
                 "XDG_CONFIG_HOME",

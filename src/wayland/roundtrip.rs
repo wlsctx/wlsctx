@@ -7,10 +7,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use wayland_client::{
-    Connection, EventQueue,
-    backend::WaylandError,
-};
+use wayland_client::{Connection, EventQueue, backend::WaylandError};
 
 /// How long to wait for the compositor to answer the security-context
 /// commit before giving up. Deliberately far below systemd's default

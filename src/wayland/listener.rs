@@ -132,7 +132,7 @@ pub(crate) fn bind_socket(path: &path::Path) -> Result<UnixListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{LISTEN_FD_LOCK, TmpDir, xdg_runtime_dir, with_env};
+    use crate::testutil::{LISTEN_FD_LOCK, TmpDir, with_env, xdg_runtime_dir};
     use std::os::fd::{AsRawFd, OwnedFd};
 
     fn test_wayland_listen(listen: &str) -> WaylandArgs {
@@ -142,6 +142,12 @@ mod tests {
             sandbox_engine: "podman".into(),
             listen: Some(path::PathBuf::from(listen)),
             socket_activation: false,
+            proxy: false,
+            tagged_socket: None,
+            allow_globals: vec![],
+            clipboard_policy: "allow".into(),
+            broker_socket: None,
+            notify_copy_out: false,
         }
     }
 
@@ -152,6 +158,12 @@ mod tests {
             sandbox_engine: "podman".into(),
             listen: None,
             socket_activation: true,
+            proxy: false,
+            tagged_socket: None,
+            allow_globals: vec![],
+            clipboard_policy: "allow".into(),
+            broker_socket: None,
+            notify_copy_out: false,
         }
     }
 
@@ -324,7 +336,8 @@ mod tests {
         with_env(
             &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
             || {
-                let err = obtain_listener(&test_wayland_listen("")).expect_err("empty path must fail");
+                let err =
+                    obtain_listener(&test_wayland_listen("")).expect_err("empty path must fail");
                 assert!(
                     format!("{err:#}").contains("not a socket"),
                     "clear error expected, got: {err:#}"
@@ -343,8 +356,9 @@ mod tests {
             &[("XDG_RUNTIME_DIR", Some(runtime.path().to_str().unwrap()))],
             || {
                 let expected = runtime.path().join("wlsctx/work/wayland-1");
-                let (_, _, listener) = obtain_listener(&test_wayland_listen("wlsctx/work/wayland-1"))
-                    .expect("relative path must land in the runtime dir");
+                let (_, _, listener) =
+                    obtain_listener(&test_wayland_listen("wlsctx/work/wayland-1"))
+                        .expect("relative path must land in the runtime dir");
                 assert_eq!(socket_path(&listener), Some(expected));
                 assert!(runtime.path().join("wlsctx/work").is_dir());
             },

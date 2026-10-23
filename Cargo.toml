@@ -19,15 +19,50 @@ nono = { version = "0.80.0", default-features = false }
 sd-notify = "0.5.0"
 # App-profile serialization (PLAN.md phase 3).
 serde = { version = "1.0.229", features = ["derive"] }
+# App-profile serialization (PLAN.md phase 3).
 toml = "1.1.8"
-wayland-client = "0.31.15"
+# The prompt broker's newline-delimited JSON wire protocol (Phase 4).
+serde_json = "1"
+# Socket I/O (send/recv with SCM_RIGHTS fd passing) + poll(2) for the
+# transparent proxy relay. Uses the same crate (and feature set) that
+# wayland-backend's `rs/socket.rs` uses, so the proxy mirrors the
+# upstream implementation exactly; `nix` is kept for signalfd/SigSet/waitpid.
+rustix = { version = "1", features = ["event", "fs", "net"] }
 # Session-bus D-Bus client for the transient systemd scope (PLAN.md
 # phase 6, #35). The one-shot call happens in the single-threaded
-# pre-fork part of the supervisor, via `zbus::blocking`. v5 for now:
-# 6.0.0 (2026-10-16) reworked the runtime API (`zbus::block_on`,
-# async-only `call_method`) — migrating is a later, small task.
-# `blocking-api` is the feature gate for the `zbus::blocking` module in v5
-# (not `blocking`, which is an optional *dependency*).
-zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"] }
-wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+# pre-fork part of the supervisor. It is driven on a *fresh, local*
+# tokio runtime via zbus's **async** API — deliberately NOT
+# `zbus::blocking` (v5), whose wrapper hides a *process-global* tokio
+# runtime in an `OnceLock` that is dead in a `fork(2)`-ed child (see
+# `src/systemd.rs` module docs). v5 for now: 6.0.0 (2026-10-16)
+# reworked the runtime API (`zbus::block_on`) — migrating is a later,
+# small task, but the async API used here is the same one 6 is built
+# on, so this code is already 6-shaped.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# Runtime host for that one-shot call: `src/systemd.rs` builds a fresh
+# multi-threaded runtime per invocation (never a process-global one)
+# so the scope call is safe in a forked child. Feature set matches
+# zbus's own `tokio` dep (unified by the resolver).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "io-util"] }
+# Public `protocol` module only (Interface / MessageDesc / ArgumentType):
+# the runtime signature table for the proxy's wire codec.
+wayland-backend = "0.3"
+wayland-client = "0.31.15"
+# Both `staging` and `unstable` are enabled so the proxy can parse every
+# global sway/wlroots exposes (xdg-output, relative-pointer, pointer-gestures,
+# keyboard-shortcuts-inhibit, input-timestamps, idle-inhibit,
+# linux-explicit-synchronization are `unstable`-gated) and therefore gate or
+# relay them fail-closed.
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+# generate_interfaces! for the vendored wlroots protocol XMLs
+# (protocols/ — sway's wlr family; see src/proxy/wlr_tables.rs).
+wayland-scanner = "0.31"
 xdg = "3.0.0"
+
+[dev-dependencies]
+# Test-only: a fake compositor (tests/common) and the `tempfile` scratch
+# dirs. Dev deps are unified into `cargo test` builds only; the static
+# release binary is built from [dependencies] alone.
+tempfile = "3"
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "server"] }

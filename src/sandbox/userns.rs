@@ -70,7 +70,10 @@ impl Credentials {
         if unsafe { libc::getresgid(&mut rgid, &mut egid, &mut sgid) } != 0 {
             return Err(io::Error::last_os_error()).context("getresgid(2)");
         }
-        Ok(Self { uid: ruid, gid: rgid })
+        Ok(Self {
+            uid: ruid,
+            gid: rgid,
+        })
     }
 }
 
@@ -117,8 +120,9 @@ fn write_map_file(path: &str, contents: &str) -> Result<()> {
         .write(true)
         .open(path)
         .with_context(|| format!("opening {path}"))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("writing {path} (the kernel permits exactly one successful write)"))?;
+    file.write_all(contents.as_bytes()).with_context(|| {
+        format!("writing {path} (the kernel permits exactly one successful write)")
+    })?;
     Ok(())
 }
 
@@ -165,8 +169,8 @@ fn check_resids(creds: &Credentials) -> Result<()> {
 
 /// The process's effective capability set (from /proc/self/status).
 fn cap_eff() -> Result<u64> {
-    let status = std::fs::read_to_string("/proc/self/status")
-        .context("reading /proc/self/status")?;
+    let status =
+        std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
     for line in status.lines() {
         if let Some(hex) = line.strip_prefix("CapEff:") {
             return u64::from_str_radix(hex.trim(), 16)
@@ -184,10 +188,14 @@ fn cap_eff() -> Result<u64> {
 fn check_caps_present() -> Result<()> {
     let caps = cap_eff()?;
     if caps == 0 {
-        bail!("CapEff is 0 before the exec; the design relies on the creator's ns capability set (PLAN §3.1)");
+        bail!(
+            "CapEff is 0 before the exec; the design relies on the creator's ns capability set (PLAN §3.1)"
+        );
     }
     if caps & (1 << 21) == 0 {
-        bail!("CapEff is {caps:#018x} without CAP_SYS_ADMIN; the rootfs phase cannot mount (PLAN §3.1)");
+        bail!(
+            "CapEff is {caps:#018x} without CAP_SYS_ADMIN; the rootfs phase cannot mount (PLAN §3.1)"
+        );
     }
     Ok(())
 }
@@ -197,16 +205,12 @@ fn check_caps_present() -> Result<()> {
 /// (success, a different errno) would mean the id can move, which
 /// breaks the "locked at the real uid" invariant.
 fn check_repriv_blocked() -> Result<()> {
-    assert_errno(
-        "setresuid(0,0,0)",
-        libc::EINVAL,
-        || unsafe { libc::setresuid(0, 0, 0) },
-    )?;
-    assert_errno(
-        "setresgid(0,0,0)",
-        libc::EINVAL,
-        || unsafe { libc::setresgid(0, 0, 0) },
-    )?;
+    assert_errno("setresuid(0,0,0)", libc::EINVAL, || unsafe {
+        libc::setresuid(0, 0, 0)
+    })?;
+    assert_errno("setresgid(0,0,0)", libc::EINVAL, || unsafe {
+        libc::setresgid(0, 0, 0)
+    })?;
     Ok(())
 }
 
@@ -215,7 +219,9 @@ fn check_repriv_blocked() -> Result<()> {
 /// violation.
 fn assert_errno(what: &str, want: i32, call: impl FnOnce() -> i32) -> Result<()> {
     if call() == 0 {
-        bail!("{what} SUCCEEDED — the credential state can move, this breaks the design (PLAN §3.1)");
+        bail!(
+            "{what} SUCCEEDED — the credential state can move, this breaks the design (PLAN §3.1)"
+        );
     }
     let err = io::Error::last_os_error();
     if err.raw_os_error() != Some(want) {
@@ -223,7 +229,6 @@ fn assert_errno(what: &str, want: i32, call: impl FnOnce() -> i32) -> Result<()>
     }
     Ok(())
 }
-
 
 /// The forked-child test harness (`run_in_child` + `ChildOut`) and the
 /// `enter_userns` failure classifier, shared with the `namespaces`
@@ -233,7 +238,7 @@ fn assert_errno(what: &str, want: i32, call: impl FnOnce() -> i32) -> Result<()>
 pub(crate) mod tests {
     use super::*;
     use crate::sandbox::run_sandboxed;
-    use nix::sys::wait::{waitpid, WaitStatus};
+    use nix::sys::wait::{WaitStatus, waitpid};
     use nix::unistd::ForkResult;
     use std::ffi::OsString;
     use std::io::{Read, Write};
@@ -265,13 +270,10 @@ pub(crate) mod tests {
     impl ChildOut {
         /// A writer for the child's *stderr* pipe (diagnostics).
         pub(crate) fn err(&mut self) -> ErrWriter<'_> {
-            ErrWriter { fd: self.err_fd, _marker: std::marker::PhantomData }
-        }
-
-        /// The raw write fds, for code that cannot hold a `&mut`
-        /// (e.g. a thread inside a forked child).
-        pub(crate) fn fds(&self) -> (i32, i32) {
-            (self.out_fd, self.err_fd)
+            ErrWriter {
+                fd: self.err_fd,
+                _marker: std::marker::PhantomData,
+            }
         }
     }
 
@@ -351,7 +353,10 @@ pub(crate) mod tests {
                 let _ = env_logger::try_init_from_env(
                     env_logger::Env::default().default_filter_or("warn"),
                 );
-                let code = body(&mut ChildOut { out_fd: w_out, err_fd: w_err });
+                let code = body(&mut ChildOut {
+                    out_fd: w_out,
+                    err_fd: w_err,
+                });
                 // Close the write ends explicitly (fd 1/2 share the
                 // same pipe; `exit` closes everything regardless) so
                 // the parent's read reaches EOF.
@@ -456,18 +461,23 @@ pub(crate) mod tests {
             let (want_uid, want_gid) = single_extent(&creds);
             let lines: Vec<&str> = map.lines().collect();
             if lines.len() != 1 || normalize_map(lines[0]) != want_uid {
-                let _ = writeln!(o, "FAIL uid_map is {map:?}; want the single extent {want_uid:?}");
+                let _ = writeln!(
+                    o,
+                    "FAIL uid_map is {map:?}; want the single extent {want_uid:?}"
+                );
                 return 2;
             }
             let gmap = std::fs::read_to_string("/proc/self/gid_map").unwrap_or_default();
             let glines: Vec<&str> = gmap.lines().collect();
             if glines.len() != 1 || normalize_map(glines[0]) != want_gid {
-                let _ = writeln!(o, "FAIL gid_map is {gmap:?}; want the single extent {want_gid:?}");
+                let _ = writeln!(
+                    o,
+                    "FAIL gid_map is {gmap:?}; want the single extent {want_gid:?}"
+                );
                 return 3;
             }
 
-            let setgroups =
-                std::fs::read_to_string("/proc/self/setgroups").unwrap_or_default();
+            let setgroups = std::fs::read_to_string("/proc/self/setgroups").unwrap_or_default();
             if setgroups.trim() != "deny" {
                 let _ = writeln!(o, "FAIL setgroups is {setgroups:?}; want \"deny\"");
                 return 4;
@@ -481,11 +491,17 @@ pub(crate) mod tests {
                     return 5;
                 }
                 Ok(0) => {
-                    let _ = writeln!(o, "FAIL CapEff is 0 after the map write; the design needs the full ns set");
+                    let _ = writeln!(
+                        o,
+                        "FAIL CapEff is 0 after the map write; the design needs the full ns set"
+                    );
                     return 5;
                 }
                 Ok(caps) if caps & (1 << 21) == 0 => {
-                    let _ = writeln!(o, "FAIL CapEff is {caps:#018x} without CAP_SYS_ADMIN; the rootfs phase cannot mount");
+                    let _ = writeln!(
+                        o,
+                        "FAIL CapEff is {caps:#018x} without CAP_SYS_ADMIN; the rootfs phase cannot mount"
+                    );
                     return 5;
                 }
                 Ok(_) => {}
@@ -519,7 +535,9 @@ pub(crate) mod tests {
             // map: this is a design/kernel mismatch, not an
             // environment quirk — fail loudly (this is the case that
             // used to hide behind a "skip").
-            Some(20) => panic!("the kernel rejected the single-extent map (this is a design failure, not an environment skip):\n{out}\n{err}"),
+            Some(20) => panic!(
+                "the kernel rejected the single-extent map (this is a design failure, not an environment skip):\n{out}\n{err}"
+            ),
             Some(other) => panic!("credential sequence failed (exit {other}):\n{out}\n{err}"),
             None => panic!("test harness failed"),
         }
@@ -561,17 +579,22 @@ pub(crate) mod tests {
             ] {
                 match write_map_file("/proc/self/uid_map", &contents) {
                     Ok(()) => {
-                        let _ = writeln!(o, "FAIL: the second write ({label}) was ACCEPTED — write-once is not in effect on this kernel");
+                        let _ = writeln!(
+                            o,
+                            "FAIL: the second write ({label}) was ACCEPTED — write-once is not in effect on this kernel"
+                        );
                         return 10;
                     }
                     Err(e) => {
-                        let is_eperm = e
-                            .chain()
-                            .any(|c| c
-                                .downcast_ref::<io::Error>()
-                                .is_some_and(|io| io.raw_os_error() == Some(libc::EPERM)));
+                        let is_eperm = e.chain().any(|c| {
+                            c.downcast_ref::<io::Error>()
+                                .is_some_and(|io| io.raw_os_error() == Some(libc::EPERM))
+                        });
                         if !is_eperm {
-                            let _ = writeln!(o, "FAIL: second write ({label}) failed with {e:#}; expected EPERM");
+                            let _ = writeln!(
+                                o,
+                                "FAIL: second write ({label}) failed with {e:#}; expected EPERM"
+                            );
                             return 11;
                         }
                     }
@@ -582,11 +605,17 @@ pub(crate) mod tests {
             let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
             let (want, _) = single_extent(&creds);
             if normalize_map(&map) != want {
-                let _ = writeln!(o, "FAIL: the map changed after the rejected writes: {map:?}");
+                let _ = writeln!(
+                    o,
+                    "FAIL: the map changed after the rejected writes: {map:?}"
+                );
                 return 12;
             }
 
-            let _ = writeln!(o, "OK: write-once holds (second writes rejected with EPERM, map unchanged)");
+            let _ = writeln!(
+                o,
+                "OK: write-once holds (second writes rejected with EPERM, map unchanged)"
+            );
             0
         });
 
@@ -632,15 +661,16 @@ pub(crate) mod tests {
             gpu: false,
             wayland: None,
         };
-        let (code, out, err) = run_in_child(move |o| {
-            match run_sandboxed(&[OsString::from("id")], &config) {
-                Ok(code) => code,
-                Err(e) => {
-                    let _ = writeln!(o.err(), "run_sandboxed error: {e:#}");
-                    2
-                }
-            }
-        });
+        let (code, out, err) =
+            run_in_child(
+                move |o| match run_sandboxed(&[OsString::from("id")], &config) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        let _ = writeln!(o.err(), "run_sandboxed error: {e:#}");
+                        2
+                    }
+                },
+            );
 
         match code {
             Some(0) => {}
@@ -649,7 +679,9 @@ pub(crate) mod tests {
             // kernel rejected our map" (hard fail).
             Some(126) => {
                 if err.contains("uid_map") || err.contains("gid_map") {
-                    panic!("the kernel rejected the single-extent map (design failure, not an environment skip):\n{err}");
+                    panic!(
+                        "the kernel rejected the single-extent map (design failure, not an environment skip):\n{err}"
+                    );
                 }
                 eprintln!("skipping (environment cannot create a user namespace):\n{err}");
                 return;
@@ -659,8 +691,14 @@ pub(crate) mod tests {
         }
 
         let want = format!("uid={}(", creds.uid);
-        assert!(out.contains(&want), "expected `{want}` in `id` output; got:\n{out}\n{err}");
+        assert!(
+            out.contains(&want),
+            "expected `{want}` in `id` output; got:\n{out}\n{err}"
+        );
         let want = format!("gid={}(", creds.gid);
-        assert!(out.contains(&want), "expected `{want}` in `id` output; got:\n{out}\n{err}");
+        assert!(
+            out.contains(&want),
+            "expected `{want}` in `id` output; got:\n{out}\n{err}"
+        );
     }
 }

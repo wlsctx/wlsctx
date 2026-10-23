@@ -1,11 +1,15 @@
-//! wlsctx — run commands inside an in-process namespaced sandbox
-//! (`run`), or give a Wayland socket an attached security context so
-//! the compositor can identify sandboxed clients (`wayland`, the
-//! original single-purpose mode).
+//! wlsctx — run a command in an in-process namespaced sandbox
+//! (`run`), tag a Wayland socket with an attached security context
+//! (`wayland`, the original single-purpose mode) and optionally relay
+//! sandboxed clients through a transparent proxy (`wayland --proxy`),
+//! run the clipboard prompt broker (`broker`), or list/resolve the
+//! broker's pending prompts (`decide`).
 //!
 //! The rework (PLAN.md) makes this a subcommand-based CLI: the
 //! in-process sandbox (namespaces, private rootfs, landlock+seccomp
-//! via `nono`) is created by this binary itself, no containers.
+//! via `nono`) is created by this binary itself, no containers. The
+//! transparent proxy and the prompt broker live in the library
+//! (`src/lib.rs`) and are driven by the subcommands below.
 
 mod cli;
 mod profile;
@@ -14,20 +18,24 @@ mod systemd;
 mod testutil;
 mod wayland;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use env_logger::Env;
-use log::{Level, info, log_enabled, warn};
+use log::{Level, info, log_enabled};
+use std::io::Write as _;
+use std::path;
+use std::time::Duration;
 
-use crate::cli::{Cli, Command, WaylandArgs};
+use crate::cli::{BrokerArgs, Cli, Command, DecideArgs, WaylandArgs};
 use crate::wayland::context::create_security_context;
 use crate::wayland::listener::obtain_listener;
-use crate::wayland::signals::run_signal_loop;
+use wlsctx::proxy::LoopEnd;
 
 fn main() -> Result<()> {
     let env = Env::default().default_filter_or("warn");
     env_logger::init_from_env(env);
     let cli = Cli::parse();
+    cli.validate()?;
 
     match cli.command {
         // `run`: exec the command inside the sandbox and exit with
@@ -50,16 +58,15 @@ fn main() -> Result<()> {
             };
             // The tagged Wayland socket (Phase 5.1): enabled by any of
             // --wayland / --listen / --socket-activation.
-            let wayland =
-                if args.wayland || args.listen.is_some() || args.socket_activation {
-                    Some(sandbox::WaylandSpec {
-                        listen: args.listen.map(|p| p.to_string_lossy().into_owned()),
-                        socket_activation: args.socket_activation,
-                        sandbox_engine: args.sandbox_engine,
-                    })
-                } else {
-                    None
-                };
+            let wayland = if args.wayland || args.listen.is_some() || args.socket_activation {
+                Some(sandbox::WaylandSpec {
+                    listen: args.listen.map(|p| p.to_string_lossy().into_owned()),
+                    socket_activation: args.socket_activation,
+                    sandbox_engine: args.sandbox_engine,
+                })
+            } else {
+                None
+            };
             let config = sandbox::SandboxConfig {
                 app_id: args.app_id.clone(),
                 instance_id: args.instance_id.clone(),
@@ -75,40 +82,354 @@ fn main() -> Result<()> {
             info!("Sandboxed command exited with {code}");
             std::process::exit(code);
         }
-        Command::Wayland(args) => run_wayland(&args)?,
+        Command::Wayland(args) => {
+            if args.proxy {
+                run_proxy(&args)?
+            } else {
+                run_tag_and_park(&args)?
+            }
+        }
+        Command::Broker(args) => run_broker(&args)?,
+        Command::Decide(args) => run_decide(&args)?,
     }
 
     Ok(())
 }
 
-/// The original single-purpose mode (the `wlsctx wayland`
-/// subcommand): create the tagged socket and hold it until shutdown.
-fn run_wayland(args: &WaylandArgs) -> Result<()> {
+/// READY without unsetting NOTIFY_SOCKET: the `wayland` modes may
+/// re-exec in place on SIGHUP, and the new process must be able to
+/// re-notify.
+fn sd_notify_ready() {
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+}
+
+/// Resolve a `--listen`/`--tagged-socket` path: absolute paths are
+/// used as-is; relative ones are placed in the runtime directory
+/// (`XDG_RUNTIME_DIR`).
+fn resolve_listener_path(p: &path::Path) -> Result<path::PathBuf> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        xdg::BaseDirectories::new()
+            .place_runtime_file(p)
+            .with_context(|| {
+                format!(
+                    "placing {p:?} in the runtime directory \
+                     (is XDG_RUNTIME_DIR set?)"
+                )
+            })
+    }
+}
+
+/// Tag-and-park: tag the listen socket with the security context,
+/// hold the reference pipe, park until killed. Apps connect to the
+/// tagged socket directly.
+fn run_tag_and_park(args: &WaylandArgs) -> Result<()> {
     let (app_id, instance_id, listener) = obtain_listener(args)?;
-    let sandbox_engine = args.sandbox_engine.clone();
 
     if log_enabled!(Level::Info)
         && let Ok(local_addr) = listener.local_addr()
     {
-        info!("Listening on {local_addr:?}")
+        info!("Listening on {local_addr:?} (tagged)")
     }
 
-    // Keep BOTH the reference pipe (close_fd) and our copy of the tagged
-    // listener (listener) open until process exit: the compositor holds
-    // its own copies, so nothing is double-closed, but releasing either
-    // here would make the socket's lifecycle diverge from ours. See the
-    // ownership note on create_security_context.
-    let close_fd = create_security_context(&listener, &sandbox_engine, &app_id, &instance_id)?;
+    // Keep BOTH the reference pipe (close_fd) and our copy of the
+    // tagged listener open until process exit: the compositor holds
+    // its own copies, so nothing is double-closed, but releasing
+    // either here would make the socket's lifecycle diverge from
+    // ours. See the ownership note on create_security_context.
+    let close_fd = create_security_context(&listener, &args.sandbox_engine, &app_id, &instance_id)?;
     info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
-    // SAFETY: called from main() before any threads are spawned
-    if let Err(e) = unsafe { sd_notify::notify_and_unset_env(&[sd_notify::NotifyState::Ready]) } {
-        // With Notify=true a failed READY means
-        // systemd will time the service out; say so, since the failure
-        // would otherwise be invisible in our own log.
-        warn!("notifying the service manager (READY) failed: {e}");
-    }
+    sd_notify_ready();
 
-    run_signal_loop()?;
+    // SIGHUP rebuilds the tag in place (the only meaningful rebuild
+    // here — the protocol tables re-load): a --listen run re-execs;
+    // a socket-activated run exits cleanly for a systemd restart.
+    // (Contrast `run`, where SIGHUP terminates the app and exits 129
+    // — decision #33: there is no in-place rebuild of a live
+    // sandbox.)
+    match wlsctx::proxy::run_signal_loop()? {
+        LoopEnd::Stopped => {}
+        LoopEnd::ReExec => {
+            // Closing the reference pipe invalidates the old tag;
+            // dropping the listener frees the socket path / closes
+            // the activated fd. (The setup connection was already
+            // consumed by the tagging exchange.)
+            drop(close_fd);
+            drop(listener);
+            if args.socket_activation {
+                info!(
+                    "SIGHUP: socket-activated; exiting for a systemd restart \
+                     (a fresh socket is re-passed and re-tagged)"
+                );
+            } else {
+                wlsctx::proxy::re_exec().with_context(|| "SIGHUP re-exec failed")?;
+            }
+        }
+    }
     info!("Shutting down.");
     Ok(())
+}
+
+/// Proxy mode: tag a *second*, private listener; every app
+/// connection to the public socket is relayed to the compositor
+/// through a fresh security-context connection to it.
+fn run_proxy(args: &WaylandArgs) -> Result<()> {
+    let (app_id, instance_id, public) = obtain_listener(args)?;
+    // validate() guarantees Some in proxy mode.
+    let tagged_path = resolve_listener_path(args.tagged_socket.as_deref().unwrap())?;
+    let tagged = wlsctx::proxy::bind_listener(&tagged_path)
+        .with_context(|| format!("binding the tagged listener {tagged_path:?}"))?;
+
+    if log_enabled!(Level::Info)
+        && let Ok(local_addr) = public.local_addr()
+    {
+        info!("Listening on {local_addr:?} (public); tagged listener at {tagged_path:?}")
+    }
+
+    let close_fd = create_security_context(&tagged, &args.sandbox_engine, &app_id, &instance_id)?;
+    // The compositor now holds its own copy of the tagged listener
+    // and accepts (and stamps) connections on it; the proxy only
+    // connects to it by path. Dropping our copy guarantees we can
+    // never accept on it (which would race the compositor and bypass
+    // the context).
+    drop(tagged);
+    info!("Holding close_fd open to keep the tagged Wayland socket available {close_fd:?}");
+    sd_notify_ready();
+
+    let policy = wlsctx::proxy::Policy::from_names(args.allow_globals.clone());
+    if policy.is_active() {
+        info!(
+            "Global allowlist active: showing {} interface(s) to sandboxed clients",
+            policy.allow_count()
+        );
+    } else {
+        info!("No global allowlist: pass-through (all globals shown)");
+    }
+    let clipboard = wlsctx::proxy::ClipboardPolicy::parse(&args.clipboard_policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if clipboard.is_active() {
+        info!(
+            "Clipboard gate active (deny): sandboxed reads of foreign selections come back empty"
+        );
+    } else {
+        info!("Clipboard gate: pass-through (allow)");
+    }
+    // The audit identity: every selection event the relay observes is
+    // recorded under the `audit` log target. Always on;
+    // `RUST_LOG=warn` suppresses the stream.
+    let audit = wlsctx::proxy::AuditConfig::new(app_id.clone(), instance_id.clone());
+    // The optional prompt broker: when a denied read lands, the
+    // relay asks here (a fresh connection per ask) before dropping.
+    let broker = match &args.broker_socket {
+        Some(p) => {
+            let p = resolve_listener_path(p)?;
+            if args.notify_copy_out {
+                info!(
+                    "Copy-out notifier: {} (each app write to the clipboard or primary \
+                     selection fires a desktop notification; fire-and-forget, fails open)",
+                    p.display()
+                );
+            } else {
+                info!(
+                    "Prompt broker: {} (denied reads are asked before dropping; a missing or \
+                     slow broker fails closed)",
+                    p.display()
+                );
+            }
+            Some(wlsctx::proxy::BrokerConfig {
+                socket: p,
+                app: app_id.clone(),
+                instance: instance_id.clone(),
+                notify_copy_out: args.notify_copy_out,
+                ..Default::default()
+            })
+        }
+        None => None,
+    };
+    match wlsctx::proxy::event_loop(
+        &public,
+        &tagged_path,
+        &policy,
+        clipboard,
+        audit,
+        broker,
+        None,
+    )? {
+        LoopEnd::Stopped => {}
+        LoopEnd::ReExec => {
+            // SIGHUP: close the reference pipe (invalidating the old
+            // tag) and the public listener (freeing its path, or the
+            // activated fd). In-flight app connections are severed
+            // (the relay is per-connection).
+            drop(close_fd);
+            drop(public);
+            if args.socket_activation {
+                info!(
+                    "SIGHUP: socket-activated; exiting for a systemd restart \
+                     (a fresh socket is re-passed and the tag re-created)"
+                );
+            } else {
+                wlsctx::proxy::re_exec().with_context(|| "SIGHUP re-exec failed")?;
+            }
+        }
+    }
+    info!("Shutting down.");
+    Ok(())
+}
+
+/// Broker mode: sit on the broker socket (systemd-activated or bound
+/// here), prompt the user for each denied foreign clipboard read, and
+/// answer the proxy.
+fn run_broker(args: &BrokerArgs) -> Result<()> {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").context(
+        "XDG_RUNTIME_DIR must be set: the broker keeps its decision \
+         socket in $XDG_RUNTIME_DIR/wlsctx",
+    )?;
+    let listener = if args.socket_activation {
+        wlsctx::broker::take_activated_socket().with_context(|| {
+            "no socket was received via systemd socket activation (LISTEN_FDS is not set \
+             or empty); run wlsctx through the wlsctx-broker.socket unit or use --listen"
+        })?
+    } else {
+        let socket_path = args.listen.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--listen is required when --socket-activation is not set \
+                 (or set WLSCTX_SOCKET_PATH)"
+            )
+        })?;
+        let socket_abspath = resolve_listener_path(socket_path)?;
+        wlsctx::broker::bind_listener(&socket_abspath)
+            .with_context(|| format!("binding {socket_abspath:?} failed"))?
+    };
+    sd_notify_ready();
+    let broker_args = wlsctx::broker::BrokerArgs {
+        runtime_dir: path::PathBuf::from(xdg).join("wlsctx"),
+        auto_decide: args.auto_decide.as_deref().and_then(|s| {
+            // validate() already rejected a bad value.
+            wlsctx::broker::parse_decision(s).ok().map(|d| match d {
+                wlsctx::broker::UserDecision::Allow => wlsctx::broker::AutoDecide::Allow,
+                wlsctx::broker::UserDecision::Deny => wlsctx::broker::AutoDecide::Deny,
+            })
+        }),
+        timeout: Duration::from_millis(args.broker_timeout_millis),
+    };
+    wlsctx::broker::run(&broker_args, listener).context("the broker event loop ended")?;
+    info!("Shutting down.");
+    Ok(())
+}
+
+/// Decide mode: talk to the broker's session decision socket.
+/// Without `--decision`: list the pending prompts (oldest first).
+/// With it: resolve the oldest pending prompt, or the one `--prompt`
+/// names.
+fn run_decide(args: &DecideArgs) -> Result<()> {
+    let xdg = std::env::var("XDG_RUNTIME_DIR").context(
+        "XDG_RUNTIME_DIR must be set: the broker's decision socket \
+         lives in $XDG_RUNTIME_DIR/wlsctx",
+    )?;
+    let socket = path::PathBuf::from(xdg)
+        .join("wlsctx")
+        .join(wlsctx::broker::DECISION_SOCKET);
+
+    let listing = args.decision.is_none();
+    let request = if listing {
+        wlsctx::broker::encode_list_request()?
+    } else {
+        let d = wlsctx::broker::parse_decision(
+            args.decision.as_deref().expect("checked by validate()"),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        wlsctx::broker::encode_decide_request(&d, args.prompt)?
+    };
+    info!(
+        "decide: {} on the decision socket {socket:?}",
+        if listing {
+            "listing pending prompts"
+        } else {
+            "deciding"
+        }
+    );
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "connecting to the broker decision socket {socket:?} failed (is the broker \
+             running — an --auto-decide broker never binds one?)"
+        )
+    })?;
+    let _ = stream.set_read_timeout(Some(wlsctx::broker::DECIDER_READ_TIMEOUT));
+    stream
+        .write_all(request.as_bytes())
+        .context("writing to the broker decision socket failed")?;
+
+    let mut line = String::new();
+    wlsctx::broker::read_line(&mut stream, &mut line)
+        .context("reading the broker's reply on the decision socket failed")?;
+    if line.is_empty() {
+        anyhow::bail!("the broker decision socket closed without a reply");
+    }
+
+    // The reply is one of three known kinds; each decoder validates
+    // the version and its own kind, so trying them in order
+    // dispatches.
+    match (
+        wlsctx::broker::decode_pending_list(&line),
+        wlsctx::broker::decode_resolution(&line),
+        wlsctx::broker::decode_error_reply(&line),
+    ) {
+        (Ok(list), _, _) => {
+            if list.prompts.is_empty() {
+                println!("no pending broker prompts");
+            } else {
+                for p in &list.prompts {
+                    println!(
+                        "#{:<4} {}/{}  {:<8}  {:<24} ({} left)",
+                        p.id,
+                        p.app,
+                        p.instance,
+                        p.selection,
+                        p.mime,
+                        format_secs(p.expires_in_ms)
+                    );
+                }
+            }
+            Ok(())
+        }
+        (_, Ok(resolved), _) => {
+            info!(
+                "decide: prompt #{} resolved ({})",
+                resolved.prompt, resolved.decision
+            );
+            println!("prompt #{}: {}", resolved.prompt, resolved.decision);
+            Ok(())
+        }
+        (_, _, Ok(err)) => {
+            let msg = match err.reason.as_str() {
+                wlsctx::broker::REASON_NO_PENDING => {
+                    "no pending broker prompt (it may have timed out already)"
+                }
+                wlsctx::broker::REASON_UNKNOWN_PROMPT => {
+                    "unknown prompt (already resolved or expired)"
+                }
+                other => other,
+            };
+            let msg = match err.prompt {
+                Some(id) => format!("prompt #{id}: {msg}"),
+                None => msg.to_string(),
+            };
+            Err(anyhow::anyhow!("{msg}"))
+        }
+        _ => Err(anyhow::anyhow!(
+            "malformed reply from the broker decision socket: {line:?}"
+        )),
+    }
+}
+
+/// A millisecond count as a short human duration (for the listing).
+fn format_secs(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
 }
