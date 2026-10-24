@@ -271,6 +271,9 @@ pub struct ClipboardGate {
     copy_out_clipboard: Option<Instant>,
     /// The same, for the primary selection (independent window).
     copy_out_primary: Option<Instant>,
+    /// The same, for a drag-and-drop (independent window; Phase
+    /// 6.5.5 — a `start_drag` is a copy-out like a `set`).
+    copy_out_drag: Option<Instant>,
 }
 
 /// The gate's decision on one `receive`, with the facts the
@@ -323,6 +326,7 @@ impl ClipboardGate {
             copy_out_interval: Self::COPY_OUT_NOTIFY_INTERVAL,
             copy_out_clipboard: None,
             copy_out_primary: None,
+            copy_out_drag: None,
         }
     }
 
@@ -595,38 +599,62 @@ impl ClipboardGate {
         }
     }
 
-    /// The selection this `set_selection` message acts on, and how
-    /// (Phase 6: the copy-out detector; Phase 9: the audit's
-    /// write/clear distinction).
+    /// The selection a client *write* acts on, and how (Phase 6: the
+    /// copy-out detector; Phase 9: the audit's write/clear
+    /// distinction).
     ///
-    /// A client `set_selection` on either selection protocol whose
-    /// source argument is **not NULL** is the app placing data on
-    /// that selection (a `Set`); a NULL source is a `Clear` (not a
-    /// write: nothing is placed, the previous data is simply
-    /// removed). Every other message — including the server's
-    /// `selection` *event*, which only ever echoes a prior write —
-    /// returns `None`.
+    /// Two client requests place data on a selection, and both are
+    /// writes (copy-outs) the audit must record:
+    ///
+    /// * a `set_selection` on either selection protocol whose source
+    ///   argument is **not NULL** — the app placing data on that
+    ///   selection (`Set`); a NULL source is a `Clear` (not a write:
+    ///   nothing is placed, the previous data is simply removed);
+    /// * a `wl_data_device.start_drag` — the app starting a drag,
+    ///   which places the drag's data on the *drag* selection (a
+    ///   `Set`; a drag has no clear form, and its source argument is
+    ///   never NULL in a valid request).
+    ///
+    /// Every other message — including the server's `selection`
+    /// *event*, which only ever echoes a prior write — returns
+    /// `None`.
     ///
     /// The source of a `Set` is guaranteed to be one *this* client
     /// created: the relay's bookkeeping (run before this, in
     /// `forward`) rejects any reference to an object the client
-    /// does not own, and a client can only set a selection with a
-    /// source it created itself. So a `Set` is unambiguously the
-    /// app writing — no origin-tracking state is needed (nor wanted:
-    /// a write must be reported even for a source the read-gate
-    /// later attributes foreign, because the *write* is what
-    /// matters).
+    /// does not own, and a client can only set a selection or start
+    /// a drag with a source it created itself. So a `Set` is
+    /// unambiguously the app writing — no origin-tracking state is
+    /// needed (nor wanted: a write must be reported even for a
+    /// source the read-gate later attributes foreign, because the
+    /// *write* is what matters).
     ///
     /// Returns the human-facing name — `"clipboard"` (the stable
-    /// selection) or `"primary"` (the X-style primary selection) —
-    /// and the kind; `None` otherwise.
+    /// selection), `"primary"` (the X-style primary selection), or
+    /// `"drag"` (a drag-and-drop) — and the kind; `None` otherwise.
     pub(crate) fn set_selection(
         dir: Dir,
         sender: &Interface,
         desc: &MessageDesc,
         msg: &Message<u32, OwnedFd>,
     ) -> Option<(&'static str, SelectionWrite)> {
-        if dir != Dir::ClientToServer || desc.name != "set_selection" {
+        if dir != Dir::ClientToServer {
+            return None;
+        }
+        // A `start_drag` (wl_data_device) is unconditionally a write
+        // to the drag selection: the source is the first argument
+        // and is never NULL in a valid drag (the parser enforces
+        // that), and the bookkeeping guarantees the client owns it.
+        // A malformed one (no source) is not a write.
+        if desc.name == "start_drag" {
+            return match (sender.name, msg.args.first()) {
+                ("wl_data_device", Some(Argument::Object(id))) if *id != 0 => {
+                    Some(("drag", SelectionWrite::Set))
+                }
+                _ => None,
+            };
+        }
+        if desc.name != "set_selection" {
             return None;
         }
         // The source is the first argument (`allow-null`). A NULL
@@ -649,23 +677,24 @@ impl ClipboardGate {
 
     /// Phase 6 follow-up: rate-limit the copy-out notification.
     ///
-    /// Record a write to `selection` (`"clipboard"` or `"primary"`)
-    /// and return whether a notification should fire now: the first
-    /// write for that selection, or one at least
+    /// Record a write to `selection` (`"clipboard"`, `"primary"`, or
+    /// `"drag"`) and return whether a notification should fire now:
+    /// the first write for that selection, or one at least
     /// [`Self::copy_out_interval`] after the last *fired* one.
     /// Suppressed writes do **not** extend the window — it is
     /// anchored on the fired notification — so a continuous burst
     /// (a rapid copier) notifies once per window and never
     /// starves. The state is per-connection (each relay is one app
     /// connection), which makes this the per-app, per-selection
-    /// limit; the two selections keep independent windows.
+    /// limit; the three selections keep independent windows.
     pub(crate) fn note_copy_out(&mut self, selection: &str) -> bool {
         let interval = self.copy_out_interval;
         let slot = match selection {
             "clipboard" => &mut self.copy_out_clipboard,
             "primary" => &mut self.copy_out_primary,
+            "drag" => &mut self.copy_out_drag,
             // Unknown selections never notify (defensive: the parser
-            // returns only the two above).
+            // returns only the three above).
             _ => return false,
         };
         let now = Instant::now();
@@ -1006,8 +1035,9 @@ mod tests {
 
     /// The copy-out/clear detector: a client `set_selection` with a
     /// non-NULL source (either protocol) is a `Set`; with a NULL
-    /// source a `Clear`; a compositor `selection` echo, and any
-    /// other request, is neither.
+    /// source a `Clear`; a `start_drag` with a source is a `Set` on
+    /// the drag selection; a compositor `selection` echo, and any
+    /// other (or malformed) request, is neither.
     #[test]
     fn set_selection_detects_writes_and_clears() {
         use SelectionWrite::{Clear, Set};
@@ -1067,8 +1097,19 @@ mod tests {
             ),
             None
         );
-        // An unrelated request on the device (`start_drag`) is not a
-        // `set_selection`.
+        // A `start_drag` with a source is a write to the drag
+        // selection (Phase 6.5.5) — the drag's data is a copy-out.
+        let (op, d) = request("start_drag");
+        assert_eq!(
+            ClipboardGate::set_selection(
+                Dir::ClientToServer,
+                &WL_DATA_DEVICE_INTERFACE,
+                d,
+                &msg(DEVICE, op, vec![Argument::Object(SRC)]),
+            ),
+            Some(("drag", Set))
+        );
+        // A malformed `start_drag` (no source) is not a write.
         let (op, d) = request("start_drag");
         assert_eq!(
             ClipboardGate::set_selection(
@@ -1109,10 +1150,17 @@ mod tests {
             !g.note_copy_out("clipboard"),
             "the clipboard's window is untouched by the primary note"
         );
+        // The drag selection keeps its own window (Phase 6.5.5 — a
+        // `start_drag` is a copy-out like a `set`): its first write
+        // notifies, independent of the other two, then suppresses.
+        assert!(g.note_copy_out("drag"), "the drag window is independent");
+        assert!(!g.note_copy_out("drag"), "…and then suppresses");
         assert!(
-            !g.note_copy_out("drag"),
-            "an unknown selection never notifies"
+            !g.note_copy_out("clipboard"),
+            "the clipboard's window is untouched by the drag note"
         );
+        // An unknown selection never notifies.
+        assert!(!g.note_copy_out("bogus"));
     }
 
     /// The window re-arms: a write after the interval notifies again

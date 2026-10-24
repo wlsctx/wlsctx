@@ -592,10 +592,14 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
   terminals that allocate a fresh PTY can fail with `EACCES`. It is a
   kernel-level restriction, not a policy one; under test we use a
   pre-allocated path instead.
-- **Drag-and-drop is only partially audited.** `start_drag` is not audited
-  as a write (the gate still attributes drags for the read-gate, and
-  `serve` events fired during a drag are recorded under the clipboard
-  label — `wl_data_source` is shared by both).
+- **Drag-and-drop `serve` is labelled by its source, not its drag.**
+  A `start_drag` is audited as a write (`action=set selection=drag`,
+  with its own copy-out notification — Phase 6.5.5), but the `serve`
+  records for the bytes it then serves are still labelled
+  `selection=clipboard`: `wl_data_source` is shared by the clipboard
+  and the drag, and the relay does not yet track which source is in
+  an active drag. The write is never missed — only the per-mime byte
+  flow behind a drag carries the stable-selection label.
 - **The full chain is still being verified end-to-end.** The sandboxed
   pipeline itself is verified (Phase 5.5: Firefox reached the
   compositor, networked, and tore down cleanly); what remains is the

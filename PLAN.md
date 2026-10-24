@@ -601,8 +601,14 @@ is integration-tested (`tests/proxy_integration.rs`,
       record per `set`/`read`/`clear`/`serve` event to the **host
       journal** (the relay logs to stderr); payload recorded as
       **size only, never content**; no rate-limiting (a persistent
-      record, not a digest). Open follow-up: extend to drag-and-drop
-      (`start_drag` is not audited yet).
+      record, not a digest). Drag-and-drop closed (2026-10-24): a
+      `start_drag` is audited as a write (`action=set selection=drag`,
+      its own copy-out notification). Remaining refinement: the
+      `serve` records for bytes served *during* a drag still carry the
+      `clipboard` label (`wl_data_source` is shared by the clipboard
+      and the drag; the relay does not yet track the active drag
+      source) — the write is never missed, only the per-mime flow's
+      selection label.
 - [x] 6.5.6 Protocol-table CI (branch deferred refinement):
       `scripts/gen_interface_table.py` regenerates `interfaces.rs`
       from `protocols/*.xml` and CI diffs the result
@@ -623,10 +629,13 @@ the same checks hold: after `1e46e3b`, all 35 (before the fix: 0). A
 SIGHUP on the proxy re-execs in place (same pid, re-binds and
 re-tags, still 35). 5.5 is done (the Firefox e2e, 2026-10-24). Still
 open from here: the full chain (a sandboxed app driven through the
-*proxy* into sway) and the drag-and-drop audit (6.5.5).
+*proxy* into sway). The drag-and-drop audit (6.5.5) is closed: a
+`start_drag` is audited as a write (the `serve`-label refinement is
+the one remaining drag detail — see 6.5.5 above).
 
 **Branch TASKS.md follow-ups:** the zbus 5→6 migration is done
-(`6725560`); the drag-and-drop audit (6.5.5) is still open.
+(`6725560`); the drag-and-drop audit (6.5.5) is done (`start_drag`
+audited as a write).
 
 ### Phase 7 — Re-homing the deployment units + sidecars
 - [x] 7.1 Re-home the broker deployment for the containerless

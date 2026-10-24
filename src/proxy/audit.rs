@@ -6,8 +6,9 @@
 //! the moment, lost if nobody looked): one record per
 //!
 //! * **`set`** — the app placed data on a selection (`set_selection`
-//!   with a non-NULL source). The copy-*out*: from that moment the
-//!   data is reachable by every client on the desktop.
+//!   with a non-NULL source, or a `start_drag`, which places the
+//!   drag's data on the drag selection). The copy-*out*: from that
+//!   moment the data is reachable by every client on the desktop.
 //! * **`read`** — the app asked to receive selection data
 //!   (`receive`), with the gate's decision: forwarded, dropped, or
 //!   approved through the prompt broker.
@@ -127,7 +128,9 @@ impl AuditConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditRecord {
     /// The selection the event is about: `clipboard` (the stable
-    /// selection) or `primary` (the X-style primary selection).
+    /// selection), `primary` (the X-style primary selection), or
+    /// `drag` (a drag-and-drop — the drag's data on the drag
+    /// selection).
     pub selection: &'static str,
     /// What happened: `set` (the app placed data on the selection),
     /// `read` (the app received selection data), `clear` (the app
