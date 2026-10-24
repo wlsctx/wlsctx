@@ -17,8 +17,8 @@ prompts. **PLAN.md is the authoritative plan and decisions log — read
 it before non-trivial changes. LESSONS.md is a short, living record of
 hard-won lessons — skim it before non-trivial changes (the full
 write-ups live in `docs/postmortems/`). README.md is the
-architecture/threat-model doc for the proxy/broker side; its
-post-rework rewrite is the pending phase 8.**
+architecture/threat-model doc (rewritten for the in-process world in
+phase 8.1).**
 
 ## Layout
 
@@ -84,9 +84,10 @@ post-rework rewrite is the pending phase 8.**
   either file** (CI regenerates and diffs them).
 - `.github/workflows/ci.yml` — protocol-table regeneration check +
   cargo check
-- `systemd/user/` — the wlsctx-broker socket+service units (the
-  legacy socket-activation and dbus-proxy units are phase-7
-  re-home territory)
+- `systemd/user/` — the wlsctx-broker socket+service units: the only
+  units in the repo. Per-app proxies are documented manual runs (the
+  README), and the phase-7.2/7.3 `dbus-proxy`/`xwayland` sidecars
+  would land here
 - `PLAN.md` — rework plan: architecture, decisions log, phase/task list
 - `LESSONS.md` — a short, living record of hard-won lessons from past
   work; add a line whenever a change teaches something durable, and
@@ -101,8 +102,9 @@ post-rework rewrite is the pending phase 8.**
 - Target: Fedora 45 (upgrade in progress), user-level systemd,
   sway/wlroots desktop. No containers: the sandbox is created by
   `wlsctx` itself (namespaces, private rootfs, landlock+seccomp via
-  `nono`) — see PLAN.md. (The old podman/quadlet deployment is
-  deleted; phase 7 re-homes the deployment units.)
+  `nono`) — see PLAN.md. The container-era deployment is fully
+  deleted; the broker units are re-homed to the subcommand CLI
+  (phase 7.1).
 - The app runs as its **real uid** inside the user namespace: the
   `uid_map` is a **single extent `<uid> <uid> 1`**, written **exactly
   once** (decision #9), because that is all an unprivileged creator may
@@ -130,7 +132,14 @@ post-rework rewrite is the pending phase 8.**
 - The app only sees the **tagged** Wayland socket, never the host
   socket; the reference pipe ("close" fd) must stay open for the
   process lifetime (ownership note in `wayland/context.rs`).
-- Per-instance runtime dir: `$XDG_RUNTIME_DIR/wlsctx/<instance>/`.
+- Per-instance runtime dir on the host:
+  `$XDG_RUNTIME_DIR/wlsctx/<app>-<instance>/`. Inside the sandbox it
+  always appears at the systemd-standard
+  `/run/user/<uid>/wlsctx/<app>-<instance>/`, regardless of the
+  host's `XDG_RUNTIME_DIR` (decision #28) — and that in-sandbox path
+  is what the app's env uses: `run --wayland` sets `XDG_RUNTIME_DIR`
+  to it and `WAYLAND_DISPLAY` to the socket name (default
+  `wayland-1`).
 - GPU: `/dev/dri/renderD*` nodes are bind-mounted into the sandbox's
   `/dev`; the user must be in the `render` group. `/dev` nodes are
   **bind-mounted, not mknod'd**, so future SELinux modules can use the
@@ -198,7 +207,11 @@ post-rework rewrite is the pending phase 8.**
   dominated by the `SANDBOX_LOCK`-serialised sandbox tests). See
   LESSONS.md #15/#16.
 - This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
-  each phase committed and working; the README rewrite is phase 8.
+  each phase committed and working. Next up: the phase 5.5 e2e (a
+  real GUI app — Firefox — through the full S→A→B pipeline on this
+  desktop), the 7.2/7.3 sidecars, and phase 8.2 and 8.4–8.5 (the
+  SELinux policy, the integration test suite, the threat-model
+  review).
 
 ## Commit conventions
 

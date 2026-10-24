@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.10 — the README is rewritten for the in-process architecture (8.1, 2026-10-24): the S→A→B pipeline, the rebuilt rootfs, the nono policy, the relay/broker/decider, the layered containment table, install/profiles/the per-app relay recipe, verify-your-setup, and the residual-risk list. The zbus 6 migration (`6725560`) landed with it. Next up: the Phase 5.5 e2e (a real GUI app — Firefox — through the full S→A→B pipeline on this desktop), then Phase 7's remaining sidecars (7.2 dbus-proxy, 7.3 xwayland) and Phase 8's 8.2–8.5 (SELinux, AGENTS.md, the integration test suite, the threat-model review)**
+Status: **v2.10 — the README is rewritten for the in-process architecture (8.1, 2026-10-24): the S→A→B pipeline, the rebuilt rootfs, the nono policy, the relay/broker/decider, the layered containment table, install/profiles/the per-app relay recipe, verify-your-setup, and the residual-risk list. The zbus 6 migration (`6725560`) landed with it. Next up: the Phase 5.5 e2e (a real GUI app — Firefox — through the full S→A→B pipeline on this desktop), then Phase 7's remaining sidecars (7.2 dbus-proxy, 7.3 xwayland) and Phase 8's 8.2 and 8.4–8.5 (the SELinux policy, the integration test suite, the threat-model review)**
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -654,7 +654,13 @@ drives the 6-shaped async API) and the drag-and-drop audit (6.5.5).
 - [ ] 8.2 New SELinux policy from scratch (local module confining the
       supervisor and app domains; the bind-mounted `/dev` nodes keep
       canonical labels, which makes this tractable — see §3.3)
-- [ ] 8.3 Update `AGENTS.md` (layout, facts)
+- [x] 8.3 Update `AGENTS.md` (layout, facts): the header points at
+      the rewritten README; the `systemd/user/` entry notes the
+      broker units are the only units left (proxies are manual runs,
+      sidecars would land here); the target fact drops the phase-7
+      re-home as pending (7.1 done); the per-instance-dir fact gains
+      the in-sandbox path translation and the app-env wiring
+      (decision #28); the WIP bullet lists the true next steps.
 - [ ] 8.4 Integration test suite (`tests/`): in-ns assertions (uid is
       non-root, pid 1, mounts, cgroup), landlock deny checks, seccomp
       checks, network checks, wayland tagged-socket check, lifecycle
