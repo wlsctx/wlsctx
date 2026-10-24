@@ -26,7 +26,7 @@ use std::io::Write as _;
 use std::path;
 use std::time::Duration;
 
-use crate::cli::{BrokerArgs, Cli, Command, DecideArgs, WaylandArgs};
+use crate::cli::{BrokerArgs, Cli, Command, DbusProxyArgs, DecideArgs, WaylandArgs};
 use crate::wayland::context::create_security_context;
 use crate::wayland::listener::obtain_listener;
 use wlsctx::proxy::LoopEnd;
@@ -91,6 +91,7 @@ fn main() -> Result<()> {
         }
         Command::Broker(args) => run_broker(&args)?,
         Command::Decide(args) => run_decide(&args)?,
+        Command::DbusProxy(args) => run_dbus_proxy(&args)?,
     }
 
     Ok(())
@@ -446,6 +447,57 @@ fn run_decide(args: &DecideArgs) -> Result<()> {
             "malformed reply from the broker decision socket: {line:?}"
         )),
     }
+}
+
+/// The D-Bus session-bus sidecar: wrap `xdg-dbus-proxy` so the
+/// sandboxed app's session-bus address reaches the real bus through a
+/// filterable bridge.
+fn run_dbus_proxy(args: &DbusProxyArgs) -> Result<()> {
+    let mut config = wlsctx::dbus_proxy::Config {
+        app_id: args.app_id.clone(),
+        instance_id: args.instance_id.clone(),
+        bus_address: args.bus_address.clone().unwrap_or_default(),
+        socket_name: args
+            .socket_name
+            .clone()
+            .unwrap_or_else(|| "bus.sock".into()),
+        proxy_bin: args
+            .proxy_bin
+            .clone()
+            .unwrap_or_else(|| "xdg-dbus-proxy".into()),
+        ..Default::default()
+    };
+    for n in &args.see {
+        config.rules.push(wlsctx::dbus_proxy::Rule {
+            kind: "see",
+            body: n.clone(),
+        });
+    }
+    for n in &args.talk {
+        config.rules.push(wlsctx::dbus_proxy::Rule {
+            kind: "talk",
+            body: n.clone(),
+        });
+    }
+    for n in &args.own {
+        config.rules.push(wlsctx::dbus_proxy::Rule {
+            kind: "own",
+            body: n.clone(),
+        });
+    }
+    for n in &args.call {
+        config.rules.push(wlsctx::dbus_proxy::Rule {
+            kind: "call",
+            body: n.clone(),
+        });
+    }
+    for n in &args.broadcast {
+        config.rules.push(wlsctx::dbus_proxy::Rule {
+            kind: "broadcast",
+            body: n.clone(),
+        });
+    }
+    wlsctx::dbus_proxy::run(config)
 }
 
 /// A millisecond count as a short human duration (for the listing).

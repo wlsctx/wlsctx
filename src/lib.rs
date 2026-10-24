@@ -15,4 +15,5 @@
 //!   `clipboard-write` notifications.
 
 pub mod broker;
+pub mod dbus_proxy;
 pub mod proxy;

@@ -44,6 +44,10 @@ pub(crate) enum Command {
     /// of them (the oldest, or the one --prompt names) on the
     /// broker's session decision socket
     Decide(DecideArgs),
+    /// Bridge the session bus to the per-instance D-Bus socket (a host
+    /// sidecar wrapping xdg-dbus-proxy; the app's
+    /// DBUS_SESSION_BUS_ADDRESS points at the public socket)
+    DbusProxy(DbusProxyArgs),
 }
 
 impl Cli {
@@ -112,6 +116,7 @@ impl Cli {
                 }
             }
             Command::Run(_) => {}
+            Command::DbusProxy(_) => {}
         }
         Ok(())
     }
@@ -300,6 +305,48 @@ pub(crate) struct DecideArgs {
     /// Omitted: the oldest pending prompt.
     #[arg(long, value_name = "ID")]
     pub(crate) prompt: Option<u32>,
+}
+
+/// Arguments of `wlsctx dbus-proxy`: a host sidecar wrapping
+/// `xdg-dbus-proxy` that bridges the session bus to the per-instance
+/// public D-Bus socket the sandboxed app points at.
+#[derive(Args, Debug)]
+pub(crate) struct DbusProxyArgs {
+    /// Application id: part of the instance name (`<app>-<instance>`)
+    /// that names the per-instance runtime dir holding the public
+    /// socket.
+    #[arg(long, default_value = "app")]
+    pub(crate) app_id: String,
+    /// Instance id: part of the instance name.
+    #[arg(long, default_value = "1")]
+    pub(crate) instance_id: String,
+    /// The session bus address (upstream). Defaults to the
+    /// `DBUS_SESSION_BUS_ADDRESS` environment variable.
+    #[arg(long, value_name = "ADDRESS")]
+    pub(crate) bus_address: Option<String>,
+    /// The public socket's file name in the instance runtime dir
+    /// (default `bus.sock`).
+    #[arg(long, value_name = "SOCKET")]
+    pub(crate) socket_name: Option<String>,
+    /// See-policy rule(s): which bus names the app may *see*
+    /// (repeatable).
+    #[arg(long = "see", value_name = "NAME")]
+    pub(crate) see: Vec<String>,
+    /// Talk-policy rule(s): which bus names the app may call (repeatable).
+    #[arg(long = "talk", value_name = "NAME")]
+    pub(crate) talk: Vec<String>,
+    /// Own-policy rule(s): which bus names the app may own (repeatable).
+    #[arg(long = "own", value_name = "NAME")]
+    pub(crate) own: Vec<String>,
+    /// Call-rule(s): `NAME=RULE` (repeatable).
+    #[arg(long = "call", value_name = "NAME=RULE")]
+    pub(crate) call: Vec<String>,
+    /// Broadcast-rule(s): `NAME=RULE` (repeatable).
+    #[arg(long = "broadcast", value_name = "NAME=RULE")]
+    pub(crate) broadcast: Vec<String>,
+    /// The proxy binary (default `xdg-dbus-proxy`, on `PATH`).
+    #[arg(long, value_name = "BIN")]
+    pub(crate) proxy_bin: Option<String>,
 }
 
 /// A value parser that rejects the empty string for the security-context
