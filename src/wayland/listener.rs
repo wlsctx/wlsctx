@@ -121,8 +121,7 @@ pub(crate) fn bind_socket(path: &path::Path) -> Result<UnixListener> {
     // (typically 0755): tighten it so only the owner can connect, even
     // if the containing directory ends up more permissive than it
     // should be (the socket-activation mode is covered by the unit's
-    // SocketMode=0600, this covers --listen, i.e. the in-pod sidecar
-    // mode and manual use).
+    // SocketMode=0600, this covers --listen and manual use).
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600)).inspect_err(|e| {
         warn!("chmod {path:?} to 0600 failed (continuing with umask permissions): {e}")
     });

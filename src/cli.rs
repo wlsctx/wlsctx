@@ -208,7 +208,8 @@ pub(crate) struct WaylandArgs {
     /// (Proxy mode only) path of the tagged listener: bound here,
     /// passed to the compositor, and the only socket the proxy
     /// connects to upstream. It must be unreachable from the
-    /// sandboxed app (e.g. the sidecar's private runtime dir)
+    /// sandboxed app — so outside its in-sandbox runtime dir, which
+    /// holds the *public* socket the app is pointed at.
     #[arg(long, required_if_eq("proxy", "true"))]
     pub(crate) tagged_socket: Option<path::PathBuf>,
     /// (Proxy mode only) comma-separated list of Wayland interface
