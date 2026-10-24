@@ -43,8 +43,8 @@ use crate::broker::{
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
     /// The broker's listening socket (the relay connects to it per
-    /// ask). In deployment it is a systemd socket-activated unit on
-    /// the host (Mode A) or a socket file bound into the pod (Mode B).
+    /// ask). In deployment it is a socket-activated systemd user
+    /// service on the host.
     pub socket: PathBuf,
     /// The app ID from the sandbox's security context (what the
     /// prompt shows).

@@ -1,7 +1,7 @@
 //! Per-app sandbox profiles (PLAN.md §5): TOML files under
 //! `~/.config/wlsctx/apps/<app-id>.toml` describing ro/rw binds,
-//! masked paths, environment variables and GPU access — the
-//! replacement for the old quadlet drop-ins.
+//! masked paths, environment variables and GPU access for the
+//! in-process sandbox.
 //!
 //! The file is optional: [builtin] covers the known apps, and a
 //! profile-less `run` (ad-hoc command) falls back to

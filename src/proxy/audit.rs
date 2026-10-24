@@ -22,10 +22,9 @@
 //!
 //! The default sink writes one line per record under the `audit` log
 //! target. In deployment the relay's stderr reaches the **host**
-//! journal in both modes — mode B via the pod's passthrough logging
-//! (`LogDriver=passthrough`, `StandardError=journal`), mode A via the
-//! unit's `StandardError=journal` — so the record outlives the pod:
-//! `journalctl -u <relay unit>` shows one line per event, greppable
+//! journal via the unit's `StandardError=journal`, so the record
+//! outlives the relay: `journalctl -u <relay unit>` shows one line per
+//! event, greppable
 //! on the `key=value` fields (the target renders as `audit:` in the
 //! line). The audit is *always on* while the relay runs (one formatted
 //! line per selection event — negligible against the traffic it

@@ -6,9 +6,6 @@
 //! modules below (plus binary-only modules for the in-process sandbox
 //! and the tagged-socket machinery that live next to `main.rs`):
 //!
-//! * [`security_context`] — tag a listening socket with a
-//!   `wp_security_context_v1` security context (the "tag-and-park" mode,
-//!   and the setup step of the proxy);
 //! * [`proxy`] — the transparent Wayland relay (`wayland --proxy`):
 //!   forwards a sandboxed app's connection to the compositor, applies
 //!   the global allowlist, the clipboard/selection gate, and the copy-out
@@ -19,4 +16,3 @@
 
 pub mod broker;
 pub mod proxy;
-pub mod security_context;

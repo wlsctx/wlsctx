@@ -9,7 +9,8 @@
 //!   only the proxy accepts on it.
 //! * **tagged** (`--tagged-socket`): bound by the proxy and passed to
 //!   the compositor via `wp_security_context_manager_v1.create_listener()`
-//!   (see [`crate::security_context`]). The proxy never accepts on it.
+//!   (the tagging lives in `wayland::context`). The proxy never accepts
+//!   on it.
 //!   For every app connection it opens a fresh connection to that path,
 //!   and the compositor — which holds the listener — accepts the other
 //!   end and stamps it with the security context
@@ -92,9 +93,8 @@
 //! behind a write). The record carries app, instance, selection,
 //! action, origin, mime, the gate's decision, the fd's class, and the
 //! payload *size* — never the contents. The default sink writes one
-//! line per record, which in deployment reaches the host journal
-//! (mode B via the pod's passthrough logging, mode A via the unit's
-//! `StandardError=journal`): the persistent, cross-pod record, as
+//! line per record, which in deployment reaches the host journal via
+//! the unit's `StandardError=journal`: the persistent record, as
 //! opposed to the Phase 6 notification (visible in the moment only).
 //! The audit is always on while the relay runs (one line per event;
 //! `RUST_LOG=warn` suppresses the stream).
@@ -1411,8 +1411,8 @@ fn osstring_bytes_to_cstring(bytes: &[u8]) -> io::Result<CString> {
 /// process environment.
 ///
 /// The target is `/proc/self/exe` — the very image that is running,
-/// independent of how it was launched (the quadlet container path
-/// need not be on `PATH`). On success this never returns; on failure
+/// independent of how it was launched (it need not be on `PATH`). On
+/// success this never returns; on failure
 /// it returns an error so the caller can exit with a distinguishable
 /// status rather than carry on in the stale state the HUP asked to
 /// rebuild.

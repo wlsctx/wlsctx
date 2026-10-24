@@ -649,8 +649,8 @@ mod tests {
     fn wayland_socket_activation_conflicts_with_socket_path_env() {
         // WLSCTX_SOCKET_PATH in the environment counts as --listen being
         // present for clap's conflict check, so a stray env var (e.g. left
-        // over from a shell) makes mode A refuse to start instead of
-        // silently ignoring the path.
+        // over from a shell) makes a `--socket-activation` run refuse to
+        // start instead of silently ignoring the path.
         with_env(
             &[("WLSCTX_SOCKET_PATH", Some("/run/wlsctx/wayland-1"))],
             || {
