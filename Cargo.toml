@@ -31,19 +31,17 @@ rustix = { version = "1", features = ["event", "fs", "net"] }
 # Session-bus D-Bus client for the transient systemd scope (PLAN.md
 # phase 6, #35). The one-shot call happens in the single-threaded
 # pre-fork part of the supervisor. It is driven on a *fresh, local*
-# tokio runtime via zbus's **async** API — deliberately NOT
-# `zbus::blocking` (v5), whose wrapper hides a *process-global* tokio
-# runtime in an `OnceLock` that is dead in a `fork(2)`-ed child (see
-# `src/systemd.rs` module docs). v5 for now: 6.0.0 (2026-10-16)
-# reworked the runtime API (`zbus::block_on`) — migrating is a later,
-# small task, but the async API used here is the same one 6 is built
-# on, so this code is already 6-shaped.
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-# Runtime host for that one-shot call: `src/systemd.rs` builds a fresh
-# multi-threaded runtime per invocation (never a process-global one)
-# so the scope call is safe in a forked child. Feature set matches
-# zbus's own `tokio` dep (unified by the resolver).
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "io-util"] }
+# tokio runtime via zbus's **async** API — deliberately never on the
+# blocking wrapper, which in v5 hid a *process-global* tokio runtime
+# in an `OnceLock` that is dead in a `fork(2)`-ed child (see
+# `src/systemd.rs` module docs); 6 removed that API entirely.
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+# Runtime host for that one-shot call: `src/systemd.rs` builds a
+# fresh, local, current-thread runtime per invocation (never a
+# process-global one) so the scope call is safe in a forked child.
+# Feature set matches zbus's own `tokio` dep (unified by the
+# resolver).
+tokio = { version = "1", features = ["rt", "net", "time", "fs", "io-util"] }
 # Public `protocol` module only (Interface / MessageDesc / ArgumentType):
 # the runtime signature table for the proxy's wire codec.
 wayland-backend = "0.3"

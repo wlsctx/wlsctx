@@ -61,16 +61,15 @@
 //! `attach_scope` runs in `S` before the supervisor forks `A`, and a
 //! multi-thread runtime's un-joined worker threads would linger across
 //! that fork and hand the child a locked global. (zbus 6 removed the
-//! blocking API; migrating is a later task, but the async API used
-//! here is the same one 6 is built on.)
+//! blocking API entirely, so the constraint is now structural: the
+//! async API used here is the only one left.)
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
 
-use zbus::zvariant::Value;
-use zbus::{Connection, Proxy};
+use zbus::{Array, Connection, OwnedVariant, Proxy, Variant};
 
 /// The outcome of the scope-attachment attempt.
 #[derive(Debug)]
@@ -121,10 +120,11 @@ pub(crate) fn attach_scope(unit: &str, description: &str) -> ScopeTier {
 ///
 /// Two constraints shape this, and they pull in the same direction:
 ///
-/// 1. **Never a process-global runtime.** `zbus::blocking` (zbus 5)
-///    hides a process-global runtime in an `OnceLock`; that global is
-///    dead in a `fork(2)`-ed child (see the module docs). We build a
-///    runtime here instead.
+/// 1. **Never a process-global runtime.** zbus 5's `blocking` wrapper
+///    hid a process-global runtime in an `OnceLock`; that global is
+///    dead in a `fork(2)`-ed child (see the module docs) — and the
+///    wrapper is gone in 6, so this is the only shape left. We build
+///    a runtime here instead.
 ///
 /// 2. **Current-thread, not multi-thread.** `attach_scope` runs in `S`
 ///    *before* `run_sandboxed` forks `A`. A `new_multi_thread()` runtime
@@ -158,8 +158,8 @@ fn with_local_runtime<F: std::future::Future>(fut: F) -> F::Output {
 type ManagerArgs = (
     String,
     String,
-    Vec<(String, Value<'static>)>,
-    Vec<(String, Vec<(String, Value<'static>)>)>,
+    Vec<(String, Variant<'static>)>,
+    Vec<(String, Vec<(String, Variant<'static>)>)>,
 );
 
 /// Give an in-flight `StopUnit` job this long to complete before
@@ -201,12 +201,9 @@ fn start_transient(unit: &str, description: &str, pid: u32) -> Result<()> {
         // element signature is `u` (an array of `Value` would serialize
         // as `av`, which systemd rejects with ENXIO/"Unexpected message
         // contents" in the scope property setter).
-        let props: Vec<(String, Value<'static>)> = vec![
-            (
-                "PIDs".into(),
-                Value::Array(zbus::zvariant::Array::from(vec![pid])),
-            ),
-            ("Description".into(), Value::from(description)),
+        let props: Vec<(String, Variant<'static>)> = vec![
+            ("PIDs".into(), Variant::Array(Array::from(vec![pid]))),
+            ("Description".into(), Variant::from(description)),
         ];
 
         let args: ManagerArgs = (unit.clone(), "replace".into(), props, Vec::new());
@@ -230,10 +227,8 @@ fn start_transient(unit: &str, description: &str, pid: u32) -> Result<()> {
                     let stop: &(&String, &str) = &(&args.0, "replace");
                     let _ = proxy.call_method("StopUnit", stop).await.map(|_| ());
                     tokio::time::sleep(STOP_SETTLE).await;
-                    let pids: Vec<(String, Value<'static>)> = vec![(
-                        "PIDs".into(),
-                        Value::Array(zbus::zvariant::Array::from(vec![pid])),
-                    )];
+                    let pids: Vec<(String, Variant<'static>)> =
+                        vec![("PIDs".into(), Variant::Array(Array::from(vec![pid])))];
                     let set = (&args.0, pids, false);
                     let _ = proxy
                         .call_method("SetUnitProperties", &set)
@@ -313,7 +308,7 @@ async fn unit_task_count(conn: &Connection, unit: &str) -> Result<u64> {
         "org.freedesktop.systemd1.Unit".to_string(),
         "Tasks".to_string(),
     );
-    let v: zbus::zvariant::OwnedValue = props
+    let v: OwnedVariant = props
         .call("Get", &body)
         .await
         .map_err(|e| anyhow!("reading Tasks on {unit}: {e:#}"))?;
