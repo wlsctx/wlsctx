@@ -719,10 +719,30 @@ open from here: the full chain (a sandboxed app driven through the
       re-home as pending (7.1 done); the per-instance-dir fact gains
       the in-sandbox path translation and the app-env wiring
       (decision #28); the WIP bullet lists the true next steps.
-- [ ] 8.4 Integration test suite (`tests/`): in-ns assertions (uid is
-      non-root, pid 1, mounts, cgroup), landlock deny checks, seccomp
-      checks, network checks, wayland tagged-socket check, lifecycle
-      (TERM → clean death) — all runnable as a regular user
+- [x] 8.4 Integration test suite (`tests/`) (2026-10-24):
+      `tests/sandbox_integration.rs` — eight tests driving the *built*
+      `wlsctx run` binary as a subprocess with a python3 probe as the
+      app (all runnable as a regular user): identity (single-extent
+      `uid_map`, PID 1, cgroup-ns root `0::/`, uts hostname,
+      `setuid(0)` fails), the rebuilt rootfs (fresh `/dev` with only
+      the standard nodes, `/sys` with empty `/sys/fs`, `/run` holding
+      only the instance tree, fresh `/tmp`, namespaced `/proc`), the
+      Landlock floor (seccomp filter active; a write denied outside
+      the granted subtrees, allowed inside them, read-granted trees
+      unwritable), the network (`shared` completes a ping/pong with a
+      host-side listener; `none` denies `bind` and `connect` before
+      the packet leaves — the bare netns per `/proc/net/dev` holds
+      only `lo`), the tagged socket (the only one visible in the
+      instance dir, the app's `connect(2)` succeeds, and the 5.4
+      cleanup removes the per-instance runtime dir after the run),
+      and the lifecycle (a forwarded TERM to a handler exits 0; an
+      ignored TERM as pidns-init dies by the 2 s SIGKILL escalation,
+      exit 137 after ≥1.5 s). The suite skips cleanly when python3,
+      unprivileged user namespaces, a live wlroots compositor, or the
+      systemd-standard session XDG is absent — the last because the
+      supervisor builds its capability set against the *in-sandbox*
+      instance-dir path (decision #28), which exists on the host only
+      for that XDG (see LESSONS.md #22).
 - [ ] 8.5 Threat-model review against the old README's list, item by item
 
 ## 8. Risks / things to watch
