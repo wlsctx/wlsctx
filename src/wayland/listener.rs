@@ -139,7 +139,7 @@ mod tests {
         WaylandArgs {
             app_id: "rustrover".into(),
             instance_id: "work".into(),
-            sandbox_engine: "podman".into(),
+            sandbox_engine: "wlsctx".into(),
             listen: Some(path::PathBuf::from(listen)),
             socket_activation: false,
             proxy: false,
@@ -155,7 +155,7 @@ mod tests {
         WaylandArgs {
             app_id: "rustrover".into(),
             instance_id: "work".into(),
-            sandbox_engine: "podman".into(),
+            sandbox_engine: "wlsctx".into(),
             listen: None,
             socket_activation: true,
             proxy: false,

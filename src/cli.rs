@@ -387,22 +387,22 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--app-id",
                 "rustrover",
                 "--instance-id",
                 "work",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("explicit arguments must parse");
             assert_eq!(
                 args.listen.as_deref(),
-                Some(std::path::Path::new("/run/pod/wayland-1"))
+                Some(std::path::Path::new("/run/wlsctx/wayland-1"))
             );
             assert_eq!(args.app_id, "rustrover");
             assert_eq!(args.instance_id, "work");
-            assert_eq!(args.sandbox_engine, "podman");
+            assert_eq!(args.sandbox_engine, "wlsctx");
             assert!(!args.socket_activation);
             assert!(!args.proxy);
             assert!(args.tagged_socket.is_none());
@@ -410,13 +410,13 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--app-id",
                 "rustrover",
                 "--instance-id",
                 "work",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("tag-and-park validates");
             cli.validate().expect("tag-and-park validates");
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_rejected() {
         without_wlsctx_env(|| {
-            let err = Cli::try_parse_from(["wlsctx", "podman"])
+            let err = Cli::try_parse_from(["wlsctx", "wlsctx"])
                 .expect_err("unknown subcommands must be rejected");
             assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
         });
@@ -456,7 +456,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect_err("--listen is required unless --socket-activation is set");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
@@ -470,9 +470,9 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect_err("app_id/instance_id are always required (no fd-name fallback)");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
@@ -490,13 +490,13 @@ mod tests {
                 "wayland",
                 "--socket-activation",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--app-id",
                 "a",
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect_err("--socket-activation and --listen must conflict");
             assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
@@ -515,7 +515,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("socket activation mode needs no --listen");
             assert!(args.socket_activation);
@@ -533,7 +533,7 @@ mod tests {
                 "wayland",
                 "--socket-activation",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect_err("socket-activation mode still requires explicit IDs");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
@@ -547,7 +547,7 @@ mod tests {
                 ("WLSCTX_APP_ID", Some("envapp")),
                 ("WLSCTX_INSTANCE_ID", Some("envinst")),
                 ("WLSCTX_SANDBOX_ENGINE", Some("envengine")),
-                ("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1")),
+                ("WLSCTX_SOCKET_PATH", Some("/run/wlsctx/wayland-1")),
             ],
             || {
                 let args =
@@ -557,7 +557,7 @@ mod tests {
                 assert_eq!(args.sandbox_engine, "envengine");
                 assert_eq!(
                     args.listen.as_deref(),
-                    Some(std::path::Path::new("/run/pod/wayland-1"))
+                    Some(std::path::Path::new("/run/wlsctx/wayland-1"))
                 );
             },
         );
@@ -581,7 +581,7 @@ mod tests {
                     "wlsctx",
                     "wayland",
                     "--listen",
-                    "/run/pod/wayland-1",
+                    "/run/wlsctx/wayland-1",
                     "--app-id",
                     "flagapp",
                 ])
@@ -589,7 +589,7 @@ mod tests {
                 // CLI wins for the flag that was given explicitly…
                 assert_eq!(
                     args.listen.as_deref(),
-                    Some(std::path::Path::new("/run/pod/wayland-1"))
+                    Some(std::path::Path::new("/run/wlsctx/wayland-1"))
                 );
                 assert_eq!(args.app_id, "flagapp");
                 // …and env still fills the arguments that were not given.
@@ -607,7 +607,7 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--app-id",
                 "a",
                 "--instance-id",
@@ -630,7 +630,7 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--listen",
                 "/other/socket",
                 "--app-id",
@@ -638,7 +638,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect_err("--listen must not be repeatable");
             assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
@@ -652,7 +652,7 @@ mod tests {
         // over from a shell) makes mode A refuse to start instead of
         // silently ignoring the path.
         with_env(
-            &[("WLSCTX_SOCKET_PATH", Some("/run/pod/wayland-1"))],
+            &[("WLSCTX_SOCKET_PATH", Some("/run/wlsctx/wayland-1"))],
             || {
                 let err = parse_wayland(&[
                     "wlsctx",
@@ -663,7 +663,7 @@ mod tests {
                     "--instance-id",
                     "i",
                     "--sandbox-engine",
-                    "podman",
+                    "wlsctx",
                 ])
                 .expect_err("--socket-activation must conflict with an env-provided --listen");
                 assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
@@ -681,7 +681,7 @@ mod tests {
         let valid: [(&str, &str); 3] = [
             ("WLSCTX_APP_ID", "a"),
             ("WLSCTX_INSTANCE_ID", "i"),
-            ("WLSCTX_SANDBOX_ENGINE", "podman"),
+            ("WLSCTX_SANDBOX_ENGINE", "wlsctx"),
         ];
         for (target, field) in [
             ("WLSCTX_APP_ID", "--app-id"),
@@ -693,7 +693,7 @@ mod tests {
                 .map(|(name, value)| (*name, Some(if *name == target { "" } else { *value })))
                 .chain(std::iter::once((
                     "WLSCTX_SOCKET_PATH",
-                    Some("/run/pod/wayland-1"),
+                    Some("/run/wlsctx/wayland-1"),
                 )))
                 .collect();
             with_env(&pairs, || {
@@ -714,11 +714,11 @@ mod tests {
             let fields: [(&str, &str); 3] = [
                 ("--app-id", "a"),
                 ("--instance-id", "i"),
-                ("--sandbox-engine", "podman"),
+                ("--sandbox-engine", "wlsctx"),
             ];
             for (flag, _valid) in fields {
                 let mut argv: Vec<&str> =
-                    vec!["wlsctx", "wayland", "--listen", "/run/pod/wayland-1"];
+                    vec!["wlsctx", "wayland", "--listen", "/run/wlsctx/wayland-1"];
                 for (f, v) in fields {
                     argv.push(f);
                     argv.push(if f == flag { "" } else { v });
@@ -847,13 +847,13 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--app-id",
                 "a",
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect_err("--proxy requires --tagged-socket");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
@@ -869,7 +869,7 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/run/user/1000/wlsctx-tagged",
                 "--app-id",
@@ -877,7 +877,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("proxy mode with a tagged socket must parse");
             assert!(args.proxy);
@@ -890,7 +890,7 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/run/user/1000/wlsctx-tagged",
                 "--app-id",
@@ -898,7 +898,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("proxy mode validates");
             cli.validate().expect("proxy mode validates");
@@ -913,14 +913,14 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--notify-copy-out",
                 "--app-id",
                 "a",
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("clap cannot express 'only with --proxy'; validate() catches it");
             let err = cli
@@ -935,7 +935,7 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/tmp/t",
                 "--notify-copy-out",
@@ -944,7 +944,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("clap cannot express 'needs --broker-socket'; validate() catches it");
             let err = cli
@@ -958,7 +958,7 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/tmp/t",
                 "--broker-socket",
@@ -969,7 +969,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("notify-copy-out with --proxy and --broker-socket must parse");
             cli.validate()
@@ -985,7 +985,7 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/tmp/t",
                 "--app-id",
@@ -993,7 +993,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ];
             // Default.
             let args = parse_wayland(&base).expect("the default policy must parse");
@@ -1017,7 +1017,7 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--clipboard-policy",
                 "deny",
                 "--app-id",
@@ -1025,7 +1025,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("clap cannot test a flag's value against another flag; validate() does");
             let err = cli
@@ -1043,7 +1043,7 @@ mod tests {
                 "wayland",
                 "--proxy",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/tmp/t",
                 "--clipboard-policy",
@@ -1053,7 +1053,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("the value is free text at parse time; validate() checks it");
             let err = cli
@@ -1070,7 +1070,7 @@ mod tests {
                 "wlsctx",
                 "wayland",
                 "--listen",
-                "/run/pod/wayland-1",
+                "/run/wlsctx/wayland-1",
                 "--tagged-socket",
                 "/somewhere",
                 "--app-id",
@@ -1078,7 +1078,7 @@ mod tests {
                 "--instance-id",
                 "i",
                 "--sandbox-engine",
-                "podman",
+                "wlsctx",
             ])
             .expect("clap cannot express 'only with --proxy'; validate() catches it");
             let err = cli
