@@ -627,11 +627,16 @@ spec requires (a tagged client must not be able to stamp again); on
 the host socket the manager is present (name 34). Through the proxy
 the same checks hold: after `1e46e3b`, all 35 (before the fix: 0). A
 SIGHUP on the proxy re-execs in place (same pid, re-binds and
-re-tags, still 35). 5.5 is done (the Firefox e2e, 2026-10-24). Still
-open from here: the full chain (a sandboxed app driven through the
-*proxy* into sway). The drag-and-drop audit (6.5.5) is closed: a
-`start_drag` is audited as a write (the `serve`-label refinement is
-the one remaining drag detail — see 6.5.5 above).
+re-tags, still 35). 5.5 is done (the Firefox e2e, 2026-10-24). The
+*full chain* is done (2026-10-24): a sandboxed `wayland-info` is
+driven through the `--proxy` relay into the live sway — it enumerates
+the compositor's globals and exits 0. The relay's public socket is
+bound inside the per-instance runtime dir (the app's in-sandbox
+`$XDG_RUNTIME_DIR`), which the rootfs build carries into the sandbox,
+so the bare `run` (no `--wayland` tag of its own) resolves
+`$WAYLAND_DISPLAY` to the relay. The drag-and-drop audit (6.5.5) is
+closed: a `start_drag` is audited as a write (the `serve`-label
+refinement is the one remaining drag detail — see 6.5.5 above).
 
 **Branch TASKS.md follow-ups:** the zbus 5→6 migration is done
 (`6725560`); the drag-and-drop audit (6.5.5) is done (`start_drag`

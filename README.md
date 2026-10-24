@@ -449,8 +449,12 @@ WAYLAND_DISPLAY = "wayland-1"
 wlsctx run --app-id rustrover --instance-id 1 -- /opt/rustrover/bin/rover
 ```
 
-(The full sandboxed-app-through-the-relay chain is still being verified
-end-to-end — see the [known gap](#known-gaps--wip).)
+The chain works end-to-end: a sandboxed Wayland client is driven through
+the relay into the live compositor (verified with `wayland-info`
+enumerating sway's globals and exiting 0). The relay's public socket is
+bound inside the per-instance runtime dir, which the rootfs build carries
+into the sandbox — so the app's `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`
+resolves to it without any `run --wayland` tag of its own.
 
 **Audit sink.** Run the relay under a unit (or `systemd-run --user`) that
 sends its stderr to the host journal, so the selection audit log is
@@ -600,12 +604,6 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
   and the drag, and the relay does not yet track which source is in
   an active drag. The write is never missed — only the per-mime byte
   flow behind a drag carries the stable-selection label.
-- **The full chain is still being verified end-to-end.** The sandboxed
-  pipeline itself is verified (Phase 5.5: Firefox reached the
-  compositor, networked, and tore down cleanly); what remains is the
-  chain of a *sandboxed* Wayland client driven through the `--proxy`
-  relay into the live compositor (the relay itself is covered by the
-  three-party integration tests, against a fake compositor).
 - **The sidecars are opt-in, not on by default.** `wlsctx dbus-proxy`
   (Phase 7.2) and the optional `wlsctx xwayland` host satellite
   (Phase 7.3) are built and run per instance; neither is started by a
