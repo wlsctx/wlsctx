@@ -317,6 +317,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 35 | D-Bus primary, varlink deferred (supersedes #34) | Hands-on verification on the Fedora 45 target (systemd 261) overturned the varlink-first plan. (a) `io.systemd.Unit.StartTransient` exists since 261 but is **service-only** (`ID`/`Description`/`Service{Type,ExecStart,RemainAfterExit}`); `SetUnitProperties` accepts `Markers` only; a scope created without PIDs **refuses to start** ("Scope has no PIDs. Refusing"). A scope context with `PIDs` (json pidref) exists only on `main` (abde7e80d0, 2026-10-16 — after v262), so no *released* systemd can do the operation via varlink. (b) D-Bus `StartTransientUnit` works on every user-systemd stack (scopes since v252), needs no polkit on the session bus, and the exact call is: unit `*.scope`, mode `replace`, properties `{ PIDs: <au> [self] }` — property name is `PIDs` (since v252), value an array of uint32; reply type is `(o)`, not `(uo)`. (c) `StopWhenUnneeded=true` is **harmful** on v261 scopes: `unit_is_unneeded()` stops any active, jobless, unpinned scope immediately (verified: scope removed in the same second, member alive, cgroup `(deleted)`). Not needed anyway — a scope auto-stops and is removed **recursively** when its last member leaves (verified: supervisor in scope, app in a user-mkdir'd child; supervisor exits last → whole subtree gone). (d) `Delegate=` is unnecessary: the entire user-session cgroup subtree (`user.slice/user-<uid>.slice/user@<uid>.service/`, incl. manager-created scopes) is **owned by the user** (delegation of `user@.service` chowns it), so the user can `mkdir`/write `cgroup.procs` inside the scope without any unit-level delegation. The user manager also lands transient scopes in `app.slice` (not directly under `user@.service`) — hence the instance sub-cgroup's parent is read from `/proc/self/cgroup` after the call, never assumed. Net: D-Bus (`zbus`, driven on a fresh local tokio runtime per call — never the process-global `OnceLock` runtime, which is dead in a forked child; see `src/systemd.rs`) is the primary tier for all distros (incl. Ubuntu 26.04 LTS, Debian 13 — the very distros that motivated the fallback); varlink becomes a future tier (6.4) once a release ships scope-with-PIDs. The raw-cgroup path remains the last resort (and is what A already does in #12/#20 — the only change is that S's D-Bus call moves S (and thus A's inherited cgroup) into the scope before the forks). |
 
 | 36 | The D-Bus sidecar's lifetime is a *fd*, and that fd must be *non*-CLOEXEC | `wlsctx dbus-proxy` spawns `xdg-dbus-proxy` (0.1.9) as a child it owns (signalfd + pidfd `poll(2)`), and hands the proxy one end of a private **socketpair** as `--fd=3`. Two hard parts. (a) The fd must reach the child **without** CLOEXEC — `execve(2)` *closes* CLOEXEC descriptors (the inverse of the usual "protect the fd" reflex): `pre_exec` dups the end onto 3, *clears* the flag, closes the original (exactly one reference — a second fd for the same end keeps the peer alive). The proxy writes one `x` byte on startup (the sidecar's readiness gate) and exits when its fd sees the peer close (`g_io_add_watch(G_IO_ERR\|G_IO_HUP)`) — so even a SIGKILL'd sidecar tears the proxy down. Socketpair, not pipe: with the installed GLib 2.90 that watch does **not** fire on pipe EOF, but does on a socket peer close (the same thing flatpak passes). (b) GLib 2.90 masks `G_IO_ERR\|G_IO_HUP\|G_IO_NVAL` out of the events it hands `ppoll(2)` (an IRIX-era workaround — see `g_main_context_query_unlocked`), so the watch is polled with *zero* requested events and fires only because the kernel reports `POLLHUP` in `revents` even when unrequested — verified with an `LD_PRELOAD` ppoll tracer dumping the array. The child also resets its signal mask in `pre_exec`: a proxy orphaned with every signal blocked would be killable only by SIGKILL. The long bug of Phase 7.2: a socketpair rewrite dropped `--fd=3` from the *argv* — the proxy (told nothing) never wrote the sync byte, the sidecar parked forever in its readiness `read`, and the child outlived the sidecar; nothing about the GLib/kernel path was wrong. The gdb ppoll-array dump (fd 3 absent) vs a shimmed control run (fd 3 present, `events=0`) exposed it. |
+| 37 | Xwayland runs *host-side*, not inside the sandbox; the satellite owns a bound socket and a chosen display number | `wlsctx xwayland` (7.3) gives a sandboxed app an X server by running Xwayland on the host as an ordinary Wayland *client* of the desktop compositor, sharing only its X socket into the sandbox through the per-instance runtime dir. The in-sandbox alternative (Xwayland inside the ns, connected to the tagged socket) was rejected on two counts: (a) the X server is the least-trusted component of the X stack — it can read every client's pixels and inject input — and running it inside the sandbox would hand *that* component the app's full capability set (network, home rw); a host-side satellite is the same documented trust tier as the dbus sidecar and the relay, not a new hole; (b) the private rootfs would need the entire X/GL stack (Xwayland + glamor/EGL/driver + libraries) — a large, version-sensitive surface for a rarely-used feature. Mechanically the satellite mirrors the `dbus-proxy` sidecar, and Xwayland's spawn mirrors sway's own (verified on this machine: `Xwayland :0 -rootless -listenfd N -listenfd M -displayfd K -wm W`): the sidecar creates and binds the socket itself (`-listenfd`, non-CLOEXEC — the #36 fd contract), uses `-displayfd` as the readiness gate (Xwayland writes the display number in use when it can take clients; a mismatch against the requested `--display` is a hard error — Xwayland will not silently renumber, and the app's profile must name a stable display), runs `-rootless` by default (the window integrates with the desktop), and passes `-nolisten tcp` (never a TCP listener) and `-once` (the server exits when the *last* X client disconnects — a SIGKILL'd satellite leaves a self-cleaning Xwayland: it exits when the sandbox's app dies and the socket closes). Xwayland also always binds the conventional `/tmp/.X11-unix/X<N>` socket on the host in addition to the `-listenfd` socket (sway's own instance does too): it is cookie-gated and owner-reachable, which doubles as a `:N` escape hatch on the host. |
 
 ## 7. Phases & task list
 
@@ -661,6 +662,36 @@ open from here: the full chain (a sandboxed app driven through the
       Verified: pass-through `busctl --list`, SIGTERM teardown, and
       SIGKILL-teardown of the sidecar (the proxy dies on the HUP).
 - [ ] 7.3 (optional) `wlsctx xwayland` host-side satellite
+      (design: decision #37). Per-instance `Xwayland` for sandboxed
+      X clients: a *host* process (the in-sandbox alternative is
+      rejected — see #37) mirroring the `dbus-proxy` sidecar's shape:
+      direct spawn, signalfd + pidfd `poll(2)` ownership,
+      TERM→2 s→KILL teardown, exit with the child's status. The
+      sidecar creates the X socket itself (unix stream, bound to
+      `<instance-dir>/xwayland.sock`, owner-only from birth) and
+      hands it to Xwayland as `-listenfd` — the same pattern sway
+      uses to spawn its own Xwayland (verified on this machine:
+      `Xwayland :0 -rootless … -listenfd N -displayfd K`) — with the
+      fd made *non*-CLOEXEC (the decision-#36 fd contract: `execve`
+      closes CLOEXEC descriptors). Readiness is Xwayland's own
+      `-displayfd` (a private socketpair): Xwayland writes the
+      display number in use when it can take clients; the sidecar
+      cross-checks it against `--display` (default 97, kept clear of
+      sway's auto-Xwayland) and fails loudly on mismatch — the
+      profile's env must name a stable display, so a silent
+      renumbering is worse than an error. `-auth <instance-dir>/
+      xwayland-auth` gives Xwayland a cookie file (the app points
+      `XAUTHORITY` at the in-sandbox copy, decision #28's path);
+      `-nolisten tcp` (never a TCP listener); `-once` (the server
+      exits when the *last* X client disconnects — an orphaned
+      Xwayland self-cleans when the sandbox dies); `-rootless` by
+      default (the window integrates with the desktop;
+      `--no-rootless` for the framed window). The sidecar prints
+      the profile env line: `DISPLAY=unix:<in-sandbox socket>`,
+      `XAUTHORITY=<in-sandbox auth>`. Xwayland additionally binds
+      the conventional `/tmp/.X11-unix/X<N>` on the host (it always
+      does, even with `-listenfd` — sway's instance shows it):
+      cookie-gated, owner-reachable, a convenience, not a hole.
 
 ### Phase 8 — Docs, SELinux, hardening
 - [x] 8.1 Rewrite `README.md`: architecture, threat model (what changed
