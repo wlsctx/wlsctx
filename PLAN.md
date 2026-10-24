@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.9 — the clipboard branch is merged (2026-10-23, `21b26dd`): the wayland proxy and the prompt broker (folded in as Phase 6.5) are done and verified on this desktop by a `wayland-info` e2e (the stamp, the nesting guard, the allow-list pass-through, the SIGHUP re-exec), which surfaced two latent bugs — the allow-list pass-through (`1e46e3b`) and the broker's arrival-order race (`9fded8c`, LESSONS #17). Next up: Phase 7 (re-home the proxy/broker deployment units, dbus-proxy, xwayland)**
+Status: **v2.10 — the README is rewritten for the in-process architecture (8.1, 2026-10-24): the S→A→B pipeline, the rebuilt rootfs, the nono policy, the relay/broker/decider, the layered containment table, install/profiles/the per-app relay recipe, verify-your-setup, and the residual-risk list. The zbus 6 migration (`6725560`) landed with it. Next up: the Phase 5.5 e2e (a real GUI app — Firefox — through the full S→A→B pipeline on this desktop), then Phase 7's remaining sidecars (7.2 dbus-proxy, 7.3 xwayland) and Phase 8's 8.2–8.5 (SELinux, AGENTS.md, the integration test suite, the threat-model review)**
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -464,8 +464,12 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 - [x] 5.4 sd-notify (READY on child spawn), signal forwarding
       (TERM/INT to app; keep SIGHUP→129 semantics), exit-status
       propagation, `/run` dir cleanup
-- [ ] 5.5 E2E on target: RustRover and LibreWolf run; `wlsinfo` diff vs
-      host matches the old acceptance checklist
+- [ ] 5.5 E2E on target: a real GUI app runs through the full S→A→B
+      pipeline on this desktop; `wlsinfo` diff vs host matches the old
+      acceptance checklist. (Per user, 2026-10-24: use **Firefox** on this
+      machine as the E2E target instead of RustRover/LibreWolf — needs a
+      Firefox profile/TOML and `--no-gpu` unless the user is in the
+      `render` group.)
 
 **Phase 5 decisions.**
 - **30 — In-sandbox path grants.** The `CapabilitySet` and the app's env are
@@ -611,7 +615,7 @@ chain (a sandboxed app through the proxy into sway).
 **Branch TASKS.md follow-ups:** the zbus 5→6 migration (6.1 already
 drives the 6-shaped async API) and the drag-and-drop audit (6.5.5).
 
-### Phase 7 — Re-homing the deployment units + sidecars (**next up**)
+### Phase 7 — Re-homing the deployment units + sidecars
 - [x] 7.1 Re-home the broker deployment for the containerless
       world: `systemd/user/wlsctx-broker.{socket,service}` rewritten
       from the branch-era global-flag forms (`wlsctx --broker
@@ -632,9 +636,21 @@ drives the 6-shaped async API) and the drag-and-drop audit (6.5.5).
 - [ ] 7.3 (optional) `wlsctx xwayland` host-side satellite
 
 ### Phase 8 — Docs, SELinux, hardening
-- [ ] 8.1 Rewrite `README.md`: architecture, threat model (what changed
+- [x] 8.1 Rewrite `README.md`: architecture, threat model (what changed
       vs. containers; residual risks: network, GPU, downloads, portal
-      attribution), install, verify-your-setup, adding an app
+      attribution), install, verify-your-setup, adding an app.
+      Done: full container-era replacement — the S→A→B pipeline, the
+      rebuilt rootfs and the nono policy, the tagged socket's three
+      modes, the relay (allowlist / gate / notify / audit), the
+      broker/decider, a 10-layer containment table, install, TOML
+      profiles, the per-app relay manual-run recipe (public socket
+      inside the instance dir, tagged socket outside it; the app's
+      `[env]` routes it through, `run` without `--wayland`), the
+      audit-sink journal wiring (7.1's deferred deployment recipe),
+      verify-your-setup (56 vs 35 globals, nesting guard), and the
+      residual-risk list (network egress, copy-out, GPU, own-home
+      exposure, portal attribution, multi-process deadlock, FOOT/PTY
+      `EACCES`).
 - [ ] 8.2 New SELinux policy from scratch (local module confining the
       supervisor and app domains; the bind-mounted `/dev` nodes keep
       canonical labels, which makes this tractable — see §3.3)
