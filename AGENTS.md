@@ -23,7 +23,8 @@ phase 8.1).**
 ## Layout
 
 - `src/main.rs` — binary entry: logging, CLI parse, subcommand
-  dispatch (`run`/`wayland`/`broker`/`decide`). SIGHUP semantics are
+  dispatch (`run`/`wayland`/`broker`/`decide`/`dbus-proxy`). SIGHUP
+  semantics are
   mode-dependent: `run` terminates the app and exits 129 (decision
   #33); the `wayland` modes rebuild (in-place re-exec in `--listen`
   mode, clean exit for a systemd restart when socket-activated)
@@ -32,7 +33,10 @@ phase 8.1).**
   `--allow-globals`, `--clipboard-policy`, `--broker-socket`,
   `--notify-copy-out`), `broker` (`--listen`/`--socket-activation`,
   `--auto-decide`, `--broker-timeout-millis`), `decide`
-  (`--decision`, `--prompt`); cross-field checks live in `validate()`
+  (`--decision`, `--prompt`), `dbus-proxy` (`--app-id`,
+  `--instance-id`, `--bus-address`, `--socket-name`,
+  `--see`/`--talk`/`--own`/`--call`/`--broadcast`, `--proxy-bin`);
+  cross-field checks live in `validate()`
 - `src/lib.rs` — library modules used by the binary:
   - `proxy/` — the `--proxy` relay: wire parser, object bookkeeping
     (convention-adaptive ID layout), interface tables (generated),
@@ -48,8 +52,13 @@ phase 8.1).**
     a session decision socket (`decision.sock`, bound once for the
     life of the session) carries `decide`'s list/decide requests over
     a poll(2) main loop
-  - `security_context.rs` — tag a listening socket with a
-    `wp_security_context_v1` security context
+  - `dbus_proxy.rs` — the Phase-7.2 D-Bus sidecar: owns an
+    `xdg-dbus-proxy` child (signalfd + pidfd `poll(2)` loop; stops it
+    on TERM/INT/HUP); the child's lifetime is a private socketpair
+    handed over as `--fd=3` (**non**-CLOEXEC — `execve` closes
+    CLOEXEC fds), so even a SIGKILL'd sidecar tears the proxy down
+    (decision #36); sync-byte readiness gate; public `bus.sock` in
+    the per-instance runtime dir, owner-only
 - `src/wayland/` — the tagged Wayland socket for the `run` pipeline:
   `listener` (socket activation / `--listen`), `roundtrip` (bounded
   sync), `context` (the `wp_security_context_v1` exchange)
@@ -208,11 +217,12 @@ phase 8.1).**
   dominated by the `SANDBOX_LOCK`-serialised sandbox tests). See
   LESSONS.md #15/#16.
 - This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
-  each phase committed and working. Next up: the phase 5.5 e2e (a
-  real GUI app — Firefox — through the full S→A→B pipeline on this
-  desktop), the 7.2/7.3 sidecars, and phase 8.2 and 8.4–8.5 (the
-  SELinux policy, the integration test suite, the threat-model
-  review).
+  each phase committed and working. Phase 5.5 (the Firefox e2e) and
+  7.2 (the `dbus-proxy` sidecar) are done. Next up: the 7.3 xwayland
+  satellite (optional) and phase 8.2 and 8.4–8.5 (the SELinux policy,
+  the integration test suite, the threat-model review), plus the full
+  chain (a sandboxed app through the proxy into sway) and the
+  drag-and-drop audit (6.5.5).
 
 ## Commit conventions
 

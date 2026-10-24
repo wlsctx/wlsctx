@@ -187,3 +187,22 @@ write-up.
     integration tests build the queue directly, so nothing exercised
     the thread-race path until the desktop e2e found the sibling
     allowlist bug and the flake was re-run.
+
+18. **When a spawner passes an fd to a child, the argv is half the
+    contract — and its absence fails silently.** Phase 7.2's
+    socketpair rewrite handed `xdg-dbus-proxy` its lifetime fd on fd 3
+    but dropped the *`--fd=3` flag* from the argv: the proxy (told
+    nothing) never wrote its sync byte, so the sidecar parked forever
+    in its one-byte readiness `read`, and a SIGKILL'd sidecar left the
+    proxy alive. Nothing in GLib or the kernel was wrong — the bug was
+    invisible in every "it works" smoke test except the SIGKILL one.
+    Two tools found it fast: `gdb`-dumping the child's *ppoll
+    arguments* (fd 3 absent from the array in the broken run,
+    present — with `events=0` — in a control run) and an
+    `LD_PRELOAD` ppoll tracer. Related, verified on GLib 2.90: that
+    `g_io_add_watch(G_IO_ERR|G_IO_HUP)` is polled with *zero*
+    requested events (GLib masks those bits out — an IRIX-era
+    workaround) and fires only because the kernel reports `POLLHUP` in
+    `revents` even when unrequested; and the fd must be **non**-CLOEXEC
+    to survive `execve` (it *closes* CLOEXEC descriptors — the inverse
+    of the reflex).
