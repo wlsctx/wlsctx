@@ -159,11 +159,12 @@ phase 8.1).**
   the real-time range (34-64) at its default-terminate disposition,
   letting a same-uid process kill wlsctx with `kill -34` (see
   `proxy::proxy_signal_mask`).
-- The app is the **only** process the supervisor arms: it mediates for
-  B's pid (decision #25). A *child* of the app issuing a trapped syscall
-  is never serviced and deadlocks the handoff (decision #32) — so a
-  shell app that spawns subshells (e.g. `$(...)`) will hang; the
-  reference app is single-process.
+- The supervisor services **every** trapped notification on the
+  listener: `handle_notif` dispatches by syscall number with no pid
+  filter, so children of the app that inherit the seccomp filter are
+  served with the same capability set, and a failed verdict answers
+  EPERM rather than hanging (decision #32, resolved — the Firefox e2e
+  ran a real multi-process GUI app to a clean SIGTERM shutdown).
 - SIGTERM/SIGINT are **forwarded to the app** (SIGTERM, then SIGKILL
   after 2 s, since pidns-init ignores default-action signals, #13/#33);
   SIGHUP also terminates the app and exits 129. S sends `READY=1` to

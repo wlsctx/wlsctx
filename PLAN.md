@@ -1,6 +1,6 @@
 # wlsctx rework: in-process sandboxing, no containers
 
-Status: **v2.10 — the README is rewritten for the in-process architecture (8.1, 2026-10-24): the S→A→B pipeline, the rebuilt rootfs, the nono policy, the relay/broker/decider, the layered containment table, install/profiles/the per-app relay recipe, verify-your-setup, and the residual-risk list. The zbus 6 migration (`6725560`) landed with it. Next up: the Phase 5.5 e2e (a real GUI app — Firefox — through the full S→A→B pipeline on this desktop), then Phase 7's remaining sidecars (7.2 dbus-proxy, 7.3 xwayland) and Phase 8's 8.2 and 8.4–8.5 (the SELinux policy, the integration test suite, the threat-model review)**
+Status: **v2.10 — the README is rewritten for the in-process architecture (8.1, 2026-10-24): the S→A→B pipeline, the rebuilt rootfs, the nono policy, the relay/broker/decider, the layered containment table, install/profiles/the per-app relay recipe, verify-your-setup, and the residual-risk list. The zbus 6 migration (`6725560`) landed with it. Phase 5.5 is done (2026-10-24): Firefox ran through the full S→A→B pipeline on this desktop — the window reached the compositor, network egress worked, and a SIGTERM tore it down cleanly; it also confirmed decision #32 (the supervisor services *every* trapped notification, so multi-process apps that inherit the filter don't deadlock). Next up: a code-quality sweep, then Phase 7's remaining sidecars (7.2 dbus-proxy, 7.3 xwayland) and Phase 8's 8.2 and 8.4–8.5 (the SELinux policy, the integration test suite, the threat-model review), plus the full chain (a sandboxed app through the proxy into sway) and the drag-and-drop audit (6.5.5)**
 
 The podman/quadlet layer is deleted (`0c842cf`); the remaining
 container-era artifacts (`docker-bake.hcl`, `systemd/`, `selinux/`) are
@@ -464,12 +464,16 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 - [x] 5.4 sd-notify (READY on child spawn), signal forwarding
       (TERM/INT to app; keep SIGHUP→129 semantics), exit-status
       propagation, `/run` dir cleanup
-- [ ] 5.5 E2E on target: a real GUI app runs through the full S→A→B
-      pipeline on this desktop; `wlsinfo` diff vs host matches the old
-      acceptance checklist. (Per user, 2026-10-24: use **Firefox** on this
-      machine as the E2E target instead of RustRover/LibreWolf — needs a
-      Firefox profile/TOML and `--no-gpu` unless the user is in the
-      `render` group.)
+- [x] 5.5 E2E on target: a real GUI app runs through the full S→A→B
+      pipeline on this desktop — done with **Firefox** (2026-10-24,
+      `--no-gpu`, profile `~/.config/wlsctx/apps/firefox.toml`): the
+      window reached the compositor (`org.mozilla.firefox` in sway's
+      tree), network egress worked (neqo/Glean uploads in the log), and
+      the supervisor forwarded SIGTERM and reaped the app cleanly
+      (exit 15). The in-sandbox identity probe (same pipeline, ad-hoc
+      `sh`) verified real uid 1000, hostname `wlsctx-probe-1`, `0::/`
+      cgroup view, the app as PID 1, and the rebuilt rootfs with the
+      expected masks.
 
 **Phase 5 decisions.**
 - **30 — In-sandbox path grants.** The `CapabilitySet` and the app's env are
@@ -480,13 +484,19 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       `--wayland/--listen/--socket-activation/--sandbox-engine`.
 - **31 — `open` ≠ `connect` on a unix socket.** `open(2)` on a unix socket
       returns `ENXIO` (bash `exec 3<>` does `open`); the app must `connect(2)`.
-- **32 — The app is the only armed process.** The supervisor mediates for the
-      app's (B's) pid only (decision #25). A *child* of the pidns-init app
-      (e.g. a `$(...)` subshell in a shell script) issuing a trapped syscall is
-      never serviced → handoff deadlock (observed: the openat-write test hung
-      with the subshell stuck in `unix_stream_data_wait`). Reference app
-      scripts stay single-process; a multi-process app needs the supervisor to
-      arm per-pid (open question, Phase 6+).
+- **32 — The supervisor services every trapped notification (original
+      per-pid arming resolved, 2026-10-24).** Originally the supervisor
+      armed B's pid only, and a *child* of the pidns-init app issuing a
+      trapped syscall was never serviced → handoff deadlock (observed: the
+      openat-write test hung with the subshell stuck in
+      `unix_stream_data_wait`). The supervisor now services *every*
+      notification on the listener — `handle_notif` dispatches by syscall
+      number with no pid filter, and a failed verdict answers EPERM rather
+      than hanging — so children that inherit the seccomp filter are served
+      with the same capability set. The Firefox e2e (5.5) confirms a real
+      multi-process GUI app (browser + gecko/socket children) runs and exits
+      cleanly; the remaining caveat is app-internal pipe behaviour, not a
+      supervisor gap.
 - **33 — Signal forwarding & shutdown.** S blocks `SIGTERM/SIGINT/SIGHUP`
       before spawning any thread (all threads inherit the block). A forwarder
       reads them from a `signalfd`: TERM/INT → `kill(SIGTERM)` to the app then
@@ -608,12 +618,12 @@ spec requires (a tagged client must not be able to stamp again); on
 the host socket the manager is present (name 34). Through the proxy
 the same checks hold: after `1e46e3b`, all 35 (before the fix: 0). A
 SIGHUP on the proxy re-execs in place (same pid, re-binds and
-re-tags, still 35). Still open from here: 5.5 (RustRover/LibreWolf
-running *sandboxed*, the full S→A→B pipeline on target) and the full
-chain (a sandboxed app through the proxy into sway).
+re-tags, still 35). 5.5 is done (the Firefox e2e, 2026-10-24). Still
+open from here: the full chain (a sandboxed app driven through the
+*proxy* into sway) and the drag-and-drop audit (6.5.5).
 
-**Branch TASKS.md follow-ups:** the zbus 5→6 migration (6.1 already
-drives the 6-shaped async API) and the drag-and-drop audit (6.5.5).
+**Branch TASKS.md follow-ups:** the zbus 5→6 migration is done
+(`6725560`); the drag-and-drop audit (6.5.5) is still open.
 
 ### Phase 7 — Re-homing the deployment units + sidecars
 - [x] 7.1 Re-home the broker deployment for the containerless
