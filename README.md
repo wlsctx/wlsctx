@@ -601,7 +601,4 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
   (Phase 7.2) and an optional `wlsctx xwayland` host satellite (Phase 7.3)
   are not built yet; until then the host session bus is simply unreachable
   and there is no in-sandbox X server.
-- **No SELinux yet.** The container-era CIL blocks are gone; a new local
-  module confining the supervisor and app domains is Phase 8.2. The
-  bind-mounted `/dev` nodes keep their canonical genfs labels precisely to
-  make that tractable.
+- **SELinux: first-pass module built, not yet installed (needs root).** The container-era CIL blocks are gone; `selinux/` now ships a local module (`wlsctx`) defining `wlsctx_t` (supervisor/pipeline/sidecars) and `wlsctx_app_t` (the sandboxed app), plus the `xserver_t` rules the reconnaissance found missing. Built with `selinux/build.sh` (it is `checkmodule` that compiles modules, not `checkpolicy` — see there); installing is `sudo semodule -i`. Uninstalled, the stack runs unconfined exactly as before; the module is a second containment layer on top of the namespaces + nono, not a replacement for them.

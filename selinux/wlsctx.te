@@ -1,0 +1,280 @@
+module wlsctx 1.0.0;
+
+# base types this module references (must exist in the loaded policy)
+require {
+    type unconfined_t;
+    type bin_t;
+    type user_home_t;
+    type user_cache_t;
+    type lib_t;
+    type usr_t;
+    type xserver_t;
+    type xserver_exec_t;
+    type cgroup_t;
+    type user_tmp_t;
+    type device_t;
+    type null_device_t;
+    type urandom_device_t;
+    type ptmx_t;
+    type devtty_t;
+    type dri_device_t;
+    type session_dbusd_t;
+    type proc_t;
+    type sysfs_t;
+    type etc_t;
+    type tmpfs_t;
+    type node_t;
+
+    class process { fork getattr signal sigkill sigstop getsched getsession getrlimit setpgid setcurrent setexec setfscreate setkeycreate setsockcreate noatsecure rlimitinh siginh sigchld transition };
+    class filesystem { mount remount unmount transition };
+    class dir { create getattr open search read write add_name remove_name rmdir mounton };
+    class file { append create getattr map open read write unlink execute };
+    class chr_file { open read write getattr ioctl };
+    class sock_file { create getattr open read write unlink };
+    class unix_stream_socket { accept bind connectto create getattr read write setsockopt };
+    class unix_dgram_socket { ioctl sendto };
+    class tcp_socket { create getattr name_bind connect read write setsockopt };
+    class udp_socket { create getattr name_bind connect read write setsockopt };
+    class node { name_bind recvfrom sendto tcp_recv tcp_send udp_recv udp_send };
+    class dbus { send_msg acquire_svc };
+}
+
+# ------------------------------------------------------------------
+# wlsctx — SELinux policy module (phase 8.2, first pass)
+#
+# The in-process sandbox runs the whole S→A→B pipeline (and every
+# sidecar: broker, dbus-proxy, xwayland satellite) as the wlsctx
+# binary, and B execs the app while still in the same domain. There
+# is exactly one process label that matters: the binary's. This
+# module defines:
+#
+#   wlsctx_exec_t   file type for the installed wlsctx binary
+#   wlsctx_t        supervisor / pipeline / sidecar domain
+#   wlsctx_app_t    sandboxed-app domain
+#
+# Operating modes
+# ===============
+# unconfined mode (default): the binary keeps its usual label
+# (user_home_t / bin_t), nothing transitions, and the whole stack —
+# including the app — runs unconfined_t exactly as today. The only
+# effect of the module in this mode is the xserver_t rules at the
+# bottom (they matter the moment Xwayland is ever run as a real
+# xserver_t, e.g. after adding the stock Xorg transition).
+#
+# confined mode: relabel the installed binary to wlsctx_exec_t
+# (restorecon, see README.md). The `unconfined_t → wlsctx_t`
+# transition fires for every subcommand. The app B execs then lands
+# in wlsctx_app_t via the { bin_t, user_home_t } transition; the
+# bin_t helpers the pipeline and the app itself exec (notify-send,
+# xdg-dbus-proxy, app subprocesses) land there too, which is
+# intentional — the wlsctx_app_t rule set is a "confined user app"
+# set. Xwayland lands in a real xserver_t (the stock policy on this
+# machine has no transition into xserver_t at all). The S-side
+# supervisor stays wlsctx_t and signals/waits on the app across the
+# domain boundary.
+#
+# The rule sets below are deliberately a little broader than the
+# minimum; the tuning loop is in README.md (audit2allow, trim).
+#
+# Note on the bind-mounted /dev nodes (PLAN.md §3.3): they keep
+# their canonical genfs labels (null_device_t, urandom_device_t,
+# ptmx_t, devtty_t, dri_device_t), which is what makes per-class
+# rules here tractable instead of a blanket file_type grant.
+
+# ------------------------------------------------------------------
+# types
+# ------------------------------------------------------------------
+
+type wlsctx_exec_t;
+
+# base type attribute, referenced as an allow target (merged with the
+# base attribute of the same name at module load)
+attribute file_type;
+
+type wlsctx_t;
+
+type wlsctx_app_t;
+
+# ------------------------------------------------------------------
+# transitions
+# ------------------------------------------------------------------
+
+# installed binary → supervisor domain (confined mode only)
+allow unconfined_t wlsctx_t:process transition;
+type_transition unconfined_t wlsctx_exec_t:file wlsctx_t;
+
+# the app B execs, plus any bin_t / user_home_t helper the pipeline
+# or the app execs → app domain. If an app binary carries some other
+# type (check with `ls -lZ <app>`), add it to this list.
+allow wlsctx_t wlsctx_app_t:process transition;
+type_transition wlsctx_t { bin_t user_home_t }:file wlsctx_app_t;
+
+# the app's own subprocesses (bin_t / user_home_t / lib_t / usr_t
+# execs from wlsctx_app_t have no transition on the app side) stay
+# in the app domain; this is what keeps the whole app tree confined.
+allow wlsctx_app_t { bin_t user_home_t lib_t usr_t }:process { noatsecure rlimitinh siginh };
+
+# the xwayland satellite → real X server domain
+allow wlsctx_t xserver_t:process transition;
+type_transition wlsctx_t xserver_exec_t:file xserver_t;
+allow wlsctx_t xserver_exec_t:file { getattr open read execute map };
+
+# /proc/self/exe re-exec (SIGHUP rebuild in proxy --listen mode)
+# stays in the supervisor domain: no transition rule on wlsctx_exec_t
+# from wlsctx_t.
+allow wlsctx_t wlsctx_exec_t:file { getattr open read execute map };
+
+# ------------------------------------------------------------------
+# supervisor domain (wlsctx_t): S→A→B pipeline + sidecars
+# ------------------------------------------------------------------
+
+# same-domain fork/supervise (S→A, A→B, sidecar children)
+allow wlsctx_t wlsctx_t:process { fork getattr signal sigkill sigstop
+    getsched getsession getrlimit setpgid setcurrent setexec
+    setfscreate setkeycreate setsockcreate noatsecure rlimitinh
+    siginh sigchld };
+
+# the supervisor waits on / signals the app (S-side supervisor loop)
+allow wlsctx_t wlsctx_app_t:process { getattr signal sigkill };
+
+# --- rootfs mounts (A builds the tree, B finishes it) ---
+# The pipeline self-binds / (a disk fs: btrfs here, no superblock
+# context, i.e. unlabeled_t), mounts fresh tmpfs / devpts / proc
+# trees, and bind-mounts per-profile paths from whatever disk fs the
+# user pointed them at. Mirroring unconfined_t's "mount any
+# file_type superblock" is the tractable form of that; the §3.3
+# table decides *what* gets mounted, SELinux only checks the sb.
+allow wlsctx_t file_type:filesystem { mount remount unmount transition };
+allow wlsctx_t file_type:dir mounton;
+
+# --- cgroup: per-instance sub-cgroup under the session scope ---
+allow wlsctx_t cgroup_t:dir { create getattr open search read write
+    add_name remove_name rmdir };
+allow wlsctx_t cgroup_t:file { open read write getattr };
+
+# --- per-instance runtime dir: wayland, X, bus and broker sockets ---
+allow wlsctx_t user_tmp_t:dir { create getattr open search read write
+    add_name remove_name rmdir };
+allow wlsctx_t user_tmp_t:file { create append getattr open read write unlink };
+allow wlsctx_t user_tmp_t:sock_file { create getattr open read write unlink };
+allow wlsctx_t user_tmp_t:unix_stream_socket { bind connectto accept
+    create getattr read write setsockopt };
+allow wlsctx_t wlsctx_t:unix_stream_socket { getattr read write };
+
+# --- broker: session-bus client (direct notify path; the
+#     fire-and-forget notify-send child is covered by wlsctx_app_t) ---
+allow wlsctx_t session_dbusd_t:unix_stream_socket { accept connectto
+    getattr read write };
+allow session_dbusd_t wlsctx_t:unix_stream_socket { accept getattr
+    read write };
+allow wlsctx_t session_dbusd_t:dbus { send_msg acquire_svc };
+allow session_dbusd_t wlsctx_t:dbus send_msg;
+
+# --- sidecar spawns (xdg-dbus-proxy; Xwayland via the transition
+#     above) ---
+allow wlsctx_t bin_t:process { noatsecure rlimitinh siginh };
+
+# --- /dev nodes the pipeline binds in (canonical genfs labels) ---
+allow wlsctx_t { null_device_t urandom_device_t ptmx_t devtty_t
+    dri_device_t }:chr_file { getattr open read write };
+allow wlsctx_t device_t:dir { getattr open search read };
+
+# --- the app talks to the compositor (sway, unconfined_t here) over
+#     the tagged wayland socket: the accepted socket carries the
+#     acceptor's type, so the data pair is app ↔ compositor ---
+allow wlsctx_app_t unconfined_t:unix_stream_socket { read write };
+allow unconfined_t wlsctx_app_t:unix_stream_socket { read write };
+
+# ------------------------------------------------------------------
+# app domain (wlsctx_app_t): the sandboxed app
+# ------------------------------------------------------------------
+
+allow wlsctx_app_t wlsctx_app_t:process { fork getattr signal sigkill
+    sigstop getsched getsession getrlimit setpgid setcurrent setexec
+    setfscreate setkeycreate setsockcreate noatsecure rlimitinh
+    siginh sigchld };
+
+# --- instance dir: wayland socket, X socket, bus socket, runtime
+#     files (the dir and everything in it is user_tmp_t) ---
+allow wlsctx_app_t user_tmp_t:dir { create getattr open search read
+    write add_name remove_name };
+allow wlsctx_app_t user_tmp_t:file { append create getattr open read
+    write unlink };
+allow wlsctx_app_t user_tmp_t:sock_file { create getattr open read write };
+allow wlsctx_app_t user_tmp_t:unix_stream_socket { accept bind
+    connectto create getattr read write };
+
+# --- /tmp inside the ns is a fresh tmpfs; files matching the /tmp/*
+#     filecontexts come out user_tmp_t (covered above), the mount
+#     root itself is tmpfs_t ---
+allow wlsctx_app_t tmpfs_t:dir { getattr open search read };
+allow wlsctx_app_t tmpfs_t:file { append create getattr map open read
+    write unlink };
+
+# --- session bus (dbus_session_bus_client, inlined) ---
+allow wlsctx_app_t session_dbusd_t:unix_stream_socket { accept
+    connectto getattr read write };
+allow session_dbusd_t wlsctx_app_t:unix_stream_socket { accept getattr
+    read write };
+allow wlsctx_app_t session_dbusd_t:unix_dgram_socket ioctl;
+allow session_dbusd_t wlsctx_app_t:unix_dgram_socket sendto;
+allow wlsctx_app_t session_dbusd_t:dbus { send_msg acquire_svc };
+allow session_dbusd_t wlsctx_app_t:dbus send_msg;
+allow wlsctx_app_t session_dbusd_t:process { noatsecure rlimitinh siginh };
+
+# --- network: fresh netns with only loopback up (node_t =
+#     127.0.0.1); sockets carry the app's own type (default
+#     sockcreate) ---
+allow wlsctx_app_t node_t:node { name_bind recvfrom sendto tcp_recv
+    tcp_send udp_recv udp_send };
+allow wlsctx_app_t wlsctx_app_t:tcp_socket { create getattr name_bind
+    connect read write setsockopt };
+allow wlsctx_app_t wlsctx_app_t:udp_socket { create getattr name_bind
+    connect read write setsockopt };
+
+# --- /dev nodes the app sees (the §3.3 bind set) ---
+allow wlsctx_app_t { null_device_t urandom_device_t ptmx_t
+    devtty_t }:chr_file { open read write getattr ioctl };
+allow wlsctx_app_t dri_device_t:chr_file { open read write getattr };
+
+# --- /proc, /sys, cgroup inside the ns ---
+allow wlsctx_app_t proc_t:file { getattr open read };
+allow wlsctx_app_t sysfs_t:file { getattr open read };
+allow wlsctx_app_t cgroup_t:dir { getattr open search read };
+allow wlsctx_app_t cgroup_t:file { getattr open read };
+
+# --- /etc (glibc init: nsswitch, passwd, group, hosts, resolv) ---
+allow wlsctx_app_t etc_t:dir { getattr open search read };
+allow wlsctx_app_t etc_t:file { getattr open read };
+
+# --- home / cache / config (real-uid user data; files the app
+#     creates in its own home come out user_home_t) ---
+allow wlsctx_app_t { user_home_t user_cache_t }:dir { getattr open
+    search read write create add_name remove_name };
+allow wlsctx_app_t { user_home_t user_cache_t }:file { append create
+    getattr map open read write unlink };
+
+# --- system binaries and shared libraries (exec + dlopen) ---
+allow wlsctx_app_t { bin_t lib_t usr_t }:file { getattr open read
+    execute map };
+
+# --- the app talks to Xwayland (real xserver_t in confined mode):
+#     the client connects to the user_tmp_t listener; the accepted
+#     socket carries xserver_t's type ---
+allow wlsctx_app_t xserver_t:unix_stream_socket { read write };
+allow xserver_t wlsctx_app_t:unix_stream_socket { read write };
+
+# ------------------------------------------------------------------
+# xserver_t: the stock policy on this machine has no transition into
+# xserver_t, so Xwayland has always run unconfined and the stock
+# xserver_t rule set (Xorg's /var/log, xdmx, …) has never been
+# exercised by it. In confined mode it gets the X socket and MIT
+# auth file the satellite places in the per-instance dir
+# (user_tmp_t) — the one gap the reconnaissance found, and the only
+# reason this module exists in unconfined mode at all.
+# ------------------------------------------------------------------
+
+allow xserver_t user_tmp_t:file { getattr open read };
+allow xserver_t user_tmp_t:sock_file { getattr open read };
+allow xserver_t user_tmp_t:unix_stream_socket { accept getattr read write };
+allow xserver_t xserver_t:unix_stream_socket { getattr read write };

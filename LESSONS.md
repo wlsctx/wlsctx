@@ -239,3 +239,4 @@ write-up.
     `/tmp/.X11-unix/X<N>` (the live `X0` on this host was a stale
     leftover of a dead instance, not sway's bind). — *the Phase 7.3
     verification; `src/xwayland.rs` (`ensure_shim`), decision #37.*
+1. **checkpolicy 3.11 (Fedora 45 "userspace 3.11"): module compilation is `checkmodule`, not `checkpolicy`** (which builds the base policy; its `-c` takes a *version number*, not a policy.conf file). A module `.te` must start with `module <name> <ver>;` and carry a `require { ... }` block — both hard errors without them; `require` takes one identifier per `type` line and classes with the used permissions in braces; the module policy version tops out at 24 (just omit `-c`); and base *type attributes* referenced in rules (e.g. `file_type`) are re-declared in the module and merge by name at load. — *the phase 8.2 module; `selinux/`.*

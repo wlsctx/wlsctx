@@ -709,7 +709,7 @@ open from here: the full chain (a sandboxed app driven through the
       residual-risk list (network egress, copy-out, GPU, own-home
       exposure, portal attribution, multi-process deadlock, FOOT/PTY
       `EACCES`).
-- [ ] 8.2 New SELinux policy from scratch (local module confining the
+- [~] 8.2 New SELinux policy (first pass, 2026-10-24: `selinux/` module built — `wlsctx_t` + `wlsctx_app_t` + the xserver_t fix; not yet installed, that needs root; trimming via audit2allow is the rest). The local module confining the
       supervisor and app domains; the bind-mounted `/dev` nodes keep
       canonical labels, which makes this tractable — see §3.3)
 - [x] 8.3 Update `AGENTS.md` (layout, facts): the header points at

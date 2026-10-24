@@ -231,7 +231,7 @@ phase 8.1).**
 - This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
   each phase committed and working. Phase 5.5 (the Firefox e2e) and
   7.2 (the `dbus-proxy` sidecar) and 7.3 (the `xwayland` satellite)
-  are done. Next up: phase 8.2 and 8.4–8.5 (the SELinux policy, the
+  are done; phase 8.2 landed its first-pass module (`selinux/` — `wlsctx_t`/`wlsctx_app_t`/the xserver_t fix, built with checkmodule, install pending root). Next up: 8.4–8.5 (the
   integration test suite, the threat-model review), plus the full
   chain (a sandboxed app through the proxy into sway) and the
   drag-and-drop audit (6.5.5).
