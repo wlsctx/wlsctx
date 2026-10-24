@@ -17,3 +17,4 @@
 pub mod broker;
 pub mod dbus_proxy;
 pub mod proxy;
+pub mod xwayland;

@@ -26,7 +26,7 @@ use std::io::Write as _;
 use std::path;
 use std::time::Duration;
 
-use crate::cli::{BrokerArgs, Cli, Command, DbusProxyArgs, DecideArgs, WaylandArgs};
+use crate::cli::{BrokerArgs, Cli, Command, DbusProxyArgs, DecideArgs, WaylandArgs, XwaylandArgs};
 use crate::wayland::context::create_security_context;
 use crate::wayland::listener::obtain_listener;
 use wlsctx::proxy::LoopEnd;
@@ -92,6 +92,7 @@ fn main() -> Result<()> {
         Command::Broker(args) => run_broker(&args)?,
         Command::Decide(args) => run_decide(&args)?,
         Command::DbusProxy(args) => run_dbus_proxy(&args)?,
+        Command::Xwayland(args) => run_xwayland(&args)?,
     }
 
     Ok(())
@@ -498,6 +499,33 @@ fn run_dbus_proxy(args: &DbusProxyArgs) -> Result<()> {
         });
     }
     wlsctx::dbus_proxy::run(config)
+}
+
+/// The Xwayland satellite: wrap `Xwayland` so the sandboxed app gets
+/// a per-instance X display (the sidecar hands Xwayland a bound X
+/// socket in the instance runtime dir via `-listenfd` and gates on
+/// its `-displayfd` display number).
+fn run_xwayland(args: &XwaylandArgs) -> Result<()> {
+    let config = wlsctx::xwayland::Config {
+        app_id: args.app_id.clone(),
+        instance_id: args.instance_id.clone(),
+        display: args.display,
+        socket_name: args
+            .socket_name
+            .clone()
+            .unwrap_or_else(|| "xwayland.sock".into()),
+        auth_name: args
+            .auth_name
+            .clone()
+            .unwrap_or_else(|| "xwayland-auth".into()),
+        wayland_display: args.wayland_display.clone().unwrap_or_default(),
+        xwayland_bin: args
+            .xwayland_bin
+            .clone()
+            .unwrap_or_else(|| "Xwayland".into()),
+        rootless: args.rootless,
+    };
+    wlsctx::xwayland::run(config)
 }
 
 /// A millisecond count as a short human duration (for the listing).

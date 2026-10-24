@@ -48,6 +48,10 @@ pub(crate) enum Command {
     /// sidecar wrapping xdg-dbus-proxy; the app's
     /// DBUS_SESSION_BUS_ADDRESS points at the public socket)
     DbusProxy(DbusProxyArgs),
+    /// Run a per-instance X server for sandboxed X clients (a host
+    /// sidecar wrapping Xwayland; the app's DISPLAY/XAUTHORITY point
+    /// at the socket and auth file in the instance runtime dir)
+    Xwayland(XwaylandArgs),
 }
 
 impl Cli {
@@ -117,6 +121,7 @@ impl Cli {
             }
             Command::Run(_) => {}
             Command::DbusProxy(_) => {}
+            Command::Xwayland(_) => {}
         }
         Ok(())
     }
@@ -347,6 +352,45 @@ pub(crate) struct DbusProxyArgs {
     /// The proxy binary (default `xdg-dbus-proxy`, on `PATH`).
     #[arg(long, value_name = "BIN")]
     pub(crate) proxy_bin: Option<String>,
+}
+
+/// Arguments of `wlsctx xwayland`: a host sidecar wrapping
+/// `Xwayland` that gives the sandboxed app a per-instance X display;
+/// the app's `DISPLAY`/`XAUTHORITY` point at the instance runtime
+/// dir (the in-sandbox paths).
+#[derive(Args, Debug)]
+pub(crate) struct XwaylandArgs {
+    /// Application id: part of the instance name (`<app>-<instance>`)
+    /// that names the per-instance runtime dir holding the X socket.
+    #[arg(long, default_value = "app")]
+    pub(crate) app_id: String,
+    /// Instance id: part of the instance name.
+    #[arg(long, default_value = "1")]
+    pub(crate) instance_id: String,
+    /// The X display number (`:N`). 1..=9999; 0 is the conventional
+    /// real display (and what the compositor's own Xwayland takes on
+    /// many setups), so it is refused.
+    #[arg(long, default_value_t = 97)]
+    pub(crate) display: u16,
+    /// The X socket's file name in the instance runtime dir
+    /// (default `xwayland.sock`).
+    #[arg(long, value_name = "SOCKET")]
+    pub(crate) socket_name: Option<String>,
+    /// The auth file's name in the instance runtime dir
+    /// (default `xwayland-auth`).
+    #[arg(long, value_name = "AUTH")]
+    pub(crate) auth_name: Option<String>,
+    /// The host compositor's Wayland display. Defaults to the
+    /// `WAYLAND_DISPLAY` environment variable.
+    #[arg(long, value_name = "DISPLAY")]
+    pub(crate) wayland_display: Option<String>,
+    /// The Xwayland binary (default `Xwayland`, on `PATH`).
+    #[arg(long, value_name = "BIN")]
+    pub(crate) xwayland_bin: Option<String>,
+    /// Run rootless (the default: the window integrates with the
+    /// desktop) or as a framed window (`--no-rootless`).
+    #[arg(long, default_value_t = true)]
+    pub(crate) rootless: bool,
 }
 
 /// A value parser that rejects the empty string for the security-context
