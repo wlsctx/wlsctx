@@ -743,7 +743,55 @@ open from here: the full chain (a sandboxed app driven through the
       supervisor builds its capability set against the *in-sandbox*
       instance-dir path (decision #28), which exists on the host only
       for that XDG (see LESSONS.md #22).
-- [ ] 8.5 Threat-model review against the old README's list, item by item
+- [x] 8.5 Threat-model review against the old README's list, item by
+      item (2026-10-24): reviewed the pre-8.1 README's threat model
+      (README @ `1d780d5^`) against the in-process architecture.
+      *What it protects:* **home files** — changed shape: the app is
+      its real uid and keeps its *real* XDG dirs writable, so the
+      protection is from other users and the system, not from you
+      (the standard masks — other users' homes, `/root`, `/var`,
+      `/srv`, `/media`, `/mnt` — still apply; 8.4 verified the floor
+      empirically); **session D-Bus** — stronger: unreachable by
+      default (the rebuilt `/run` carries only the instance tree and
+      AF_UNIX `connect`/`bind` is trapped to it), with the `dbus-proxy`
+      sidecar (7.2) as the opt-in filtered path; **privileged Wayland
+      globals** — unchanged (compositor per-context policy via the
+      tagged socket, plus the relay's `--allow-globals`); **privilege
+      escalation** — stronger: the single-extent self-map leaves uid 0
+      *unmapped*, so `setuid(0)` is `EINVAL` rather than merely
+      capability-dropped (8.4 verified); **app code integrity at build
+      time** — retired: the container-era GPG-verified images are gone;
+      the app is whatever command `run` is given, and its integrity is
+      the user's as for any local program; **the selection read-gate** —
+      unchanged (the relay's opt-in receive-gate, with broker consent
+      and the always-on audit log riding on it). *What it does NOT
+      protect:* **outbound network** — same stance, with `--network=none`
+      as a new explicit knob (8.4: bare netns, `bind`/`connect` denied
+      before the packet leaves); **clipboard copy-out** — same
+      tripwire + audit-log stance (the `start_drag` write-audit remains
+      open as 6.5.5); **the shared downloads volume** — absorbed into
+      the new "your own home directory" residual (the same cross-app
+      tamper, scoped to your own uid's files); **GPU render nodes** —
+      unchanged; **portal attribution** — unchanged, now via the
+      *built* `dbus-proxy` (the "planned" wording corrected); **within
+      a pod** — now "within one app instance" (all its processes share
+      the instance namespaces; the 7.3 xwayland satellite is
+      per-instance, so there is no display shared across instances).
+      The **SSH/git guidance** survives (mechanism: the profile's
+      `unix_sockets`); the container-era **SELinux caveat** (the global
+      `container_t → wl_dbus_proxy` connectto rule, MCS-bounded) is
+      retired — the 8.2 module scopes every rule to the `wlsctx_t` /
+      `wlsctx_app_t` domains. The review retired the container-era
+      known gaps (at-spi allow-nothing, the image-frozen SIGHUP
+      re-exec, the missing `wl-app@.pod`, the GPG-chain TODO, the
+      commented-out drop-in knobs) and fixed three stale entries in
+      the current README: the multi-process "deadlock" gap (resolved
+      by decision #32 — the supervisor services *every* trapped
+      notification, Firefox e2e the proof; the remaining caveat is
+      app-internal pipe behaviour), the "sidecars are later" bullet
+      (7.2/7.3 are built), and the "full chain … (Phase 5.5)" bullet
+      (5.5 is done — what remains is the sandboxed client through the
+      `--proxy` relay into the live compositor).
 
 ## 8. Risks / things to watch
 

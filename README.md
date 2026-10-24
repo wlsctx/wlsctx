@@ -559,15 +559,16 @@ AF_UNIX is Landlock-restricted to the per-instance dir).
   deliberate (apps must persist their own settings), but it means a
   compromised extension can tamper with files another of *your* apps will
   read.
-- **Portal attribution.** When a D-Bus path is re-opened (the planned
-  `wlsctx dbus-proxy`, Phase 7.2), portal calls are proxied to the *host's*
-  portal, which attributes them to the **host** desktop, not the sandbox —
-  the `sandbox_engine`/`app_id`/`instance_id` context travels only over
-  Wayland, not over D-Bus. (There is no D-Bus path at all today; the
-  session bus is simply unreachable.)
+- **Portal attribution.** When the `wlsctx dbus-proxy` sidecar (Phase
+  7.2) sits in front of the session bus, portal calls are proxied to
+  the *host's* portal, which attributes them to the **host** desktop,
+  not the sandbox — the `sandbox_engine`/`app_id`/`instance_id` context
+  travels only over Wayland, not over D-Bus. (Without the sidecar there
+  is no D-Bus path at all; the session bus is simply unreachable.)
 - **Within one app.** All processes of *one* app instance share its
-  namespaces and are isolated from *other* instances, not from each other.
-  (And see the known-gap on multi-process apps below.)
+  namespaces and are isolated from *other* instances, not from each
+  other; the supervisor nonetheless services the app's *children* as
+  well (decision #32), so a multi-process app does not deadlock.
 
 **SSH / git:** do not mount private keys into the sandbox. Use
 `ssh-agent` forwarding instead: keep the agent on the host, run
@@ -578,11 +579,13 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
 
 ## Known gaps / WIP
 
-- **Multi-process apps can deadlock.** The supervisor arms only the app
-  itself (it mediates for `B`'s pid, decision #25). A *child* of the app
-  that issues a trapped syscall is never serviced and deadlocks the
-  handoff (decision #32) — so a shell app that spawns subshells
-  (e.g. `$(…)`) will hang; the reference apps are single-process.
+- **Multi-process apps work (decision #32).** The supervisor services
+  *every* trapped notification on the listener — no pid filter — so a
+  child that inherits the seccomp filter is served with the same
+  capability set, and a failed verdict answers `EPERM` rather than
+  hanging. The Phase 5.5 Firefox e2e (browser + gecko/socket children)
+  ran and exited cleanly; the remaining caveat is app-internal pipe
+  behaviour, not a supervisor gap.
 - **FOOT/PTY: `EACCES` from `devpts` inside the userns.** A fresh
   `devpts` instance is mounted, but opening a *new* pt from inside an
   unprivileged user namespace is rejected by the kernel on this system —
@@ -593,12 +596,15 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
   as a write (the gate still attributes drags for the read-gate, and
   `serve` events fired during a drag are recorded under the clipboard
   label — `wl_data_source` is shared by both).
-- **The full chain is still being verified end-to-end.** Running a real
-  GUI app *sandboxed* through the full `S → A → B` pipeline on target
-  (Phase 5.5), and the full chain of a sandboxed app through the proxy
-  into sway, are the remaining verification steps.
-- **D-Bus and Xwayland sidecars are later.** `wlsctx dbus-proxy <instance>`
-  (Phase 7.2) and an optional `wlsctx xwayland` host satellite (Phase 7.3)
-  are not built yet; until then the host session bus is simply unreachable
-  and there is no in-sandbox X server.
+- **The full chain is still being verified end-to-end.** The sandboxed
+  pipeline itself is verified (Phase 5.5: Firefox reached the
+  compositor, networked, and tore down cleanly); what remains is the
+  chain of a *sandboxed* Wayland client driven through the `--proxy`
+  relay into the live compositor (the relay itself is covered by the
+  three-party integration tests, against a fake compositor).
+- **The sidecars are opt-in, not on by default.** `wlsctx dbus-proxy`
+  (Phase 7.2) and the optional `wlsctx xwayland` host satellite
+  (Phase 7.3) are built and run per instance; neither is started by a
+  plain `run`, so out of the box the host session bus is simply
+  unreachable and there is no in-sandbox X server.
 - **SELinux: first-pass module built, not yet installed (needs root).** The container-era CIL blocks are gone; `selinux/` now ships a local module (`wlsctx`) defining `wlsctx_t` (supervisor/pipeline/sidecars) and `wlsctx_app_t` (the sandboxed app), plus the `xserver_t` rules the reconnaissance found missing. Built with `selinux/build.sh` (it is `checkmodule` that compiles modules, not `checkpolicy` — see there); installing is `sudo semodule -i`. Uninstalled, the stack runs unconfined exactly as before; the module is a second containment layer on top of the namespaces + nono, not a replacement for them.
