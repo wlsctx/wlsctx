@@ -203,7 +203,7 @@ pub enum UserDecision {
 /// [`DECIDE_KIND`] (with a `decision`; an optional `prompt` id to
 /// target a specific pending prompt, the oldest when absent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecideRequest {
+pub(crate) struct DecideRequest {
     /// The protocol version (currently 1).
     pub v: u8,
     /// The request kind ([`LIST_KIND`] or [`DECIDE_KIND`]).
@@ -296,7 +296,7 @@ pub fn encode_request(req: &ClipboardRead) -> io::Result<String> {
 }
 
 /// Decode a request line; the version and kind must match.
-pub fn decode_request(line: &str) -> Result<ClipboardRead, String> {
+pub(crate) fn decode_request(line: &str) -> Result<ClipboardRead, String> {
     let req = decode::<ClipboardRead>(line)?;
     if req.v != PROTOCOL_VERSION {
         return Err(format!(
@@ -356,16 +356,6 @@ pub fn decode_decision(line: &str) -> Result<Decision, String> {
     decode(line)
 }
 
-/// Encode a user-decision line (the `--decide` → broker direction).
-pub fn encode_user_decision(d: &UserDecision) -> io::Result<String> {
-    encode(d)
-}
-
-/// Decode a user-decision line.
-pub fn decode_user_decision(line: &str) -> Result<UserDecision, String> {
-    decode(line)
-}
-
 /// Encode a `list` request line (the decider → broker direction).
 pub fn encode_list_request() -> io::Result<String> {
     encode(&DecideRequest {
@@ -389,7 +379,7 @@ pub fn encode_decide_request(d: &UserDecision, prompt: Option<u32>) -> io::Resul
 
 /// Decode a decider request line; the version, the kind, and (for a
 /// `decide`) the decision must all be valid.
-pub fn decode_decider_request(line: &str) -> Result<DecideRequest, String> {
+pub(crate) fn decode_decider_request(line: &str) -> Result<DecideRequest, String> {
     let req = decode::<DecideRequest>(line)?;
     if req.v != PROTOCOL_VERSION {
         return Err(format!(
@@ -412,7 +402,7 @@ pub fn decode_decider_request(line: &str) -> Result<DecideRequest, String> {
 }
 
 /// The on-the-wire (and CLI) name of a decision.
-pub fn decision_name(d: &UserDecision) -> &'static str {
+pub(crate) fn decision_name(d: &UserDecision) -> &'static str {
     match d {
         UserDecision::Allow => "allow",
         UserDecision::Deny => "deny",
@@ -420,7 +410,7 @@ pub fn decision_name(d: &UserDecision) -> &'static str {
 }
 
 /// Encode a `pending` response line (the broker → decider direction).
-pub fn encode_pending_list(list: &PendingList) -> io::Result<String> {
+pub(crate) fn encode_pending_list(list: &PendingList) -> io::Result<String> {
     encode(list)
 }
 
@@ -440,7 +430,7 @@ pub fn decode_pending_list(line: &str) -> Result<PendingList, String> {
 }
 
 /// Encode a `resolved` response line (the broker → decider direction).
-pub fn encode_resolution(r: &Resolution) -> io::Result<String> {
+pub(crate) fn encode_resolution(r: &Resolution) -> io::Result<String> {
     encode(r)
 }
 
@@ -460,7 +450,7 @@ pub fn decode_resolution(line: &str) -> Result<Resolution, String> {
 }
 
 /// Encode an `error` response line (the broker → decider direction).
-pub fn encode_error_reply(e: &ErrorReply) -> io::Result<String> {
+pub(crate) fn encode_error_reply(e: &ErrorReply) -> io::Result<String> {
     encode(e)
 }
 
@@ -1331,19 +1321,6 @@ mod tests {
             encode_decision(&a).unwrap().trim(),
             r#"{"decision":"allow","window_ms":1500}"#
         );
-    }
-
-    #[test]
-    fn user_decision_roundtrip() {
-        assert_eq!(
-            decode_user_decision(&encode_user_decision(&UserDecision::Allow).unwrap()).unwrap(),
-            UserDecision::Allow
-        );
-        assert_eq!(
-            encode_user_decision(&UserDecision::Deny).unwrap().trim(),
-            r#"{"decision":"deny"}"#
-        );
-        assert!(decode_user_decision("nonsense").is_err());
     }
 
     /// A `clipboard-write` line through the daemon's real per-connection
