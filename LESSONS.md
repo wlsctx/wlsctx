@@ -206,3 +206,36 @@ write-up.
     `revents` even when unrequested; and the fd must be **non**-CLOEXEC
     to survive `execve` (it *closes* CLOEXEC descriptors — the inverse
     of the reflex).
+
+19. **The `-listenfd` contract: the *spawner* must `listen(2)` before the
+    handoff.** Xwayland's `-listenfd` path (libXtrans `SocketReopen`)
+    adopts the given fd *as-is* and never calls `listen` itself — only
+    the create-from-scratch path (`SocketUNIXCreate`) does. Hand over
+    an unlistened socket and the server's `accept(2)` fails `EINVAL`
+    on every readiness wake: an infinite `accept() failed` flood at
+    100% CPU (it also filled our `/tmp` quota with its stderr). sway's
+    own spawn is the model: it `listen`s first. The bug was invisible
+    in every "it starts" smoke test; an `LD_PRELOAD` `accept` tracer
+    (fd number + errno, count-capped) pinned it to fd 4 / `EINVAL` in
+    one run.
+
+20. **The kernel clears `PR_SET_PDEATHSIG` on any exec that changes
+    the process's *security credentials* — not just setuid, and not
+    just `AT_SECURE`.** On this (SELinux-enforcing) machine `Xwayland`
+    execs into the `xserver_t` domain; the transition changes
+    `cred->security` and the kernel's
+    `security_bprm_committing_creds` clears the death signal — while
+    `AT_SECURE` stays *unset* (absent from the auxv), so glibc still
+    honors `LD_PRELOAD` there. The fix: a 3-line `LD_PRELOAD` shim
+    (compiled on demand into the per-instance runtime dir) whose
+    constructor re-sets `PR_SET_PDEATHSIG(SIGTERM)` *after* the
+    transition — verified: a SIGKILL'd satellite's Xwayland now dies.
+    The re-set is a harmless no-op where nothing was cleared. Related
+    findings from the same investigation: Xwayland's `-once` flag is
+    *XDMCP-session* semantics (terminate on XDMCP retransmission
+    timeout) and a no-op for a non-XDMCP rootless Xwayland — it does
+    **not** exit when the last X client disconnects; and given
+    `-listenfd`, Xwayland does **not** create the conventional
+    `/tmp/.X11-unix/X<N>` (the live `X0` on this host was a stale
+    leftover of a dead instance, not sway's bind). — *the Phase 7.3
+    verification; `src/xwayland.rs` (`ensure_shim`), decision #37.*

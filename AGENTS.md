@@ -59,6 +59,18 @@ phase 8.1).**
     CLOEXEC fds), so even a SIGKILL'd sidecar tears the proxy down
     (decision #36); sync-byte readiness gate; public `bus.sock` in
     the per-instance runtime dir, owner-only
+- `xwayland.rs` — the Phase-7.3 Xwayland satellite: owns an
+    `Xwayland` child (same signalfd + pidfd `poll(2)` shape;
+    TERM→2s→KILL teardown); the sidecar creates, binds **and
+    listens** the X socket (the spawner must `listen` — Xwayland's
+    `-listenfd` path adopts the fd as-is) and hands it over as
+    `-listenfd` (non-CLOEXEC); a socketpair as `-displayfd` is the
+    readiness gate (display number cross-checked against
+    `--display`); `-auth` (MIT cookie), `-nolisten tcp`, `-rootless`
+    by default. The lifetime backstop for a SIGKILL'd satellite is
+    `PR_SET_PDEATHSIG` (set in `pre_exec`, re-armed in the child by
+    an on-demand-compiled `LD_PRELOAD` shim — the SELinux transition
+    into `xserver_t` clears it on exec; decision #37, LESSONS #19-20)
 - `src/wayland/` — the tagged Wayland socket for the `run` pipeline:
   `listener` (socket activation / `--listen`), `roundtrip` (bounded
   sync), `context` (the `wp_security_context_v1` exchange)
@@ -218,9 +230,9 @@ phase 8.1).**
   LESSONS.md #15/#16.
 - This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
   each phase committed and working. Phase 5.5 (the Firefox e2e) and
-  7.2 (the `dbus-proxy` sidecar) are done. Next up: the 7.3 xwayland
-  satellite (optional) and phase 8.2 and 8.4–8.5 (the SELinux policy,
-  the integration test suite, the threat-model review), plus the full
+  7.2 (the `dbus-proxy` sidecar) and 7.3 (the `xwayland` satellite)
+  are done. Next up: phase 8.2 and 8.4–8.5 (the SELinux policy, the
+  integration test suite, the threat-model review), plus the full
   chain (a sandboxed app through the proxy into sway) and the
   drag-and-drop audit (6.5.5).
 

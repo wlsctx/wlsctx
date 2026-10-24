@@ -27,10 +27,14 @@
 //! (`execve(2)` closes CLOEXEC descriptors — the decision-#36 fd
 //! contract):
 //!
-//! - **fd 4, `-listenfd`**: the X socket the *sidecar* created and
-//!   bound (`<instance-dir>/xwayland.sock`, owner-only from birth).
-//!   Xwayland calls `listen(2)` on it. This is the same pattern sway
-//!   uses to spawn its own Xwayland.
+//! - **fd 4, `-listenfd`**: the X socket the *sidecar* created,
+//!   bound, and **listened** (`<instance-dir>/xwayland.sock`,
+//!   owner-only from birth). The sidecar must call `listen(2)` before
+//!   the handoff: Xwayland's `-listenfd` path (libXtrans
+//!   `SocketReopen`) adopts the fd *as-is* and never calls `listen`
+//!   itself — a socket handed over unlistened makes the server's
+//!   `accept(2)` fail `EINVAL` on every readiness wake, a 100%-CPU
+//!   hot spin (sway's spawn, which listens first, is the model).
 //! - **fd 5, `-displayfd`**: one end of a private socketpair. Xwayland
 //!   writes the display number in use when it is ready to take
 //!   clients and closes it; the sidecar reads it as the readiness
@@ -40,22 +44,31 @@
 //!
 //! Other arguments: `-auth <instance-dir>/xwayland-auth` (Xwayland
 //! writes its MIT cookie there; the app's `XAUTHORITY` points at the
-//! in-sandbox copy), `-nolisten tcp` (never a TCP listener), `-once`
-//! (the server exits when the *last* X client disconnects — a
-//! SIGKILL'd satellite leaves a self-cleaning Xwayland), and
+//! in-sandbox copy), `-nolisten tcp` (never a TCP listener), and
 //! `-rootless` by default (the window integrates with the desktop;
-//! `--no-rootless` for the framed window).
+//! `--no-rootless` for the framed window). As a lifetime backstop
+//! the sidecar sets `PR_SET_PDEATHSIG` to SIGTERM in `pre_exec`,
+//! and re-arms it inside the child with a small `LD_PRELOAD` shim
+//! (`ensure_shim`) where the exec clears it (here: a SELinux domain
+//! transition into `xserver_t` changes the process's security
+//! credentials, and the kernel clears pdeathsig on such an exec):
+//! Xwayland has no lifetime fd (unlike `xdg-dbus-proxy`), so without
+//! this a SIGKILL'd satellite would leave an idle X server holding
+//! the instance socket; with it, Xwayland gets SIGTERM whenever the
+//! satellite dies — however it dies — and shuts down cleanly.
 //!
 //! The sidecar sets `umask(0077)` before creating anything: the
 //! instance dir (if new) and the socket it binds are owner-only from
 //! birth, and the auth file Xwayland creates is tightened once it
 //! exists (the wayland listener's pattern).
 //!
-//! Note: Xwayland *additionally* binds the conventional
-//! `/tmp/.X11-unix/X<N>` on the host (it always does, even with
-//! `-listenfd` — sway's own instance shows it). That socket is
-//! cookie-gated and owner-reachable; it is a `:N` convenience on the
-//! host, not an extra exposure.
+//! The instance socket is the *only* host-visible X path: Xwayland
+//! given `-listenfd` does not create the conventional
+//! `/tmp/.X11-unix/X<N>` socket (verified against the Fedora
+//! 24.1.13 build — a `:97` satellite produced no such file, while a
+//! `/tmp/.X11-unix/X0` that looked like sway's live bind was in fact
+//! a stale leftover of a dead instance). The 0600 instance socket is
+//! therefore the sole reachability surface, owner-gated.
 //!
 //! [`Xwayland`]: https://www.x.org/archive/commission/xace/docs/xwayland/
 
@@ -277,7 +290,16 @@ fn displayfd_socketpair() -> Result<(OwnedFd, OwnedFd)> {
     Ok((side, child))
 }
 
-/// Create, bind, and return the X socket (owner-only from birth).
+/// Create, bind, *listen*, and return the X socket (owner-only from
+/// birth).
+///
+/// The `listen(2)` is ours, not Xwayland's: the `-listenfd` path in
+/// the X transport (`SocketReopen`) adopts the fd *as-is* — only the
+/// create-from-scratch path (`SocketUNIXCreate`) listens. A bound
+/// but un-listened socket makes Xwayland's accept loop fail with
+/// `EINVAL` on every wake (a hot spin at 100% CPU spewing
+/// `accept() failed`) — observed, then fixed (sway, which spawns
+/// Xwayland the same way, listens before handing the fd over).
 ///
 /// A stale socket file from a crashed run is removed first (a
 /// `bind(2)` onto an existing unix socket path is `EADDRINUSE`).
@@ -291,6 +313,14 @@ fn create_listen_socket(path: &str) -> Result<OwnedFd> {
         return Err(e);
     }
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    // SAFETY: our own listening socket; backlog 16 is plenty for a
+    // per-instance X server.
+    let rc = unsafe { libc::listen(fd.as_fd().as_raw_fd(), 16) };
+    if rc < 0 {
+        drop(fd);
+        let _ = std::fs::remove_file(path);
+        return Err(io::Error::last_os_error()).with_context(|| format!("listen({path})"));
+    }
     Ok(fd)
 }
 
@@ -336,14 +366,70 @@ fn bind_unix(fd: &std::os::fd::BorrowedFd<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The C source of the pdeathsig-restore shim ([`ensure_shim`]).
+const PDEATHSIG_SHIM_SRC: &str = r#"
+#define _GNU_SOURCE
+#include <signal.h>
+#include <sys/prctl.h>
+__attribute__((constructor)) static void wlsctx_restore_pdeathsig(void) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+}
+"#;
+
+/// Compile (or reuse) the pdeathsig-restore shim in the instance dir.
+///
+/// The satellite sets `PR_SET_PDEATHSIG` in `pre_exec`, but this
+/// machine's Xwayland execs into the `xserver_t` SELinux domain, and
+/// the kernel clears pdeathsig on any exec that changes the
+/// process's security credentials (`security_bprm_committing_creds`)
+/// — with neither setuid nor AT_SECURE (both stay unset, which is
+/// why glibc still honors `LD_PRELOAD` here). The shim's constructor
+/// re-sets the signal after the transition; on systems that do not
+/// clear it, the re-set is a harmless no-op.
+///
+/// Returns `None` (and logs a warning) when no compiler is
+/// available: the satellite still works, a SIGKILL'd satellite then
+/// leaves an idle Xwayland behind, and the SIGTERM path still tears
+/// down cleanly.
+fn ensure_shim(dir: &str) -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(dir);
+    let so = dir.join("pdeathsig-restore.so");
+    if so.exists() {
+        return Some(so);
+    }
+    let c = dir.join("pdeathsig-restore.c");
+    if std::fs::write(&c, PDEATHSIG_SHIM_SRC).is_err() {
+        return None;
+    }
+    match process::Command::new("cc")
+        .arg("-shared")
+        .arg("-fPIC")
+        .arg("-o")
+        .arg(&so)
+        .arg(&c)
+        .status()
+    {
+        Ok(s) if s.success() => Some(so),
+        _ => {
+            eprintln!(
+                "wlsctx: warning: could not compile the pdeathsig restore shim ({c:?}); \
+                 a SIGKILL'd satellite would leave Xwayland behind"
+            );
+            None
+        }
+    }
+}
+
 /// The `Xwayland` command line: `BIN :N -listenfd 4 -displayfd 5
-/// -auth <path> -nolisten tcp -once [-rootless]`.
+/// -auth <path> -nolisten tcp [-rootless]`.
 ///
 /// `-listenfd`/`-displayfd` name the two fds handed over in
 /// `pre_exec` (decision #36's fd contract — non-CLOEXEC, since
-/// `execve(2)` closes CLOEXEC descriptors). `-once` makes a SIGKILL'd
-/// satellite's orphan self-clean: Xwayland exits when its last X
-/// client (the sandboxed app) disconnects.
+/// `execve(2)` closes CLOEXEC descriptors). The lifetime backstop for
+/// a SIGKILL'd satellite is `PR_SET_PDEATHSIG` in `pre_exec`, not an
+/// X flag: `-once` is XDMCP *session* semantics (terminate on XDMCP
+/// retransmission timeout) and a no-op for a non-XDMCP rootless
+/// Xwayland — it does *not* exit when the last X client goes away.
 fn xwayland_argv(cfg: &Config, auth: &str) -> Vec<String> {
     let mut argv = vec![
         cfg.xwayland_bin.clone(),
@@ -356,7 +442,6 @@ fn xwayland_argv(cfg: &Config, auth: &str) -> Vec<String> {
         auth.to_string(),
         "-nolisten".to_string(),
         "tcp".to_string(),
-        "-once".to_string(),
     ];
     if cfg.rootless {
         argv.push("-rootless".to_string());
@@ -413,6 +498,9 @@ pub fn run(cfg: Config) -> Result<()> {
     let listen_fd = listen.as_fd().as_raw_fd();
     let df_child_fd = df_child.as_fd().as_raw_fd();
 
+    // The pdeathsig-restore shim (see `ensure_shim`), if it builds.
+    let shim = ensure_shim(&dir);
+
     let argv = xwayland_argv(&cfg, &auth);
     let wl_display = wayland_display(&cfg)?;
 
@@ -427,6 +515,17 @@ pub fn run(cfg: Config) -> Result<()> {
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::inherit())
         .stderr(process::Stdio::inherit());
+    // Re-arm the lifetime backstop inside the child (see
+    // `ensure_shim`): append to any inherited LD_PRELOAD.
+    if let Some(shim) = &shim {
+        let shim_s = shim.to_string_lossy().into_owned();
+        match std::env::var("LD_PRELOAD") {
+            Ok(existing) if !existing.is_empty() => {
+                cmd.env("LD_PRELOAD", format!("{existing}:{shim_s}"))
+            }
+            _ => cmd.env("LD_PRELOAD", shim_s),
+        };
+    }
     // Hand Xwayland its two fds: dup each onto its fixed number and
     // *remove* CLOEXEC — `execve(2)` closes CLOEXEC descriptors, so
     // both must be unmarked to reach Xwayland.
@@ -441,6 +540,15 @@ pub fn run(cfg: Config) -> Result<()> {
             // SIGKILL. Reset to the default disposition.
             nix::sys::signal::sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
                 .map_err(io::Error::other)?;
+            // Lifetime backstop: whenever the satellite dies (TERM,
+            // KILL, crash, OOM), exec's parent-death signal reaches
+            // Xwayland as SIGTERM and it shuts down cleanly. Without
+            // this, a SIGKILL'd satellite would leave an idle X
+            // server holding the instance socket (Xwayland has no
+            // lifetime fd of its own).
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(io::Error::last_os_error());
+            }
             let rc = libc::dup2(listen_fd, LISTEN_FD);
             if rc < 0 {
                 return Err(io::Error::last_os_error());
@@ -672,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn argv_is_listendf_displayfd_auth_nolisten_once() {
+    fn argv_is_listendf_displayfd_auth_nolisten_rootless() {
         // Rootless (the default): the trailing -rootless is present.
         let cfg = Config {
             xwayland_bin: "Xwayland".into(),
@@ -691,7 +799,6 @@ mod tests {
             "/a/xwayland-auth".into(),
             "-nolisten".into(),
             "tcp".into(),
-            "-once".into(),
             "-rootless".into(),
         ];
         assert_eq!(xwayland_argv(&cfg, "/a/xwayland-auth"), expected);
@@ -702,7 +809,7 @@ mod tests {
         };
         let argv = xwayland_argv(&rootful, "/a/xwayland-auth");
         assert!(!argv.contains(&"-rootless".to_string()));
-        assert_eq!(argv.len(), 11);
+        assert_eq!(argv.len(), 10);
     }
 
     #[test]
