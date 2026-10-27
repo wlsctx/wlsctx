@@ -58,8 +58,8 @@ require {
 # (user_home_t / bin_t), nothing transitions, and the whole stack —
 # including the app — runs unconfined_t exactly as today. The only
 # effect of the module in this mode is the xserver_t rules at the
-# bottom (they matter the moment Xwayland is ever run as a real
-# xserver_t, e.g. after adding the stock Xorg transition).
+# bottom (Xwayland already runs as a real xserver_t on this machine
+# via the stock unconfined_t transition — see LESSONS #20).
 #
 # confined mode: relabel the installed binary to wlsctx_exec_t
 # (restorecon, see README.md). The `unconfined_t → wlsctx_t`
@@ -265,13 +265,18 @@ allow wlsctx_app_t xserver_t:unix_stream_socket { read write };
 allow xserver_t wlsctx_app_t:unix_stream_socket { read write };
 
 # ------------------------------------------------------------------
-# xserver_t: the stock policy on this machine has no transition into
-# xserver_t, so Xwayland has always run unconfined and the stock
-# xserver_t rule set (Xorg's /var/log, xdmx, …) has never been
-# exercised by it. In confined mode it gets the X socket and MIT
-# auth file the satellite places in the per-instance dir
-# (user_tmp_t) — the one gap the reconnaissance found, and the only
-# reason this module exists in unconfined mode at all.
+# xserver_t: the stock policy on this machine DOES transition
+# unconfined_t → xserver_t on xserver_exec_t (verified live
+# 2026-10-27: a bare `Xwayland :99 -rootless …` runs xserver_t with
+# the module uninstalled; the earlier `sesearch` note to the
+# contrary was wrong — see LESSONS #20). The transition below
+# matters in *confined* mode, where the satellite is wlsctx_t and
+# no stock rule fires. The user_tmp_t allows below are
+# precautionary: the Phase 7.3 e2e (Xwayland as xserver_t creating
+# the auth file and the instance-dir X socket, a real client
+# connecting) produced no denials, so the stock rule set already
+# covers what the satellite touches — confirm in the tuning loop
+# and drop if redundant.
 # ------------------------------------------------------------------
 
 allow xserver_t user_tmp_t:file { getattr open read };

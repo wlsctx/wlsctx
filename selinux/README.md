@@ -23,14 +23,18 @@ system (installing needs root).
   app": instance dir, /tmp, /dev nodes (the §3.3 genfs labels),
   /proc /sys /cgroup /etc, home/cache, system libs (`lib_t` dlopen),
   session bus, loopback network.
-- `xserver_t` — the stock policy on this machine has **no transition
-  into `xserver_t` at all** (verified with `sesearch -T -t
-  xserver_t`), so Xwayland has always run `unconfined_t` and the
-  stock xserver rules were never exercised. The module adds the
-  `wlsctx_t → xserver_t` transition (so the satellite gets a real
-  X-server domain in confined mode) and the one gap the
-  reconnaissance found: `xserver_t` access to the X socket and MIT
-  auth file in the per-instance dir (`user_tmp_t`).
+- `xserver_t` — the stock policy on this machine **does** transition
+  `unconfined_t → xserver_t` on `xserver_exec_t` (verified live
+  2026-10-27; an earlier `sesearch` note to the contrary was wrong —
+  see LESSONS #20), so Xwayland has run in the real X-server domain
+  all along. The module adds the `wlsctx_t → xserver_t` transition
+  (needed in confined mode, where the satellite is `wlsctx_t` and
+  the stock transition does not fire) plus `xserver_t` access to
+  the X socket and MIT auth file the satellite places in the
+  per-instance dir (`user_tmp_t`) — precautionary: the Phase 7.3
+  e2e (Xwayland as `xserver_t` creating exactly those files, a real
+  client connecting) produced no denials, so the stock rule set may
+  already cover them; the tuning loop decides whether to keep them.
 
 ## Operating modes
 
