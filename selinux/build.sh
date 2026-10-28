@@ -11,6 +11,9 @@ set -eu
 cd "$(dirname "$0")"
 mkdir -p build
 checkmodule -m -M -o build/wlsctx.p wlsctx.te
+# Reference CIL rendering (checkpolicy 3.11 can *write* CIL but not
+# *read* it — see README.md; not an install path).
+checkmodule -m -M -C -o build/wlsctx.cil wlsctx.te
 if [ -f wlsctx.fc ]; then
     semodule_package -o build/wlsctx.pp -m build/wlsctx.p -f wlsctx.fc
 else

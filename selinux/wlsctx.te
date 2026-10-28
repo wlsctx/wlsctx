@@ -19,16 +19,23 @@ require {
     type devtty_t;
     type dri_device_t;
     type session_dbusd_t;
+    type unconfined_dbusd_t;
+    type session_dbusd_tmp_t;
     type proc_t;
     type sysfs_t;
     type etc_t;
     type tmpfs_t;
+    type tmp_t;
     type node_t;
 
-    class process { fork getattr signal sigkill sigstop getsched getsession getrlimit setpgid setcurrent setexec setfscreate setkeycreate setsockcreate noatsecure rlimitinh siginh sigchld transition };
+    class process { fork getattr signal sigkill sigstop getsched getsession getrlimit setpgid setcurrent setexec setfscreate setkeycreate setsockcreate noatsecure rlimitinh siginh sigchld transition dyntransition };
     class filesystem { mount remount unmount transition };
-    class dir { create getattr open search read write add_name remove_name rmdir mounton };
-    class file { append create getattr map open read write unlink execute };
+    class dir { create getattr open search read write add_name remove_name rmdir mounton setattr };
+    # mounton is also checked on *file* objects (bind-mounting over a
+    # file, e.g. the fresh-/dev node builds): the kernel has it in the
+    # file common set, but checkmodule's class table does not — the
+    # module requires it explicitly.
+    class file { append create getattr map open read write unlink execute mounton };
     class chr_file { open read write getattr ioctl };
     class sock_file { create getattr open read write unlink };
     class unix_stream_socket { accept bind connectto create getattr read write setsockopt };
@@ -37,6 +44,7 @@ require {
     class udp_socket { create getattr name_bind connect read write setsockopt };
     class node { name_bind recvfrom sendto tcp_recv tcp_send udp_recv udp_send };
     class dbus { send_msg acquire_svc };
+    class system { start };
 }
 
 # ------------------------------------------------------------------
@@ -106,7 +114,9 @@ type_transition unconfined_t wlsctx_exec_t:file wlsctx_t;
 # the app B execs, plus any bin_t / user_home_t helper the pipeline
 # or the app execs → app domain. If an app binary carries some other
 # type (check with `ls -lZ <app>`), add it to this list.
-allow wlsctx_t wlsctx_app_t:process transition;
+# dyntransition: B may override the exec context with
+# setexecfilecon (per-instance MCS category, see README.md).
+allow wlsctx_t wlsctx_app_t:process { transition dyntransition };
 type_transition wlsctx_t { bin_t user_home_t }:file wlsctx_app_t;
 
 # the app's own subprocesses (bin_t / user_home_t / lib_t / usr_t
@@ -147,10 +157,19 @@ allow wlsctx_t wlsctx_app_t:process { getattr signal sigkill };
 allow wlsctx_t file_type:filesystem { mount remount unmount transition };
 allow wlsctx_t file_type:dir mounton;
 
+# build scratch /var/tmp/.wlsctx/<inst> (tmp_t here) and the fresh /tmp
+allow wlsctx_t tmp_t:dir { create getattr open search read write
+    add_name remove_name rmdir mounton setattr };
+allow wlsctx_t tmp_t:file { create append getattr map open read write
+    unlink mounton };
+
 # --- cgroup: per-instance sub-cgroup under the session scope ---
 allow wlsctx_t cgroup_t:dir { create getattr open search read write
     add_name remove_name rmdir };
 allow wlsctx_t cgroup_t:file { open read write getattr };
+
+# the scope is created through systemd user (unconfined_t here)
+allow wlsctx_t unconfined_t:system start;
 
 # --- per-instance runtime dir: wayland, X, bus and broker sockets ---
 allow wlsctx_t user_tmp_t:dir { create getattr open search read write
@@ -163,6 +182,20 @@ allow wlsctx_t wlsctx_t:unix_stream_socket { getattr read write };
 
 # --- broker: session-bus client (direct notify path; the
 #     fire-and-forget notify-send child is covered by wlsctx_app_t) ---
+# On this box the session bus is dbus-broker running as
+# unconfined_dbusd_t, and /run/user/<uid>/bus is labeled
+# session_dbusd_tmp_t (permissive probe, 2026-10-28); the
+# session_dbusd_t rules below cover the classic sd-dbus variant.
+allow wlsctx_t session_dbusd_tmp_t:sock_file { getattr open read write };
+allow wlsctx_t unconfined_dbusd_t:unix_stream_socket { accept connectto
+    getattr read write setsockopt };
+allow unconfined_dbusd_t wlsctx_t:unix_stream_socket { accept getattr
+    read write };
+allow wlsctx_t unconfined_dbusd_t:dbus { send_msg acquire_svc };
+allow unconfined_dbusd_t wlsctx_t:dbus send_msg;
+# the notify recipient (and any other unconfined peer)
+allow wlsctx_t unconfined_t:dbus send_msg;
+allow unconfined_t wlsctx_t:dbus send_msg;
 allow wlsctx_t session_dbusd_t:unix_stream_socket { accept connectto
     getattr read write };
 allow session_dbusd_t wlsctx_t:unix_stream_socket { accept getattr
@@ -212,6 +245,18 @@ allow wlsctx_app_t tmpfs_t:file { append create getattr map open read
     write unlink };
 
 # --- session bus (dbus_session_bus_client, inlined) ---
+# dbus-broker (unconfined_dbusd_t) variant, per the probe; the
+# session_dbusd_t rules below cover the classic sd-dbus variant.
+allow wlsctx_app_t session_dbusd_tmp_t:sock_file { getattr open read
+    write };
+allow wlsctx_app_t unconfined_dbusd_t:unix_stream_socket { accept
+    connectto getattr read write setsockopt };
+allow unconfined_dbusd_t wlsctx_app_t:unix_stream_socket { accept
+    getattr read write };
+allow wlsctx_app_t unconfined_dbusd_t:dbus send_msg;
+allow unconfined_dbusd_t wlsctx_app_t:dbus send_msg;
+allow wlsctx_app_t unconfined_t:dbus send_msg;
+allow unconfined_t wlsctx_app_t:dbus send_msg;
 allow wlsctx_app_t session_dbusd_t:unix_stream_socket { accept
     connectto getattr read write };
 allow session_dbusd_t wlsctx_app_t:unix_stream_socket { accept getattr
