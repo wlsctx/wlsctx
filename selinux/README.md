@@ -186,26 +186,36 @@ line), all the hard-won details:
 
 ## Install (needs root — the user does this)
 
-Two equivalent routes. Both install the policy rules; they differ in
-how the binary's file context lands. **Route A (one command, file
-context in the module) is the simplest; route B (pure CIL) is for
-those who want no `.pp` at all.**
+All routes install the policy rules; they differ in how the binary's
+file context lands. **Route A (pure CIL with the file context embedded
+in the module — one command, cleanest) is the default; B and C are
+fallbacks.**
 
-**A — the `.pp` with the colon-form file contexts (one command):**
+**A — the CIL with the file context embedded (one command):**
 
 ```sh
-sudo semodule -i build/wlsctx.fcresolved.pp
+sudo semodule -i build/wlsctx.cil
 sudo restorecon -v /usr/local/bin/wlsctx     # confined mode (see above)
 ```
 
-`wlsctx.fcresolved.pp` = the policy package plus the **colon-form**
-file contexts from `wlsctx.fc.resolved`
-(`/usr/local/bin/wlsctx` and `/usr/bin/wlsctx` → `wlsctx_exec_t:s0`).
-Colon form survives the 3.11 `.pp`→CIL store conversion; the
-`gen_context(…)` form in `wlsctx.fc` does not (the store writer
-serializes the unresolved `gen_context` placeholder verbatim into CIL
-and the reader rejects it — LESSONS #25). The file context is
-registered *in the module*, so `semodule -r wlsctx` removes it too.
+`build/wlsctx.cil` = the `checkmodule -C` rules **plus** the two
+`(filecon …)` statements from `wlsctx.filecon.cil`
+(`/usr/local/bin/wlsctx` and `/usr/bin/wlsctx` →
+`system_u:object_r:wlsctx_exec_t:s0`). On 3.11 the store reads file
+contexts straight out of the module CIL (it calls
+`cil_filecons_to_string` after compiling and writes them to the
+policy's `file_contexts` — `libsemanage/src/direct_api.c`), so the CIL
+carries the whole install. The file context is *in the module*, so
+`semodule -r wlsctx` removes it too. The format is byte-for-byte what
+`semodule export` emits (`(filecon "PATH" file (USER ROLE TYPE
+((LOW) (HIGH))))`).
+
+**B — the `.pp` with colon-form file contexts (fallback, one command):**
+
+`sudo semodule -i build/wlsctx.fcresolved.pp` — the `.pp` plus the
+colon-form `wlsctx.fc.resolved`. Colon form survives the 3.11
+`.pp`→CIL store conversion; the `gen_context(…)` form in `wlsctx.fc`
+does not (LESSONS #25).
 
 **B — pure CIL for the rules + `semanage fcontext` for the label:**
 

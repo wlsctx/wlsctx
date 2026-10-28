@@ -15,10 +15,19 @@ checkmodule -m -M -o build/wlsctx.p wlsctx.te
 # CIL rendering (see README.md "Build"): checkpolicy 3.11 can *write*
 # CIL; the CIL *reader* it relies on lives in libsepol (the library
 # semodule links), so `semodule -i build/wlsctx.cil` is a valid install
-# path on this toolchain (LESSONS #25). The `.cil` carries the rules
-# only (no `-f` below) — it has no file contexts; the label lands
-# separately (README "Install", route B).
+# path on this toolchain (LESSONS #25). The rules are written by
+# checkmodule (`-C`); the file contexts are appended from
+# wlsctx.filecon.cil (CIL `filecon` statements — the 3.11 store reads
+# them straight out of the module CIL, so this one file is the whole
+# install: `semodule -i build/wlsctx.cil`, README "Install" route A).
 checkmodule -m -M -C -o build/wlsctx.cil wlsctx.te
+# Append only the (filecon ...) statements: this libsepol CIL lexer has no
+# `#`/`;` comment rule (a leading # is a symbol char, not a comment), so the
+# human-readable header stays in the source file and is dropped from the
+# built .cil.
+if [ -f wlsctx.filecon.cil ]; then
+    grep -E '^\(filecon ' wlsctx.filecon.cil >> build/wlsctx.cil
+fi
 #
 # .pp packages. `semanage_package`'s filecon context survives the
 # 3.11 `.pp`→CIL store conversion only in *colon form*; the standard
