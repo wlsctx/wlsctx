@@ -762,18 +762,24 @@ audited as a write).
       probe is the inventory the module must at least match — the
       `container_runtime_t` rules are the template for the runtime
       side, and the app side can stay minimal. **Decision #38
-      (2026-10-28):** the module stays custom (reusing
+      (2026-10-28, amended):** the module stays custom (reusing
       `container_runtime_exec_t` rejected: it would leave the app in
       the more-privileged runtime domain, the label is third-party
-      owned, and losing it degrades silently). It will be written in
-      `.te` source → **`semodule -i wlsctx.pp`** to install (the
-      user hoped for a CIL-only install, but that was verified
-      impossible on this toolchain: `semodule`/`semanage` accept only
-      binary module packages, checkpolicy 3.11 can *write* CIL
-      (`-C`) but has no CIL *reader* — the old CIL parser was never
-      merged upstream — and `cil2ff`/`ff2cil` aren't installed.
-      `build.sh` still emits `wlsctx.cil` as a reference
-      rendering). `wlsctx_t` is based on the probe's AVC inventory
+      owned, and losing it degrades silently). It is written in `.te`
+      source and installs as **`semodule -i wlsctx.cil`** — the CIL
+      *is* the install path on this toolchain (Fedora 45,
+      policycoreutils 3.11): the CIL reader lives in libsepol (the
+      same library `semodule` links), not in the checkpolicy CLI, so
+      a bare `(type …)`/`(allow …)`/`(typeattributeset …)` file with
+      no `(module …)` header installs directly — proven by install.
+      The earlier "CIL impossible" note was wrong (it tested the
+      checkpolicy binary, which has no CIL input mode); see
+      LESSONS #24-25. The `.pp` (checkmodule + semodule_package)
+      remains the classic fallback, but its file contexts break the
+      3.11 `.pp`→CIL store conversion (the writer serializes the
+      `gen_context` placeholder verbatim), so the file context lands
+      via `semanage fcontext -a -f wlsctx.fc` at install time.
+      `wlsctx_t` is based on the probe's AVC inventory
       (the deduped denials plus the three userspace-audit rules
       `audit2allow` could not see), trimmed of crun-only
       permissions; the probe's `mounton`-on-file and the

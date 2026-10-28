@@ -149,12 +149,13 @@ separates containers (`cNNN,cMMM`). Mechanics:
 ./build.sh        # → build/wlsctx.p, build/wlsctx.pp, build/wlsctx.cil
 ```
 
-`wlsctx.cil` is a *reference rendering* only: checkpolicy 3.11 can
-write CIL (`-C`) but the toolchain has no CIL reader — `semodule`
-and `semanage` take only binary module packages, and the old CIL
-parser was never merged into upstream checkpolicy (verified against
-the 3.11 sources, 2026-10-28). So the install path stays
-`.te` → `checkmodule` → `semodule -i wlsctx.pp`.
+`wlsctx.cil` is the **primary install artifact**: `semodule -i` on
+this toolchain reads CIL directly (libsemanage → libsepol's CIL
+reader; the checkpolicy CLI itself has no CIL input mode — that was
+the earlier dead end, see LESSONS #24). Install:
+`sudo semodule -i build/wlsctx.cil`. The `.pp` (checkmodule +
+semodule_package) remains as the classic alternative; the `.te`
+stays the source of truth either way.
 
 The build needs only the installed `checkmodule` (from the
 `checkpolicy` package) and `semodule_package` (policycoreutils).
@@ -182,12 +183,25 @@ line), all the hard-won details:
 ## Install (needs root — the user does this)
 
 ```sh
-sudo semodule -i build/wlsctx.pp        # registers module + file contexts
-sudo restorecon -v /usr/local/bin/wlsctx # confined mode (see above)
+sudo semodule -i build/wlsctx.cil          # policy rules (pure CIL)
+sudo semanage fcontext -a -f wlsctx.fc     # file context for the binary
+sudo restorecon -v /usr/local/bin/wlsctx   # confined mode (see above)
 ```
 
-Remove with `sudo semodule -r wlsctx`. The module package is
-self-contained (no dependency on the container-era CIL blocks,
+The `.cil` carries no file contexts (the `build.sh` CIL step passes
+no `-f`), so the file context lands via `semanage fcontext` — that
+path parses the standard `gen_context(...)` form fine; what breaks
+on 3.11 is the *store* writer, which serializes a `.pp` filecon's
+unresolved `gen_context` placeholder verbatim into CIL and the
+reader then rejects it (LESSONS #25). So: pure CIL for the rules,
+`semanage fcontext` for the label — not the bundled `.pp`.
+(If you do want the `.pp`: `build/wlsctx.nofc.pp` is the policy-only
+package, and `wlsctx.fc.resolved` is the colon-form filecontext file
+that survives the store conversion.)
+
+Remove with `sudo semodule -r wlsctx`
+(and `sudo semanage fcontext -d /usr/local/bin/wlsctx`). The module
+is self-contained (no dependency on the container-era CIL blocks,
 deleted in the plan v2 rework).
 
 ## Tuning loop (once it is installed)

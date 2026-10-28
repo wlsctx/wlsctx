@@ -11,8 +11,13 @@ set -eu
 cd "$(dirname "$0")"
 mkdir -p build
 checkmodule -m -M -o build/wlsctx.p wlsctx.te
-# Reference CIL rendering (checkpolicy 3.11 can *write* CIL but not
-# *read* it — see README.md; not an install path).
+# CIL rendering — the *install path* on policycoreutils 3.11+:
+# libsepol's CIL reader (in the same library semodule uses) accepts
+# plain CIL files, so `semodule -i build/wlsctx.cil` installs this
+# module with no checkmodule/semodule_package round-trip (see
+# README.md and LESSONS.md). Note the .cil carries no file contexts
+# (this build passes no -f); the filecon lands via
+# `semanage fcontext -a -f wlsctx.fc` at install time.
 checkmodule -m -M -C -o build/wlsctx.cil wlsctx.te
 if [ -f wlsctx.fc ]; then
     semodule_package -o build/wlsctx.pp -m build/wlsctx.p -f wlsctx.fc
