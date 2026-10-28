@@ -5,7 +5,7 @@ require {
     type unconfined_t;
     type bin_t;
     type user_home_t;
-    type user_cache_t;
+    type cache_home_t;
     type lib_t;
     type usr_t;
     type xserver_t;
@@ -18,7 +18,6 @@ require {
     type ptmx_t;
     type devtty_t;
     type dri_device_t;
-    type session_dbusd_t;
     type unconfined_dbusd_t;
     type session_dbusd_tmp_t;
     type proc_t;
@@ -32,17 +31,24 @@ require {
     class filesystem { mount remount unmount transition };
     class dir { create getattr open search read write add_name remove_name rmdir mounton setattr };
     # mounton is also checked on *file* objects (bind-mounting over a
-    # file, e.g. the fresh-/dev node builds): the kernel has it in the
-    # file common set, but checkmodule's class table does not — the
-    # module requires it explicitly.
+    # file, e.g. the fresh-/dev node builds); it is part of the file
+    # common set, but the module requires it explicitly so the module
+    # compiles even if the base policy trims it.
     class file { append create getattr map open read write unlink execute mounton };
     class chr_file { open read write getattr ioctl };
     class sock_file { create getattr open read write unlink };
-    class unix_stream_socket { accept bind connectto create getattr read write setsockopt };
-    class unix_dgram_socket { ioctl sendto };
-    class tcp_socket { create getattr name_bind connect read write setsockopt };
-    class udp_socket { create getattr name_bind connect read write setsockopt };
-    class node { name_bind recvfrom sendto tcp_recv tcp_send udp_recv udp_send };
+    # Socket options are named getopt/setopt in the policy's socket
+    # common set (there is no "setsockopt" permission in the live
+    # policy's class table — the CIL installer resolves every
+    # (class, permission) pair against the live policy and rejects
+    # unknown names; see LESSONS.md).
+    class unix_stream_socket { accept bind connectto create getattr read write getopt setopt };
+    class tcp_socket { create getattr name_bind connect read write getopt setopt };
+    class udp_socket { create getattr name_bind connect read write getopt setopt };
+    # The policy's node class carries only the network-permission set
+    # (no name_bind — port-binding checks land on the socket classes'
+    # name_bind from the socket common, which we grant below).
+    class node { recvfrom sendto tcp_recv tcp_send udp_recv udp_send };
     class dbus { send_msg acquire_svc };
     class system { start };
 }
@@ -184,18 +190,22 @@ allow wlsctx_t user_tmp_t:dir { create getattr open search read write
 allow wlsctx_t user_tmp_t:file { create append getattr open read write unlink };
 allow wlsctx_t user_tmp_t:sock_file { create getattr open read write unlink };
 allow wlsctx_t user_tmp_t:unix_stream_socket { bind connectto accept
-    create getattr read write setsockopt };
+    create getattr read write getopt setopt };
 allow wlsctx_t wlsctx_t:unix_stream_socket { getattr read write };
 
 # --- broker: session-bus client (direct notify path; the
 #     fire-and-forget notify-send child is covered by wlsctx_app_t) ---
 # On this box the session bus is dbus-broker running as
 # unconfined_dbusd_t, and /run/user/<uid>/bus is labeled
-# session_dbusd_tmp_t (permissive probe, 2026-10-28); the
-# session_dbusd_t rules below cover the classic sd-dbus variant.
+# session_dbusd_tmp_t (permissive probe, 2026-10-28). There is
+# deliberately no session_dbusd_t rule set: that type does not exist
+# in the Fedora 45 policy, and the CIL installer resolves require
+# members against the *live* policy (checkmodule does not) — an
+# absent symbol fails the install. Re-add the classic sd-dbus rules
+# only if you target a distro whose session bus is still sd-dbus.
 allow wlsctx_t session_dbusd_tmp_t:sock_file { getattr open read write };
 allow wlsctx_t unconfined_dbusd_t:unix_stream_socket { accept connectto
-    getattr read write setsockopt };
+    getattr read write getopt setopt };
 allow unconfined_dbusd_t wlsctx_t:unix_stream_socket { accept getattr
     read write };
 allow wlsctx_t unconfined_dbusd_t:dbus { send_msg acquire_svc };
@@ -203,12 +213,6 @@ allow unconfined_dbusd_t wlsctx_t:dbus send_msg;
 # the notify recipient (and any other unconfined peer)
 allow wlsctx_t unconfined_t:dbus send_msg;
 allow unconfined_t wlsctx_t:dbus send_msg;
-allow wlsctx_t session_dbusd_t:unix_stream_socket { accept connectto
-    getattr read write };
-allow session_dbusd_t wlsctx_t:unix_stream_socket { accept getattr
-    read write };
-allow wlsctx_t session_dbusd_t:dbus { send_msg acquire_svc };
-allow session_dbusd_t wlsctx_t:dbus send_msg;
 
 # --- sidecar spawns (xdg-dbus-proxy; Xwayland via the transition
 #     above) ---
@@ -252,37 +256,29 @@ allow wlsctx_app_t tmpfs_t:file { append create getattr map open read
     write unlink };
 
 # --- session bus (dbus_session_bus_client, inlined) ---
-# dbus-broker (unconfined_dbusd_t) variant, per the probe; the
-# session_dbusd_t rules below cover the classic sd-dbus variant.
+# dbus-broker (unconfined_dbusd_t) variant, per the probe; no
+# classic sd-dbus (session_dbusd_t) variant — see the broker section
+# above for why.
 allow wlsctx_app_t session_dbusd_tmp_t:sock_file { getattr open read
     write };
 allow wlsctx_app_t unconfined_dbusd_t:unix_stream_socket { accept
-    connectto getattr read write setsockopt };
+    connectto getattr read write getopt setopt };
 allow unconfined_dbusd_t wlsctx_app_t:unix_stream_socket { accept
     getattr read write };
 allow wlsctx_app_t unconfined_dbusd_t:dbus send_msg;
 allow unconfined_dbusd_t wlsctx_app_t:dbus send_msg;
 allow wlsctx_app_t unconfined_t:dbus send_msg;
 allow unconfined_t wlsctx_app_t:dbus send_msg;
-allow wlsctx_app_t session_dbusd_t:unix_stream_socket { accept
-    connectto getattr read write };
-allow session_dbusd_t wlsctx_app_t:unix_stream_socket { accept getattr
-    read write };
-allow wlsctx_app_t session_dbusd_t:unix_dgram_socket ioctl;
-allow session_dbusd_t wlsctx_app_t:unix_dgram_socket sendto;
-allow wlsctx_app_t session_dbusd_t:dbus { send_msg acquire_svc };
-allow session_dbusd_t wlsctx_app_t:dbus send_msg;
-allow wlsctx_app_t session_dbusd_t:process { noatsecure rlimitinh siginh };
 
 # --- network: fresh netns with only loopback up (node_t =
 #     127.0.0.1); sockets carry the app's own type (default
 #     sockcreate) ---
-allow wlsctx_app_t node_t:node { name_bind recvfrom sendto tcp_recv
+allow wlsctx_app_t node_t:node { recvfrom sendto tcp_recv
     tcp_send udp_recv udp_send };
 allow wlsctx_app_t wlsctx_app_t:tcp_socket { create getattr name_bind
-    connect read write setsockopt };
+    connect read write getopt setopt };
 allow wlsctx_app_t wlsctx_app_t:udp_socket { create getattr name_bind
-    connect read write setsockopt };
+    connect read write getopt setopt };
 
 # --- /dev nodes the app sees (the §3.3 bind set) ---
 allow wlsctx_app_t { null_device_t urandom_device_t ptmx_t
@@ -300,10 +296,12 @@ allow wlsctx_app_t etc_t:dir { getattr open search read };
 allow wlsctx_app_t etc_t:file { getattr open read };
 
 # --- home / cache / config (real-uid user data; files the app
-#     creates in its own home come out user_home_t) ---
-allow wlsctx_app_t { user_home_t user_cache_t }:dir { getattr open
+#     creates in its own home come out user_home_t). On Fedora 45
+#     the home cache dir is cache_home_t (there is no user_cache_t
+#     in the live policy).
+allow wlsctx_app_t { user_home_t cache_home_t }:dir { getattr open
     search read write create add_name remove_name };
-allow wlsctx_app_t { user_home_t user_cache_t }:file { append create
+allow wlsctx_app_t { user_home_t cache_home_t }:file { append create
     getattr map open read write unlink };
 
 # --- system binaries and shared libraries (exec + dlopen) ---
