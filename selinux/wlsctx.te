@@ -124,8 +124,11 @@ type_transition wlsctx_t { bin_t user_home_t }:file wlsctx_app_t;
 # in the app domain; this is what keeps the whole app tree confined.
 allow wlsctx_app_t { bin_t user_home_t lib_t usr_t }:process { noatsecure rlimitinh siginh };
 
-# the xwayland satellite → real X server domain
-allow wlsctx_t xserver_t:process transition;
+# the xwayland satellite → real X server domain. The
+# dyntransition is the MCS narrowing: the satellite setexecfilecon's
+# to xserver_t with the instance's category (phase 8.2), which
+# overrides the type_transition below.
+allow wlsctx_t xserver_t:process { transition dyntransition };
 type_transition wlsctx_t xserver_exec_t:file xserver_t;
 allow wlsctx_t xserver_exec_t:file { getattr open read execute map };
 
@@ -138,11 +141,15 @@ allow wlsctx_t wlsctx_exec_t:file { getattr open read execute map };
 # supervisor domain (wlsctx_t): S→A→B pipeline + sidecars
 # ------------------------------------------------------------------
 
-# same-domain fork/supervise (S→A, A→B, sidecar children)
+# same-domain fork/supervise (S→A, A→B, sidecar children). The
+# dyntransition is the MCS self-narrowing: the exec context is
+# written to the *same* type with a narrower range (setexecfilecon
+# → wlsctx_t, phase 8.2) — both for the one-time startup re-exec
+# and for `re_exec` preserving the range across a SIGHUP rebuild.
 allow wlsctx_t wlsctx_t:process { fork getattr signal sigkill sigstop
     getsched getsession getrlimit setpgid setcurrent setexec
     setfscreate setkeycreate setsockcreate noatsecure rlimitinh
-    siginh sigchld };
+    siginh sigchld dyntransition };
 
 # the supervisor waits on / signals the app (S-side supervisor loop)
 allow wlsctx_t wlsctx_app_t:process { getattr signal sigkill };

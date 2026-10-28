@@ -111,20 +111,35 @@ app-id+instance-id), so an instance's files in the per-instance dir
 unwritable by another instance's category, the same way podman
 separates containers (`cNNN,cMMM`). Mechanics:
 
-- at startup, if the process label is `wlsctx_t` (confined) the
-  supervisor narrows its own range to `s0-s0:cN` via
-  setexecfilecon + a one-time self re-exec (`/proc/self/exe`,
-  `dyntransition` on `wlsctx_t` — see the module); every child it
-  forks (A, the sidecars) inherits the range, and objects they
-  create (the instance dir, scratch, sockets) carry `cN`
+- at startup, if the process label is `wlsctx_t` (confined) each
+  process narrows its own range to `s0-s0:cN` via setexecfilecon
+  (`/proc/self/attr/exec`) + a one-time self re-exec of
+  `/proc/self/exe` (the self-`dyntransition` on `wlsctx_t` — see
+  the module): the `run` supervisor before it creates the instance
+  dir/sockets, and the standalone proxy/satellites before they
+  bind their sockets. The narrowing happens **before** any
+  binding/creation, so the post-re-exec pass starts clean and the
+  sockets carry `cN`. Every forked child (A, the sidecars)
+  inherits the range, and objects created with no explicit
+  fscreate context take the creator's range — the instance dir,
+  scratch and sockets carry `cN` for free
 - B carries the range into the app exec via setexecfilecon
-  (`wlsctx_app_t:s0-s0:cN`, `dyntransition`); the Xwayland satellite
-  does the same for its `xserver_t` exec, so the X socket and MIT
-  auth file it creates in the instance dir carry `cN`
+  (`wlsctx_app_t:s0-s0:cN`); the Xwayland satellite does the same
+  for its `xserver_t` exec, and the dbus-proxy satellite for its
+  `wlsctx_app_t` exec, so the X socket, MIT auth file and bus
+  socket they create in the instance dir carry `cN`
+- the broker never narrows: it is shared by all instances and its
+  sockets stay plain `s0`, which every `cN` can still reach
 - s0 (no category) labels stay reachable both ways: the instance
   can read plain host files (its range covers s0) and plain
   processes can read it only if their range covers `cN` — the
   reverse is the isolation
+- SIGHUP re-execs (`--listen` rebuild) preserve the range via an
+  exec-context write (skipping any pending explicit context, so
+  the startup narrowing is never clobbered)
+- a failed exec-context write (category outside the user's range,
+  missing `dyntransition`) degrades to a run **without** MCS:
+  logged, the run continues
 - in unconfined mode (module uninstalled / binary not relabeled)
   the mechanism is off: labels have no category to carry
 
