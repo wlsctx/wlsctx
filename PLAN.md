@@ -774,11 +774,18 @@ audited as a write).
       no `(module …)` header installs directly — proven by install.
       The earlier "CIL impossible" note was wrong (it tested the
       checkpolicy binary, which has no CIL input mode); see
-      LESSONS #24-25. The `.pp` (checkmodule + semodule_package)
-      remains the classic fallback, but its file contexts break the
-      3.11 `.pp`→CIL store conversion (the writer serializes the
-      `gen_context` placeholder verbatim), so the file context lands
-      via `semanage fcontext -a -f wlsctx.fc` at install time.
+      LESSONS #24-25. The `.pp` (checkmodule + semodule_package) is
+      the *simpler* full install path: it carries the file context
+      in the module (removed again by `semodule -r`), and a colon-form
+      `.fc` (`wlsctx.fc.resolved`) survives the 3.11 `.pp`→CIL store
+      conversion that the `gen_context(…)` form in `wlsctx.fc` does
+      not (the writer serializes the placeholder verbatim) — so
+      `semodule -i build/wlsctx.fcresolved.pp` installs rules +
+      file context in one command. The no-`.pp` route is
+      `semodule -i build/wlsctx.cil` for the rules plus per-record
+      `semanage fcontext -a -t wlsctx_exec_t -f f -s system_u -r s0
+      <path>` for the label (a local customization, kept apart from
+      the module).
       `wlsctx_t` is based on the probe's AVC inventory
       (the deduped denials plus the three userspace-audit rules
       `audit2allow` could not see), trimmed of crun-only

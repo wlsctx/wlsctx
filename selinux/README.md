@@ -146,16 +146,20 @@ separates containers (`cNNN,cMMM`). Mechanics:
 ## Build
 
 ```sh
-./build.sh        # → build/wlsctx.p, build/wlsctx.pp, build/wlsctx.cil
+./build.sh
+# → build/wlsctx.p (compiled), build/wlsctx.cil (rules, CIL),
+#   build/wlsctx.pp (gen_context fc — classic, breaks on 3.11),
+#   build/wlsctx.fcresolved.pp (colon-form fc — 3.11-safe one-command),
+#   build/wlsctx.nofc.pp (policy only)
 ```
 
-`wlsctx.cil` is the **primary install artifact**: `semodule -i` on
-this toolchain reads CIL directly (libsemanage → libsepol's CIL
-reader; the checkpolicy CLI itself has no CIL input mode — that was
-the earlier dead end, see LESSONS #24). Install:
-`sudo semodule -i build/wlsctx.cil`. The `.pp` (checkmodule +
-semodule_package) remains as the classic alternative; the `.te`
-stays the source of truth either way.
+Install: see the **Install** section below — either the colon-form
+`.pp` (one command, rules + file context) or pure CIL for the rules
+plus a `semanage fcontext` record for the label. The `wlsctx.cil`
+*is* a valid rules install path on this toolchain (the CIL reader is
+in libsepol, the library `semodule` links — the checkpolicy CLI
+itself has no CIL input mode, which was the earlier dead end;
+LESSONS #24-25). The `.te` stays the source of truth either way.
 
 The build needs only the installed `checkmodule` (from the
 `checkpolicy` package) and `semodule_package` (policycoreutils).
@@ -182,27 +186,59 @@ line), all the hard-won details:
 
 ## Install (needs root — the user does this)
 
+Two equivalent routes. Both install the policy rules; they differ in
+how the binary's file context lands. **Route A (one command, file
+context in the module) is the simplest; route B (pure CIL) is for
+those who want no `.pp` at all.**
+
+**A — the `.pp` with the colon-form file contexts (one command):**
+
 ```sh
-sudo semodule -i build/wlsctx.cil          # policy rules (pure CIL)
-sudo semanage fcontext -a -f wlsctx.fc     # file context for the binary
-sudo restorecon -v /usr/local/bin/wlsctx   # confined mode (see above)
+sudo semodule -i build/wlsctx.fcresolved.pp
+sudo restorecon -v /usr/local/bin/wlsctx     # confined mode (see above)
+```
+
+`wlsctx.fcresolved.pp` = the policy package plus the **colon-form**
+file contexts from `wlsctx.fc.resolved`
+(`/usr/local/bin/wlsctx` and `/usr/bin/wlsctx` → `wlsctx_exec_t:s0`).
+Colon form survives the 3.11 `.pp`→CIL store conversion; the
+`gen_context(…)` form in `wlsctx.fc` does not (the store writer
+serializes the unresolved `gen_context` placeholder verbatim into CIL
+and the reader rejects it — LESSONS #25). The file context is
+registered *in the module*, so `semodule -r wlsctx` removes it too.
+
+**B — pure CIL for the rules + `semanage fcontext` for the label:**
+
+```sh
+sudo semodule -i build/wlsctx.cil
+sudo semanage fcontext -a -t wlsctx_exec_t -f f -s system_u -r s0 /usr/local/bin/wlsctx
+sudo semanage fcontext -a -t wlsctx_exec_t -f f -s system_u -r s0 /usr/bin/wlsctx
+sudo restorecon -v /usr/local/bin/wlsctx
 ```
 
 The `.cil` carries no file contexts (the `build.sh` CIL step passes
-no `-f`), so the file context lands via `semanage fcontext` — that
-path parses the standard `gen_context(...)` form fine; what breaks
-on 3.11 is the *store* writer, which serializes a `.pp` filecon's
-unresolved `gen_context` placeholder verbatim into CIL and the
-reader then rejects it (LESSONS #25). So: pure CIL for the rules,
-`semanage fcontext` for the label — not the bundled `.pp`.
-(If you do want the `.pp`: `build/wlsctx.nofc.pp` is the policy-only
-package, and `wlsctx.fc.resolved` is the colon-form filecontext file
-that survives the store conversion.)
+no `-f`), so the label is a separate `semanage fcontext` record — a
+*local customization* stored apart from the module (it persists when
+the module is removed, so clean it up separately, below).
+(`semanage fcontext` takes per-record `-t/-f/-r/-s` flags and a
+path; it does **not** read a `.fc` file.)
 
-Remove with `sudo semodule -r wlsctx`
-(and `sudo semanage fcontext -d /usr/local/bin/wlsctx`). The module
-is self-contained (no dependency on the container-era CIL blocks,
-deleted in the plan v2 rework).
+Either way, `restorecon` (or `chcon -t wlsctx_exec_t`) is what
+actually relabels the installed binary so the transition fires —
+`semodule -i` / `semanage fcontext` only *register* the context, they
+do not relabel existing files.
+
+**Remove:**
+
+```sh
+sudo semodule -r wlsctx                     # route A: file context goes with the module
+# route B additionally:
+sudo semanage fcontext -d -t wlsctx_exec_t -f f /usr/local/bin/wlsctx
+sudo semanage fcontext -d -t wlsctx_exec_t -f f /usr/bin/wlsctx
+```
+
+The module is self-contained (no dependency on the container-era CIL
+blocks, deleted in the plan v2 rework).
 
 ## Tuning loop (once it is installed)
 
@@ -213,5 +249,8 @@ deleted in the plan v2 rework).
 3. Narrow: `sudo audit2allow -a` (or `-i` per line) → review every
    rule it proposes, port the ones that make sense into `wlsctx.te`
    as explicit rules (no blanket `files_unconfined_type` grants),
-   rebuild, `sudo semodule -r wlsctx && sudo semodule -i build/wlsctx.pp`.
+   rebuild (`./build.sh`), reinstall — route A's one-liner
+   `sudo semodule -r wlsctx && sudo semodule -i build/wlsctx.fcresolved.pp`
+   (or the pure-CIL route B: `semodule -i build/wlsctx.cil`, leaving
+   the existing `semanage fcontext` record in place).
 4. When the denials stop, the rule set is the trimmed policy.
