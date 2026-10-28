@@ -15,8 +15,10 @@ system (installing needs root).
   `wlsctx_exec_t`. Covers: rootfs mounts (fresh tmpfs / devpts /
   proc, self-bind of `/`, profile binds), the per-instance cgroup,
   the per-instance runtime dir and its sockets (wayland, X, bus,
-  broker), the session bus (broker), spawning `xdg-dbus-proxy` and
-  Xwayland, and the `/proc/self/exe` re-exec (SIGHUP rebuild).
+  broker), the session bus (broker — the `unconfined_dbusd_t`
+  dbus-broker variant on this box, and the classic `session_dbusd_t`
+  one), spawning `xdg-dbus-proxy` and Xwayland, and the
+  `/proc/self/exe` re-exec (SIGHUP rebuild).
 - `wlsctx_app_t` — sandboxed-app domain. B execs the app while in
   `wlsctx_t`; the app (and its subprocesses) land here via the
   `bin_t`/`user_home_t` transition. The rule set is a "confined user
@@ -100,11 +102,44 @@ If an app binary carries a type other than `bin_t`/`user_home_t`
 (check with `ls -lZ <app>`), add it to the `type_transition
 wlsctx_t { ... }` line in `wlsctx.te` and rebuild.
 
+## Per-instance MCS (cross-instance isolation)
+
+In confined mode, each app instance gets its own MCS category
+within the user's `s0-s0:c0.c1023` range (a stable hash of
+app-id+instance-id), so an instance's files in the per-instance dir
+— and everything it creates, e.g. in its home — are unreadable and
+unwritable by another instance's category, the same way podman
+separates containers (`cNNN,cMMM`). Mechanics:
+
+- at startup, if the process label is `wlsctx_t` (confined) the
+  supervisor narrows its own range to `s0-s0:cN` via
+  setexecfilecon + a one-time self re-exec (`/proc/self/exe`,
+  `dyntransition` on `wlsctx_t` — see the module); every child it
+  forks (A, the sidecars) inherits the range, and objects they
+  create (the instance dir, scratch, sockets) carry `cN`
+- B carries the range into the app exec via setexecfilecon
+  (`wlsctx_app_t:s0-s0:cN`, `dyntransition`); the Xwayland satellite
+  does the same for its `xserver_t` exec, so the X socket and MIT
+  auth file it creates in the instance dir carry `cN`
+- s0 (no category) labels stay reachable both ways: the instance
+  can read plain host files (its range covers s0) and plain
+  processes can read it only if their range covers `cN` — the
+  reverse is the isolation
+- in unconfined mode (module uninstalled / binary not relabeled)
+  the mechanism is off: labels have no category to carry
+
 ## Build
 
 ```sh
-./build.sh        # → build/wlsctx.p, build/wlsctx.pp
+./build.sh        # → build/wlsctx.p, build/wlsctx.pp, build/wlsctx.cil
 ```
+
+`wlsctx.cil` is a *reference rendering* only: checkpolicy 3.11 can
+write CIL (`-C`) but the toolchain has no CIL reader — `semodule`
+and `semanage` take only binary module packages, and the old CIL
+parser was never merged into upstream checkpolicy (verified against
+the 3.11 sources, 2026-10-28). So the install path stays
+`.te` → `checkmodule` → `semodule -i wlsctx.pp`.
 
 The build needs only the installed `checkmodule` (from the
 `checkpolicy` package) and `semodule_package` (policycoreutils).

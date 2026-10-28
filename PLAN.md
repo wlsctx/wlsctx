@@ -761,8 +761,31 @@ audited as a write).
       module remains the cleaner shape (dedicated types), and this
       probe is the inventory the module must at least match — the
       `container_runtime_t` rules are the template for the runtime
-      side, and the app side can stay minimal. The CIL conversion of
-      the module (user preference) is still pending.)
+      side, and the app side can stay minimal. **Decision #38
+      (2026-10-28):** the module stays custom (reusing
+      `container_runtime_exec_t` rejected: it would leave the app in
+      the more-privileged runtime domain, the label is third-party
+      owned, and losing it degrades silently). It will be written in
+      `.te` source → **`semodule -i wlsctx.pp`** to install (the
+      user hoped for a CIL-only install, but that was verified
+      impossible on this toolchain: `semodule`/`semanage` accept only
+      binary module packages, checkpolicy 3.11 can *write* CIL
+      (`-C`) but has no CIL *reader* — the old CIL parser was never
+      merged upstream — and `cil2ff`/`ff2cil` aren't installed.
+      `build.sh` still emits `wlsctx.cil` as a reference
+      rendering). `wlsctx_t` is based on the probe's AVC inventory
+      (the deduped denials plus the three userspace-audit rules
+      `audit2allow` could not see), trimmed of crun-only
+      permissions; the probe's `mounton`-on-file and the
+      `unconfined_dbusd_t`/`session_dbusd_tmp_t` session-bus types
+      fed the rework (commit e5a407a). `wlsctx_app_t` stays minimal
+      on stock object types. **Per-instance MCS categories** (one
+      category per instance within the user's `s0-s0:c0.c1023`
+      range, a stable hash of app-id+instance-id; S narrows its own
+      range by a `wlsctx_t` self-dyntransition re-exec, B and the
+      Xwayland satellite carry it into their execs via
+      setexecfilecon) give cross-instance file isolation the same
+      way podman does it (its `cNNN,cMMM`).)
 - [x] 8.3 Update `AGENTS.md` (layout, facts): the header points at
       the rewritten README; the `systemd/user/` entry notes the
       broker units are the only units left (proxies are manual runs,
