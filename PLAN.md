@@ -725,7 +725,44 @@ audited as a write).
       `EACCES`).
 - [~] 8.2 New SELinux policy (first pass, 2026-10-24: `selinux/` module built — `wlsctx_t` + `wlsctx_app_t` + the xserver_t fix; not yet installed, that needs root; trimming via audit2allow is the rest). The local module confining the
       supervisor and app domains; the bind-mounted `/dev` nodes keep
-      canonical labels, which makes this tractable — see §3.3)
+      canonical labels, which makes this tractable — see §3.3).
+      **container-selinux probe (2026-10-28, permissive):** wlsctx run
+      under podman's own types. Structural finding: podman uses
+      *two* domains — `container_runtime_t` (crun, labeled
+      `container_runtime_exec_t`, the `unconfined_t` exec transition)
+      and `container_t` (the payload, reached by *setexecfilecon* —
+      the policy has no file `type_transition` into `container_t` at
+      all, only `process { dyntransition transition }` from
+      `unconfined_domain_type`). Results: the S/A runtime side ran as
+      `container_runtime_t` with **zero genuine denials** (rootfs
+      rebuild mountons, fresh `/dev`+`/proc` mounts, cgroup scope
+      create/enter/teardown, session-bus connect+send, the
+      `system:start` of the transient scope, the instance dir, the
+      scratch dir) — crun does exactly this work, so the shipped
+      rules cover it; the full chain (the `--proxy` relay as
+      `container_runtime_t` tagging into live sway, a sandboxed
+      `wayland-info` through it) also ran clean. The app side ran as
+      `container_t` with zero denials: the rebuilt rootfs' fresh
+      `seclabel` tmpfs (`/tmp`/`/dev`/`/run`) inherit the creator's
+      exec label → `container_file_t` for free (podman's own
+      rootfs mechanism), and `/proc` reads, loopback net (UDP/TCP/
+      DNS) and `/dev/urandom` are covered; `/dev/dri` via
+      `container_use_dri_devices=on`. A live `podman run alpine`
+      control logged zero denials too. What `container_t` alone does
+      *not* cover is precisely the runtime-side set (the gaps above)
+      — one item (`cgroup_t:dir` write/create) is
+      `container_manage_cgroup`-gated (off by default; podman never
+      needs it from the container side). Only artifacts: the dev
+      binary in `$HOME` (`user_home_t`, a filecontext matter, not a
+      gap) and `nnp_transition→mount_t` from the probe script execing
+      `mount(8)` in-sandbox. Consequence: a zero-new-policy option
+      exists (label the production binary `container_runtime_exec_t`;
+      the whole tree then runs `container_runtime_t`); the custom
+      module remains the cleaner shape (dedicated types), and this
+      probe is the inventory the module must at least match — the
+      `container_runtime_t` rules are the template for the runtime
+      side, and the app side can stay minimal. The CIL conversion of
+      the module (user preference) is still pending.)
 - [x] 8.3 Update `AGENTS.md` (layout, facts): the header points at
       the rewritten README; the `systemd/user/` entry notes the
       broker units are the only units left (proxies are manual runs,

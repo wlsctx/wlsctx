@@ -36,6 +36,40 @@ system (installing needs root).
   client connecting) produced no denials, so the stock rule set may
   already cover them; the tuning loop decides whether to keep them.
 
+## How it relates to container-selinux (the podman types)
+
+A permissive-mode probe (2026-10-28) ran wlsctx under the types
+podman itself uses, before installing this module. The stock policy
+splits podman into **two** domains: `container_runtime_t` (crun —
+labeled `container_runtime_exec_t`, the `unconfined_t` exec
+transition) and `container_t` (the payload, reached by
+setexecfilecon — there is no file `type_transition` into
+`container_t` at all). They map onto wlsctx's two sides:
+
+- **The S/A runtime side ≙ `container_runtime_t`**: ran with *zero
+  genuine denials* — the rootfs-rebuild `mounton`s over host dirs,
+  the fresh `/dev`+`/proc` mounts, the cgroup-scope
+  create/enter/teardown, the session-bus connect+send, and the
+  transient-scope `system:start` are all covered (crun does the same
+  work), including the full `--proxy` chain into a live sway. So
+  `wlsctx_t`'s ruleset can borrow the `container_runtime_t` rules as
+  a floor.
+- **The app side ≙ `container_t`**: also zero denials. The rebuilt
+  rootfs' fresh `seclabel` tmpfs (`/tmp`/`/dev`/`/run`) inherit the
+  mounting process' exec label → `container_file_t` for free
+  (podman's own rootfs mechanism); `/proc` reads, loopback net and
+  `/dev/urandom` are covered; `/dev/dri` via
+  `container_use_dri_devices` (on by default). So `wlsctx_app_t` can
+  stay minimal.
+- What `container_t` *alone* does not cover is exactly the
+  runtime-side set (it would need, e.g., the session-bus and
+  `system:start` allows, plus `container_manage_cgroup` turned on
+  for the cgroup-scope writes) — which is why running the whole
+  tree as `container_runtime_t` works out of the box while a
+  `container_t`-only wlsctx would not. The module (dedicated
+  `wlsctx_t`/`wlsctx_app_t`) remains the cleaner confinement; the
+  probe is the inventory it must at least match.
+
 ## Operating modes
 
 **Unconfined mode (default, no action needed).** The binary keeps
