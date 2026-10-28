@@ -59,6 +59,16 @@ phase 8.1).**
     CLOEXEC fds), so even a SIGKILL'd sidecar tears the proxy down
     (decision #36); sync-byte readiness gate; public `bus.sock` in
     the per-instance runtime dir, owner-only
+- `mcs.rs` — per-instance MCS categories (phase 8.2, confined mode
+    only): one category `cN` of the user's `s0-s0:c0.c1023` range
+    per (app-id, instance-id) via a stable FNV-1a hash; the
+    one-time self-narrowing re-exec (`self_reexec_with_category`,
+    loop-guarded by range equality, degrading to no-MCS on a failed
+    exec-context write), the `setexecfilecon` carry-over into the
+    app/`xserver_t` execs (`set_exec_context`), and the range-
+    preserving re-exec (`preserve_range`, which skips a pending
+    explicit exec context so the narrowing is never clobbered).
+    No-op when the current label is not `wlsctx_t`
 - `xwayland.rs` — the Phase-7.3 Xwayland satellite: owns an
     `Xwayland` child (same signalfd + pidfd `poll(2)` shape;
     TERM→2s→KILL teardown); the sidecar creates, binds **and
@@ -161,6 +171,22 @@ phase 8.1).**
   is what the app's env uses: `run --wayland` sets `XDG_RUNTIME_DIR`
   to it and `WAYLAND_DISPLAY` to the socket name (default
   `wayland-1`).
+- **Per-instance MCS (phase 8.2, `src/mcs.rs`):** in confined mode
+  (module installed + binary relabeled to `wlsctx_exec_t`), each
+  instance runs in its own category `cN` of the user's
+  `s0-s0:c0.c1023` range (a stable hash of app-id+instance-id — the
+  `run` pipeline and the standalone proxy/satellites must agree,
+  which they do by construction). Every wlsctx process narrows its
+  own range by a `wlsctx_t` self-`dyntransition` re-exec **before**
+  it creates or binds anything; B and the Xwayland/dbus-proxy
+  satellites carry the range into their execs via setexecfilecon
+  (`wlsctx_app_t`/`xserver_t`); the broker never narrows (shared,
+  stays `s0`). Objects created with no explicit fscreate context
+  take the creator's range, so the instance dir and everything the
+  app writes carry `cN` — cross-instance isolation works the same
+  way as podman's `cNNN,cMMM`. SIGHUP re-execs preserve the range.
+  In unconfined mode every mechanism is a no-op. Details:
+  `selinux/README.md` (the "Per-instance MCS" section), decision #38.
 - GPU: `/dev/dri/renderD*` nodes are bind-mounted into the sandbox's
   `/dev`; the user must be in the `render` group. `/dev` nodes are
   **bind-mounted, not mknod'd**, so future SELinux modules can use the

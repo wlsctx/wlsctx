@@ -723,7 +723,7 @@ audited as a write).
       residual-risk list (network egress, copy-out, GPU, own-home
       exposure, portal attribution, multi-process deadlock, FOOT/PTY
       `EACCES`).
-- [~] 8.2 New SELinux policy (first pass, 2026-10-24: `selinux/` module built — `wlsctx_t` + `wlsctx_app_t` + the xserver_t fix; not yet installed, that needs root; trimming via audit2allow is the rest). The local module confining the
+- [~] 8.2 New SELinux policy (2026-10-28: first-pass module built — `wlsctx_t` + `wlsctx_app_t` + the xserver_t fix; reworked from the permissive probe's AVC inventory (tmp_t, the dbus-broker session-bus types, `system:start`, `mounton`-on-file, `dyntransition`); the per-instance MCS mechanics are wired (`src/mcs.rs`: the self-narrowing re-exec in the supervisor/proxy/satellites, the `wlsctx_app_t`/`xserver_t` setexecfilecon carry-overs, the range-preserving re-exec); not yet installed — that needs root — and the tuning loop (audit2allow against a real confined run) is the rest). The local module confining the
       supervisor and app domains; the bind-mounted `/dev` nodes keep
       canonical labels, which makes this tractable — see §3.3).
       **container-selinux probe (2026-10-28, permissive):** wlsctx run
@@ -779,13 +779,25 @@ audited as a write).
       permissions; the probe's `mounton`-on-file and the
       `unconfined_dbusd_t`/`session_dbusd_tmp_t` session-bus types
       fed the rework (commit e5a407a). `wlsctx_app_t` stays minimal
-      on stock object types. **Per-instance MCS categories** (one
-      category per instance within the user's `s0-s0:c0.c1023`
-      range, a stable hash of app-id+instance-id; S narrows its own
-      range by a `wlsctx_t` self-dyntransition re-exec, B and the
-      Xwayland satellite carry it into their execs via
-      setexecfilecon) give cross-instance file isolation the same
-      way podman does it (its `cNNN,cMMM`).)
+      on stock object types. **Per-instance MCS categories**
+      (2026-10-28, `src/mcs.rs`): one category `cN` per instance
+      within the user's `s0-s0:c0.c1023` range — a stable FNV-1a
+      hash of app-id+instance-id, so the `run` pipeline and the
+      standalone proxy/satellites agree. Every confined wlsctx
+      process (the `run` supervisor, the standalone proxy, both
+      satellites) narrows its own range via a `wlsctx_t`
+      self-`dyntransition` re-exec **before** it creates or binds
+      anything (the loop guard is range equality; a failed
+      exec-context write degrades to a run without MCS); B and the
+      Xwayland/dbus-proxy satellites carry the range into their
+      execs via setexecfilecon (`wlsctx_app_t`/`xserver_t` — the
+      module gained `dyntransition` on both transitions), and the
+      broker stays `s0` (shared by all instances). SIGHUP
+      re-execs preserve the range (an exec-context write that skips
+      a pending explicit context). Cross-instance file isolation
+      works the same way podman does it (its `cNNN,cMMM`): files
+      carry the creator's range, and the kernel's MLS check keeps a
+      different category out.)
 - [x] 8.3 Update `AGENTS.md` (layout, facts): the header points at
       the rewritten README; the `systemd/user/` entry notes the
       broker units are the only units left (proxies are manual runs,
