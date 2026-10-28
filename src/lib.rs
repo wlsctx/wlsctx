@@ -13,8 +13,12 @@
 //! * [`broker`] — the host-side consent broker (`broker` / `decide`):
 //!   answers the relay's `clipboard-read` prompts and fires the
 //!   `clipboard-write` notifications.
+//! * [`mcs`] — per-instance MCS categories (phase 8.2): each app
+//!   instance runs in its own SELinux category so its files are
+//!   unreachable from other instances (confined mode only).
 
 pub mod broker;
 pub mod dbus_proxy;
+pub mod mcs;
 pub mod proxy;
 pub mod xwayland;

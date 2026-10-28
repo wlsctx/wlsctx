@@ -1444,6 +1444,14 @@ pub fn re_exec() -> io::Result<()> {
         })
         .collect::<io::Result<_>>()?;
     let exe = c"/proc/self/exe";
+    // Phase 8.2 (MCS): without an exec context this execve would
+    // reset the process's range to the file context's s0, silently
+    // dropping the instance's category (and with it the isolation);
+    // preserve it across the exec (no-op in unconfined mode, and it
+    // skips a context a pending MCS narrowing already wrote).
+    crate::mcs::preserve_range().map_err(|e| {
+        io::Error::other(format!("preserving the MCS range across the re-exec: {e}"))
+    })?;
     nix::unistd::execve(exe, &argv, &env)
         .map_err(|e| io::Error::other(format!("re-exec (execve of /proc/self/exe) failed: {e}")))?;
     // execve returns Result<Infallible>: success never returns.

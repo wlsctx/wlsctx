@@ -17,7 +17,7 @@ pub(crate) mod supervise;
 pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
-use log::{debug, error};
+use log::{debug, error, warn};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, fork};
 use std::ffi::OsString;
@@ -90,6 +90,14 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     if command.is_empty() {
         return Err(anyhow!("no command to run"));
     }
+    // Phase 8.2 (MCS): confine before S touches anything — the exec
+    // context narrows our range to the instance's category and
+    // re-execs us once (a no-op in unconfined mode and on the
+    // post-re-exec invocation, which is the loop guard). Everything
+    // S creates from here (instance dir, scratch, tagged socket,
+    // sidecars) inherits the category. Must run before the signal
+    // block below: execve resets the mask.
+    wlsctx::mcs::self_reexec_with_category(&config.app_id, &config.instance_id)?;
     namespaces::validate_id(&config.app_id, "--app-id")?;
     namespaces::validate_id(&config.instance_id, "--instance-id")?;
     let hostname = namespaces::hostname_for(&config.app_id, &config.instance_id);
@@ -862,6 +870,13 @@ fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, Strin
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     cmd.envs(env);
+    // Phase 8.2 (MCS): carry the instance's category into the app's
+    // exec (the module's `wlsctx_t → wlsctx_app_t` dyntransition).
+    // A write failure just drops the range (logged); the exec goes
+    // on.
+    if let Err(e) = wlsctx::mcs::set_exec_context("wlsctx_app_t") {
+        warn!("{e}");
+    }
     // On success exec(3) never returns: this process is replaced. The
     // returned error means the exec itself failed (bad path,
     // permissions, …).

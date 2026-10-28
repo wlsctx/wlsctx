@@ -150,6 +150,12 @@ fn policy_from_cli(names: Vec<String>) -> wlsctx::proxy::Policy {
 /// hold the reference pipe, park until killed. Apps connect to the
 /// tagged socket directly.
 fn run_tag_and_park(args: &WaylandArgs) -> Result<()> {
+    // Phase 8.2 (MCS): narrow our range to the instance's category
+    // before binding the socket, so the tagged socket carries the
+    // category and the post-re-exec pass (loop guard: range already
+    // narrowed) rebinds it instead of racing a live one. No-op in
+    // unconfined mode.
+    wlsctx::mcs::self_reexec_with_category(&args.app_id, &args.instance_id)?;
     let (app_id, instance_id, listener) = obtain_listener(args)?;
 
     if log_enabled!(Level::Info)
@@ -200,6 +206,11 @@ fn run_tag_and_park(args: &WaylandArgs) -> Result<()> {
 /// connection to the public socket is relayed to the compositor
 /// through a fresh security-context connection to it.
 fn run_proxy(args: &WaylandArgs) -> Result<()> {
+    // Phase 8.2 (MCS): narrow our range to the instance's category
+    // before binding the public/tagged listeners, so both sockets
+    // carry the category (and the post-re-exec pass rebinds them
+    // cleanly — see `run_tag_and_park`). No-op in unconfined mode.
+    wlsctx::mcs::self_reexec_with_category(&args.app_id, &args.instance_id)?;
     let (app_id, instance_id, public) = obtain_listener(args)?;
     // validate() guarantees Some in proxy mode.
     let tagged_path = resolve_listener_path(args.tagged_socket.as_deref().unwrap())?;

@@ -72,7 +72,7 @@
 //!
 //! [`Xwayland`]: https://www.x.org/archive/commission/xace/docs/xwayland/
 
-use std::io;
+use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
@@ -479,6 +479,12 @@ pub fn run(cfg: Config) -> Result<()> {
     validate_id(&cfg.instance_id, "--instance-id")?;
     validate_display(cfg.display)?;
 
+    // Phase 8.2 (MCS): narrow our range to the instance's category
+    // before creating anything (instance dir, X socket), so they
+    // carry the category and the post-re-exec pass starts clean.
+    // No-op in unconfined mode.
+    crate::mcs::self_reexec_with_category(&cfg.app_id, &cfg.instance_id)?;
+
     let sigfd = setup_signalfd()?;
 
     let dir = host_instance_dir(&cfg.app_id, &cfg.instance_id);
@@ -548,6 +554,14 @@ pub fn run(cfg: Config) -> Result<()> {
             // lifetime fd of its own).
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // Phase 8.2 (MCS): carry the instance's category into the
+            // xserver_t exec, so the X socket and MIT auth file the
+            // server creates in the instance dir carry it. A write
+            // failure just drops the range (noted on stderr; the
+            // child's stderr is inherited); the exec goes on.
+            if let Err(e) = crate::mcs::set_exec_context("xserver_t") {
+                let _ = writeln!(io::stderr(), "wlsctx: {e}");
             }
             let rc = libc::dup2(listen_fd, LISTEN_FD);
             if rc < 0 {
