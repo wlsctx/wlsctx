@@ -1,266 +1,176 @@
-# wlsctx SELinux module (phase 8.2, first pass)
+# wlsctx SELinux module (phase 8.2)
 
-A local SELinux module that confining the wlsctx stack to its own
+A local SELinux module that confines the wlsctx stack to its own
 domains. It is a **first pass**: the rule sets are deliberately a
 little broader than the minimum and meant to be trimmed with audit
-denials (below). It has not yet been exercised on an enforcing
-system (installing needs root).
+denials (below). The first confined run is verified: types, the
+`xserver_t` fix, and the per-instance MCS narrowing all work (a run
+showed `wlsctx_t:s0-s0:cN` / `wlsctx_app_t:s0-s0:cN` live, 2026-10-29).
+
+## The policy is defined directly in CIL
+
+`wlsctx.cil` is the single source of truth — and the install artifact.
+There is no `.te`, no `checkmodule`, no build step: on this toolchain
+(Fedora 45, policycoreutils 3.11) `semodule -i` accepts CIL directly
+(the CIL reader is in libsepol, the library `semodule` links — the
+checkpolicy CLI has no CIL input mode; LESSONS #24-25), and the 3.11
+module store is CIL-based even for classic `.pp` installs, so the CIL
+is the format everything ends up in anyway. Two reasons the old
+`.te` → `checkmodule -C` path was dropped:
+
+- **checkmodule -C writes `typetransition` with the raw `.te` class**
+  (`file`) and does not normalize it to `process` the way the classic
+  checkpolicy pipeline does — the kernel's bprm transition lookup only
+  consumes `process`-class avtab entries, so the transition silently
+  never fires. Hand-written CIL spells `process` explicitly
+  (LESSONS #27).
+- a hand-written CIL lets us state the two things the classic
+  pipeline gets wrong for a user-spawned type: the **role
+  association** (`(roletype unconfined_r wlsctx_t)` — the process
+  inherits `unconfined_r` from the shell, and a context is only
+  *valid* when the role is associated with the type; without it,
+  `setprocattr` of the exec context fails `EINVAL` and the MCS
+  narrowing silently degrades, LESSONS #28) and the **`mcs_constrained_type`
+  membership** that gives the categories their teeth.
+
+CIL has no comment syntax (the libsepol lexer's comment rule is
+empty), so the file is bare statements only.
 
 ## What it defines
 
 - `wlsctx_exec_t` — file type for the installed `wlsctx` binary
-  (`/usr/local/bin/wlsctx` or `/usr/bin/wlsctx`, see `wlsctx.fc`).
+  (`/usr/local/bin/wlsctx` or `/usr/bin/wlsctx`; the two `(filecon …)`
+  statements at the bottom of the CIL, installed in the same command
+  as the rules).
 - `wlsctx_t` — supervisor / S→A→B pipeline / sidecar domain. Reached
   by transition from `unconfined_t` when the binary carries
   `wlsctx_exec_t`. Covers: rootfs mounts (fresh tmpfs / devpts /
   proc, self-bind of `/`, profile binds), the per-instance cgroup,
   the per-instance runtime dir and its sockets (wayland, X, bus,
-  broker), the session bus (broker — the `unconfined_dbusd_t`
-  dbus-broker variant on this box, and the classic `session_dbusd_t`
-  one), spawning `xdg-dbus-proxy` and Xwayland, and the
-  `/proc/self/exe` re-exec (SIGHUP rebuild).
+  broker), the session bus (dbus-broker as `unconfined_dbusd_t` on
+  this box), spawning `xdg-dbus-proxy` and Xwayland, the
+  namespace/userns/cap setup, and the `/proc/self/exe` re-execs.
 - `wlsctx_app_t` — sandboxed-app domain. B execs the app while in
   `wlsctx_t`; the app (and its subprocesses) land here via the
-  `bin_t`/`user_home_t` transition. The rule set is a "confined user
-  app": instance dir, /tmp, /dev nodes (the §3.3 genfs labels),
-  /proc /sys /cgroup /etc, home/cache, system libs (`lib_t` dlopen),
-  session bus, loopback network.
-- `xserver_t` — the stock policy on this machine **does** transition
-  `unconfined_t → xserver_t` on `xserver_exec_t` (verified live
-  2026-10-27; an earlier `sesearch` note to the contrary was wrong —
-  see LESSONS #20), so Xwayland has run in the real X-server domain
-  all along. The module adds the `wlsctx_t → xserver_t` transition
-  (needed in confined mode, where the satellite is `wlsctx_t` and
-  the stock transition does not fire) plus `xserver_t` access to
-  the X socket and MIT auth file the satellite places in the
-  per-instance dir (`user_tmp_t`) — precautionary: the Phase 7.3
-  e2e (Xwayland as `xserver_t` creating exactly those files, a real
-  client connecting) produced no denials, so the stock rule set may
-  already cover them; the tuning loop decides whether to keep them.
+  `bin_t`/`user_home_t` transition. "Confined user app": instance
+  dir, /tmp, /dev nodes, /proc /sys /cgroup /etc, home/cache,
+  system libs, session bus, loopback network.
+- `xserver_t` — stock policy transitions `unconfined_t → xserver_t`
+  on `xserver_exec_t`, but in confined mode the satellite is
+  `wlsctx_t`, so the module adds the `wlsctx_t → xserver_t`
+  transition plus `xserver_t` access to the X socket and MIT auth
+  file it places in the per-instance dir (precautionary — the Phase
+  7.3 e2e logged no denials; the tuning loop decides).
 
-## How it relates to container-selinux (the podman types)
-
-A permissive-mode probe (2026-10-28) ran wlsctx under the types
-podman itself uses, before installing this module. The stock policy
-splits podman into **two** domains: `container_runtime_t` (crun —
-labeled `container_runtime_exec_t`, the `unconfined_t` exec
-transition) and `container_t` (the payload, reached by
-setexecfilecon — there is no file `type_transition` into
-`container_t` at all). They map onto wlsctx's two sides:
-
-- **The S/A runtime side ≙ `container_runtime_t`**: ran with *zero
-  genuine denials* — the rootfs-rebuild `mounton`s over host dirs,
-  the fresh `/dev`+`/proc` mounts, the cgroup-scope
-  create/enter/teardown, the session-bus connect+send, and the
-  transient-scope `system:start` are all covered (crun does the same
-  work), including the full `--proxy` chain into a live sway. So
-  `wlsctx_t`'s ruleset can borrow the `container_runtime_t` rules as
-  a floor.
-- **The app side ≙ `container_t`**: also zero denials. The rebuilt
-  rootfs' fresh `seclabel` tmpfs (`/tmp`/`/dev`/`/run`) inherit the
-  mounting process' exec label → `container_file_t` for free
-  (podman's own rootfs mechanism); `/proc` reads, loopback net and
-  `/dev/urandom` are covered; `/dev/dri` via
-  `container_use_dri_devices` (on by default). So `wlsctx_app_t` can
-  stay minimal.
-- What `container_t` *alone* does not cover is exactly the
-  runtime-side set (it would need, e.g., the session-bus and
-  `system:start` allows, plus `container_manage_cgroup` turned on
-  for the cgroup-scope writes) — which is why running the whole
-  tree as `container_runtime_t` works out of the box while a
-  `container_t`-only wlsctx would not. The module (dedicated
-  `wlsctx_t`/`wlsctx_app_t`) remains the cleaner confinement; the
-  probe is the inventory it must at least match.
+**Roles:** both `wlsctx_t` and `wlsctx_app_t` are associated with
+`unconfined_r` (the spawner's role, as container-selinux does with
+`container_t`/`container_runtime_t`) *and* with `object_r` (so their
+file labels are valid). The `unconfined_r` association is load-bearing
+— see above.
 
 ## Operating modes
 
-**Unconfined mode (default, no action needed).** The binary keeps
-its usual label (`user_home_t` in the dev tree, `bin_t` if installed
-without relabeling). Nothing transitions; the whole stack —
-supervisor, sidecars, app — runs `unconfined_t` exactly as before,
-and the module is inert except for the `xserver_t` rules.
+**Unconfined mode (default, no action needed).** The binary keeps its
+usual label; nothing transitions; the whole stack runs `unconfined_t`
+exactly as before, and the module is inert.
 
 **Confined mode.** Relabel the installed binary so the transition
 fires:
 
 ```sh
 sudo restorecon -v /usr/local/bin/wlsctx   # picks up wlsctx_exec_t
-# or explicitly:
-sudo chcon -t wlsctx_exec_t /usr/local/bin/wlsctx
 ```
 
 After that every `wlsctx` subcommand runs as `wlsctx_t`; the
-sandboxed app and the `bin_t` helpers it or the pipeline exec
-(notify-send, xdg-dbus-proxy, app subprocesses) run as
+sandboxed app and the helpers it or the pipeline exec run as
 `wlsctx_app_t`; Xwayland runs as `xserver_t`. The hard boundary of
 the sandbox is still the namespaces + nono landlock/seccomp
-(decision #27) — the module is a second, compositable layer, and
-the S-side supervisor can still see and signal the app across the
-domain boundary.
+(decision #27) — the module is a second, compositable layer.
 
 If an app binary carries a type other than `bin_t`/`user_home_t`
-(check with `ls -lZ <app>`), add it to the `type_transition
-wlsctx_t { ... }` line in `wlsctx.te` and rebuild.
+(check with `ls -lZ <app>`), add a `(typetransition wlsctx_t TYPE
+process wlsctx_app_t)` line (plus the matching process/file allows)
+to `wlsctx.cil` and reinstall.
 
 ## Per-instance MCS (cross-instance isolation)
 
 In confined mode, each app instance gets its own MCS category
-within the user's `s0-s0:c0.c1023` range (a stable hash of
-app-id+instance-id), so an instance's files in the per-instance dir
-— and everything it creates, e.g. in its home — are unreadable and
-unwritable by another instance's category, the same way podman
-separates containers (`cNNN,cMMM`). Mechanics:
+within the user's `s0-s0:c0.c1023` range (a stable FNV-1a hash of
+app-id + instance-id), so an instance's files in the per-instance
+dir — and everything it creates, e.g. in its home — are unreadable
+and unwritable by another instance's category, the same way podman
+separates containers. The isolation is **real, not cosmetic**,
+because both types are members of the base policy's
+`mcs_constrained_type` attribute: the kernel's MLS constrain then
+applies (a file/dir/process object's level must be dominated by the
+subject's range *high*), which admits `s0` (plain host files —
+dominated by any `cN`) and blocks cross-category access. The socket
+and `fd` classes are **not** in the base constrain list, so the
+broker's session sockets and inherited fds keep working across
+categories.
+
+Mechanics (`src/mcs.rs`):
 
 - at startup, if the process label is `wlsctx_t` (confined) each
-  process narrows its own range to `s0-s0:cN` via setexecfilecon
-  (`/proc/self/attr/exec`) + a one-time self re-exec of
-  `/proc/self/exe` (the self-`dyntransition` on `wlsctx_t` — see
-  the module): the `run` supervisor before it creates the instance
-  dir/sockets, and the standalone proxy/satellites before they
-  bind their sockets. The narrowing happens **before** any
-  binding/creation, so the post-re-exec pass starts clean and the
-  sockets carry `cN`. Every forked child (A, the sidecars)
-  inherits the range, and objects created with no explicit
-  fscreate context take the creator's range — the instance dir,
-  scratch and sockets carry `cN` for free
+  process narrows its own range to `s0-s0:cN` by writing
+  `/proc/self/attr/exec` and re-exec'ing `/proc/self/exe` (the
+  self-`dyntransition` on `wlsctx_t`). The kernel accepts the write
+  only if the target context is *valid* (role associated with type —
+  the `unconfined_r` roletypes above) and the new range is a subset
+  of the current one (the base `context (contains)` constrain).
+  The narrowing happens **before** any binding/creation, so the
+  instance dir, scratch and sockets carry `cN` for free (objects
+  take the creator's range), and every forked child inherits it.
 - B carries the range into the app exec via setexecfilecon
-  (`wlsctx_app_t:s0-s0:cN`); the Xwayland satellite does the same
-  for its `xserver_t` exec, and the dbus-proxy satellite for its
-  `wlsctx_app_t` exec, so the X socket, MIT auth file and bus
-  socket they create in the instance dir carry `cN`
-- the broker never narrows: it is shared by all instances and its
-  sockets stay plain `s0`, which every `cN` can still reach
-- s0 (no category) labels stay reachable both ways: the instance
-  can read plain host files (its range covers s0) and plain
-  processes can read it only if their range covers `cN` — the
-  reverse is the isolation
-- SIGHUP re-execs (`--listen` rebuild) preserve the range via an
-  exec-context write (skipping any pending explicit context, so
-  the startup narrowing is never clobbered)
-- a failed exec-context write (category outside the user's range,
-  missing `dyntransition`) degrades to a run **without** MCS:
-  logged, the run continues
-- in unconfined mode (module uninstalled / binary not relabeled)
-  the mechanism is off: labels have no category to carry
+  (`wlsctx_app_t:s0-s0:cN`); the Xwayland and dbus-proxy satellites
+  do the same for their execs.
+- the broker does not narrow (shared by all instances). **Pending:**
+  it currently keeps the full spawn range, which on a fresh machine
+  would label a broker-created session dir at that full range — a
+  `cN` proxy could then not `add_name` inside it. The planned fix
+  narrows the broker to *single-level `s0`* (a subset of any spawn
+  range) before it creates anything: it still reads every `cN`
+  object and its own files stay plain `s0`.
+- SIGHUP re-execs preserve the range (an exec-context write that
+  skips any pending explicit context, so the startup narrowing is
+  never clobbered).
+- a failed exec-context write degrades to a run **without** MCS:
+  logged, the run continues. In unconfined mode the mechanism is off
+  (labels have no category to carry).
 
-## Build
+## Install (needs root)
 
-```sh
-./build.sh
-# → build/wlsctx.p (compiled), build/wlsctx.cil (rules, CIL),
-#   build/wlsctx.pp (gen_context fc — classic, breaks on 3.11),
-#   build/wlsctx.fcresolved.pp (colon-form fc — 3.11-safe one-command),
-#   build/wlsctx.nofc.pp (policy only)
-```
-
-Install: see the **Install** section below — either the colon-form
-`.pp` (one command, rules + file context) or pure CIL for the rules
-plus a `semanage fcontext` record for the label. The `wlsctx.cil`
-*is* a valid rules install path on this toolchain (the CIL reader is
-in libsepol, the library `semodule` links — the checkpolicy CLI
-itself has no CIL input mode, which was the earlier dead end;
-LESSONS #24-25). The `.te` stays the source of truth either way.
-
-The build needs only the installed `checkmodule` (from the
-`checkpolicy` package) and `semodule_package` (policycoreutils).
-Notes on checkpolicy 3.11 (the Fedora 45 "SELinux userspace 3.11"
-line), all the hard-won details:
-
-- **module compilation is `checkmodule`, not `checkpolicy`**
-  (`checkpolicy` builds the whole base policy; its `-c` flag takes a
-  *version number*, not a policy.conf file).
-- the module file must start with `module wlsctx 1.0.0;` and contain
-  a `require { ... }` block — both are hard errors without them.
-- `require` takes **one identifier per `type` line**, and classes
-  with their used permissions in **braces**:
-  `class process { fork signal ... };`.
-- `-M` (MLS/MCS) is needed because this system runs targeted + MCS;
-  the module policy version tops out at 24 (module-store versioning,
-  unrelated to the kernel policy version 35) — just omit `-c`.
-- the output base name must equal the module name
-  (`wlsctx.te` → `wlsctx.p`).
-- base **type attributes** referenced in rules (here: `file_type`
-  for the broad mount grant) are re-declared in the module
-  (`attribute file_type;`) — they merge with the same-named base
-  attribute at load.
-
-## Install (needs root — the user does this)
-
-All routes install the policy rules; they differ in how the binary's
-file context lands. **Route A (pure CIL with the file context embedded
-in the module — one command, cleanest) is the default; B and C are
-fallbacks.**
-
-**A — the CIL with the file context embedded (one command):**
+One command for the rules *and* the file context:
 
 ```sh
-sudo semodule -i build/wlsctx.cil
+sudo semodule -i selinux/wlsctx.cil
 sudo restorecon -v /usr/local/bin/wlsctx     # confined mode (see above)
 ```
 
-`build/wlsctx.cil` = the `checkmodule -C` rules **plus** the two
-`(filecon …)` statements from `wlsctx.filecon.cil`
-(`/usr/local/bin/wlsctx` and `/usr/bin/wlsctx` →
-`system_u:object_r:wlsctx_exec_t:s0`). On 3.11 the store reads file
-contexts straight out of the module CIL (it calls
-`cil_filecons_to_string` after compiling and writes them to the
-policy's `file_contexts` — `libsemanage/src/direct_api.c`), so the CIL
-carries the whole install. The file context is *in the module*, so
-`semodule -r wlsctx` removes it too. The format is byte-for-byte what
-`semodule export` emits (`(filecon "PATH" file (USER ROLE TYPE
-((LOW) (HIGH))))`).
-
-**B — the `.pp` with colon-form file contexts (fallback, one command):**
-
-`sudo semodule -i build/wlsctx.fcresolved.pp` — the `.pp` plus the
-colon-form `wlsctx.fc.resolved`. Colon form survives the 3.11
-`.pp`→CIL store conversion; the `gen_context(…)` form in `wlsctx.fc`
-does not (LESSONS #25).
-
-**B — pure CIL for the rules + `semanage fcontext` for the label:**
-
-```sh
-sudo semodule -i build/wlsctx.cil
-sudo semanage fcontext -a -t wlsctx_exec_t -f f -s system_u -r s0 /usr/local/bin/wlsctx
-sudo semanage fcontext -a -t wlsctx_exec_t -f f -s system_u -r s0 /usr/bin/wlsctx
-sudo restorecon -v /usr/local/bin/wlsctx
-```
-
-The `.cil` carries no file contexts (the `build.sh` CIL step passes
-no `-f`), so the label is a separate `semanage fcontext` record — a
-*local customization* stored apart from the module (it persists when
-the module is removed, so clean it up separately, below).
-(`semanage fcontext` takes per-record `-t/-f/-r/-s` flags and a
-path; it does **not** read a `.fc` file.)
-
-Either way, `restorecon` (or `chcon -t wlsctx_exec_t`) is what
-actually relabels the installed binary so the transition fires —
-`semodule -i` / `semanage fcontext` only *register* the context, they
-do not relabel existing files.
+The CIL carries the two `(filecon …)` statements for the binary
+(`system_u:object_r:wlsctx_exec_t:s0` — the MCS category is a
+*process* label, never a file label). On 3.11 the store reads file
+contexts straight out of the module CIL (libsemanage calls
+`cil_filecons_to_string` after `cil_compile` and writes them to the
+policy's `file_contexts`), so the file context is *in* the module and
+`semodule -r wlsctx` removes it too. `restorecon` (or
+`chcon -t wlsctx_exec_t`) is what actually relabels the installed
+binary — `semodule -i` only registers the context.
 
 **Remove:**
 
 ```sh
-sudo semodule -r wlsctx                     # route A: file context goes with the module
-# route B additionally:
-sudo semanage fcontext -d -t wlsctx_exec_t -f f /usr/local/bin/wlsctx
-sudo semanage fcontext -d -t wlsctx_exec_t -f f /usr/bin/wlsctx
+sudo semodule -r wlsctx
 ```
 
-The module is self-contained (no dependency on the container-era CIL
-blocks, deleted in the plan v2 rework).
-
-## Tuning loop (once it is installed)
+## Tuning loop
 
 1. Use the system normally (run an app, the broker, the xwayland
    satellite).
-2. Harvest denials: `sudo ausearch -m avc -ts recent`
-   (or `sudo cat /var/log/audit/audit.log | grep avc`).
-3. Narrow: `sudo audit2allow -a` (or `-i` per line) → review every
-   rule it proposes, port the ones that make sense into `wlsctx.te`
-   as explicit rules (no blanket `files_unconfined_type` grants),
-   rebuild (`./build.sh`), reinstall — route A's one-liner
-   `sudo semodule -r wlsctx && sudo semodule -i build/wlsctx.fcresolved.pp`
-   (or the pure-CIL route B: `semodule -i build/wlsctx.cil`, leaving
-   the existing `semanage fcontext` record in place).
-4. When the denials stop, the rule set is the trimmed policy.
+2. Harvest denials: `sudo ausearch -m avc -ts recent`.
+3. `sudo audit2allow -C <file>` — since the contexts are valid
+   (roles associated), this now parses every record and proposes
+   rules; review each one and port the ones that make sense into
+   `wlsctx.cil`.
+4. Reinstall (`sudo semodule -r wlsctx && sudo semodule -i
+   selinux/wlsctx.cil`) and re-run.
