@@ -124,19 +124,35 @@ Mechanics (`src/mcs.rs`):
 - B carries the range into the app exec via setexecfilecon
   (`wlsctx_app_t:s0-s0:cN`); the Xwayland and dbus-proxy satellites
   do the same for their execs.
-- the broker does not narrow (shared by all instances). **Pending:**
-  it currently keeps the full spawn range, which on a fresh machine
-  would label a broker-created session dir at that full range — a
-  `cN` proxy could then not `add_name` inside it. The planned fix
-  narrows the broker to *single-level `s0`* (a subset of any spawn
-  range) before it creates anything: it still reads every `cN`
-  object and its own files stay plain `s0`.
+- the broker (shared by all instances) narrows to *single-level
+`s0`* before it binds or creates anything (`mcs::self_reexec_to_s0`,
+the same re-exec, run before the listener is taken). A session dir
+it created at the full spawn range `s0-s0:c0.c1023` would not be
+`add_name`-able by a `cN` proxy (an object's level must be
+dominated by the subject's range high); at `s0` it is. The
+broker's own files stay plain `s0`; it cannot read `cN` objects
+(a `cN` level is not dominated by an `s0` high) — it never needs
+to: it only serves the (unconstrained) broker socket and fires
+the notify.
 - SIGHUP re-execs preserve the range (an exec-context write that
   skips any pending explicit context, so the startup narrowing is
   never clobbered).
 - a failed exec-context write degrades to a run **without** MCS:
   logged, the run continues. In unconfined mode the mechanism is off
   (labels have no category to carry).
+
+**Fresh-machine caveat:** new objects carry their *creator's*
+range (the 3.11 CIL store has no fscreate range rules — LESSONS
+#29), so the session-level dir `$XDG_RUNTIME_DIR/wlsctx` takes
+the range of whichever process creates it *first*. With the
+socket-activated deployment the first instance (at its `cN`)
+typically wins that race, pinning the dir to `cN` — a second
+instance in another category could not then `add_name` its own
+dir, and the `s0` broker could not bind `decision.sock` inside
+it. Pre-create it at `s0` once instead: `runcon
+unconfined_u:unconfined_r:wlsctx_t:s0 mkdir -m 700
+$XDG_RUNTIME_DIR/wlsctx` — or run the broker `--listen` from
+session start, so the broker (at `s0`) creates it.
 
 ## Install (needs root)
 

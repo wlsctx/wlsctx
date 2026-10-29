@@ -179,9 +179,7 @@ phase 8.1).**
   which they do by construction). Every wlsctx process narrows its
   own range by a `wlsctx_t` self-`dyntransition` re-exec **before**
   it creates or binds anything; B and the Xwayland/dbus-proxy
-  satellites carry the range into their execs via setexecfilecon
-  (`wlsctx_app_t`/`xserver_t`); the broker never narrows (shared,
-  stays `s0`). Objects created with no explicit fscreate context
+  satellites carry the range into their execs via setexecfilecon (`wlsctx_app_t`/`xserver_t`); the broker narrows to single-level `s0` (`mcs::self_reexec_to_s0`) so its session-level objects stay reachable from every category. Objects created with no explicit fscreate context
   take the creator's range, so the instance dir and everything the
   app writes carry `cN` — cross-instance isolation works the same
   way as podman's `cNNN,cMMM`. SIGHUP re-execs preserve the range.
