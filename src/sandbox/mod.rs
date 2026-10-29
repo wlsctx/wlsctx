@@ -364,6 +364,22 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         // namespaced (the app is PID 1).
                         mounts::mount_namespaced()?;
                         userns::verify_locked(&creds)?;
+                        // Phase 8.2 (MCS): carry the instance's
+                        // category into the app's exec (the module's
+                        // `wlsctx_t → wlsctx_app_t` dyntransition).
+                        // This must happen *before* `policy::apply`
+                        // below: the openat of `/proc/self/attr/exec`
+                        // would then be trapped by the seccomp-notify
+                        // filter and answered `EACCES` by the
+                        // supervisor (`/proc` is Read-only in the
+                        // capability set), and denied by the Landlock
+                        // floor for the same reason — the write only
+                        // works from a floor-less `wlsctx_t` process,
+                        // like S's. A write failure just drops the
+                        // range (logged); the exec goes on.
+                        if let Err(e) = wlsctx::mcs::set_exec_context("wlsctx_app_t") {
+                            warn!("{e}");
+                        }
                         // Phase 4: build the single capability set that
                         // drives both floors, install the combined
                         // filter first, then the Landlock floor (the
@@ -411,18 +427,26 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 }
                 ForkResult::Parent { child } => {
                     // A is done with the B→A pipe's write end (B holds
-                    // the only writer now). Read the listener's fd
-                    // number B wrote, complete the handoff
-                    // (decision #23) — as B's direct parent, the one
-                    // process Yama `restricted` lets `pidfd_getfd` B,
-                    // extract a copy of B's listener into our own
-                    // table and `SCM_RIGHTS` it to S — and send B the
-                    // verdict (decision #26): this runs while B is
-                    // still pre-exec (blocked in `wait_ack`), so the
-                    // extract cannot race the exec. On failure we
-                    // tell B to die: the Landlock floor B installed
-                    // still holds, and we just reap and propagate B's
-                    // status.
+                    // the only writer now) — close our copy *before*
+                    // blocking on the read below: if B dies before
+                    // writing (any setup failure) its copy is released
+                    // at exit, and with ours closed the read sees EOF
+                    // instead of blocking forever (our copy would
+                    // otherwise be the pipe's last writer, holding the
+                    // read open past B's death — a zombie B releases
+                    // its fds at exit, so only A's copy would remain).
+                    unsafe { libc::close(pw) };
+                    // Read the listener's fd number B wrote, complete
+                    // the handoff (decision #23) — as B's direct
+                    // parent, the one process Yama `restricted` lets
+                    // `pidfd_getfd` B, extract a copy of B's listener
+                    // into our own table and `SCM_RIGHTS` it to S —
+                    // and send B the verdict (decision #26): this
+                    // runs while B is still pre-exec (blocked in
+                    // `wait_ack`), so the extract cannot race the
+                    // exec. On failure we tell B to die: the Landlock
+                    // floor B installed still holds, and we just reap
+                    // and propagate B's status.
                     //
                     // Drop our copy of the verdict read end now that B
                     // has it: B becomes the pipe's only reader, and B
@@ -870,13 +894,6 @@ fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, Strin
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     cmd.envs(env);
-    // Phase 8.2 (MCS): carry the instance's category into the app's
-    // exec (the module's `wlsctx_t → wlsctx_app_t` dyntransition).
-    // A write failure just drops the range (logged); the exec goes
-    // on.
-    if let Err(e) = wlsctx::mcs::set_exec_context("wlsctx_app_t") {
-        warn!("{e}");
-    }
     // On success exec(3) never returns: this process is replaced. The
     // returned error means the exec itself failed (bad path,
     // permissions, …).
