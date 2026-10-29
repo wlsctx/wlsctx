@@ -1,11 +1,15 @@
 # wlsctx SELinux module (phase 8.2)
 
 A local SELinux module that confines the wlsctx stack to its own
-domains. It is a **first pass**: the rule sets are deliberately a
-little broader than the minimum and meant to be trimmed with audit
-denials (below). The first confined run is verified: types, the
-`xserver_t` fix, and the per-instance MCS narrowing all work (a run
-showed `wlsctx_t:s0-s0:cN` / `wlsctx_app_t:s0-s0:cN` live, 2026-10-29).
+domains. The enforcing-mode tuning loop is done (2026-10-29):
+audit2allow against a confined run, iterated until a confined
+`echo`+`cat`+`ls` produced zero denials — the current rule set is
+the loop's output, and any future denials are trimmed the same way
+(below). The confined run is verified: types, the `xserver_t` fix,
+and the per-instance MCS narrowing all work (a run showed
+`wlsctx_t:s0:cN` / `wlsctx_app_t:s0:cN` live — the code writes a
+low==high `s0-s0:cN`, which the kernel reports in canonical
+single-level form; 2026-10-29).
 
 ## The policy is defined directly in CIL
 
@@ -60,7 +64,8 @@ empty), so the file is bare statements only.
   `wlsctx_t`, so the module adds the `wlsctx_t → xserver_t`
   transition plus `xserver_t` access to the X socket and MIT auth
   file it places in the per-instance dir (precautionary — the Phase
-  7.3 e2e logged no denials; the tuning loop decides).
+  7.3 e2e logged no denials in unconfined mode; the satellite has
+  not yet run in enforcing mode).
 
 **Roles:** both `wlsctx_t` and `wlsctx_app_t` are associated with
 `unconfined_r` (the spawner's role, as container-selinux does with
@@ -92,48 +97,81 @@ If an app binary carries a type other than `bin_t`/`user_home_t`
 process wlsctx_app_t)` line (plus the matching process/file allows)
 to `wlsctx.cil` and reinstall.
 
-## Per-instance MCS (cross-instance isolation)
+## Per-instance MCS (process-level isolation)
 
 In confined mode, each app instance gets its own MCS category
 within the user's `s0-s0:c0.c1023` range (a stable FNV-1a hash of
-app-id + instance-id), so an instance's files in the per-instance
-dir — and everything it creates, e.g. in its home — are unreadable
-and unwritable by another instance's category, the same way podman
-separates containers. The isolation is **real, not cosmetic**,
-because both types are members of the base policy's
-`mcs_constrained_type` attribute: the kernel's MLS constrain then
-applies (a file/dir/process object's level must be dominated by the
-subject's range *high*), which admits `s0` (plain host files —
-dominated by any `cN`) and blocks cross-category access. The socket
-and `fd` classes are **not** in the base constrain list, so the
-broker's session sockets and inherited fds keep working across
-categories.
+app-id + instance-id). What that category actually isolates is the
+**process** level, *not* the object level — the two behave
+differently under the live policy's `default_range` rules (LESSONS
+#29):
+
+- **Processes are isolated, per-instance.** A `process` takes its
+  creator's *full* range (the `process` class has *no*
+  `default_range` rule, so `mls_compute_sid` falls through to
+  `AVTAB_CHANGE` → `mls_context_cpy`), so every stage of the S→A→B
+  pipeline, the app, and the satellites run at that instance's
+  `cN`. Both `wlsctx_t` and `wlsctx_app_t` are members of the base
+  `mcs_constrained_type` attribute, so the base mlsconstrain
+  (`h1 dom h2 or t1 != mcs_constrained_type`) applies: a `cN` subject
+  may signal/ptrace/transition only a process whose level it
+  dominates, and a *single* category is incomparable with any other
+  category — `cN` dominates only `cN`. Cross-instance
+  `sigkill`/`sigstop`/`ptrace` are therefore denied (a `cM` process
+  is simply not reachable from a `cN` subject). This is *stronger*
+  than podman's `cNNN,cMMM` two-category model, where a container's
+  level contains a *set* of categories that orders against other
+  sets; here one category dominates only itself. One gap: this
+  kernel's process class splits `signal` into `signull` (kill 0),
+  `sigkill` and `signal`, and the base mlsconstrain constrains all of
+  those **except** `signull` — so a kill -0 (used by
+  `terminate_app`'s liveness probe) is *not* category-scoped (LESSONS
+  #33); it cannot be closed in the module, because libsepol's CIL
+  reader rejects `mlsconstrain` in a module CIL.
+- **Objects are *not* isolated, per-instance.** A `dir`/`file`/
+  `sock_file` created under the user's runtime dir takes the
+  *parent's* low level, not the creator's range (`default_range …
+  target low` → `mls_context_cpy_low(newcontext, tcontext)`), and the
+  parent (`/run/user/<uid>`) is plain `s0`. So the instance dir, the
+  build scratch, and every per-instance socket are all `s0`, and any
+  `cN` (or `s0`) subject dominates `s0` — every instance and the
+  broker may read and write them. There is **no** MCS file/dir
+  separation between instances: *content* isolation comes from the
+  namespaces + landlock rootfs (each sandbox sees only its own
+  instance dir), not from SELinux. The socket and `fd` classes are
+  also **not** in the base constrain list, so the broker's session
+  sockets and inherited fds keep working across categories.
 
 Mechanics (`src/mcs.rs`):
 
 - at startup, if the process label is `wlsctx_t` (confined) each
-  process narrows its own range to `s0-s0:cN` by writing
+  process narrows its own range to the instance's single-level
+  `s0:cN` by writing
   `/proc/self/attr/exec` and re-exec'ing `/proc/self/exe` (the
   self-`dyntransition` on `wlsctx_t`). The kernel accepts the write
   only if the target context is *valid* (role associated with type —
   the `unconfined_r` roletypes above) and the new range is a subset
   of the current one (the base `context (contains)` constrain).
-  The narrowing happens **before** any binding/creation, so the
-  instance dir, scratch and sockets carry `cN` for free (objects
-  take the creator's range), and every forked child inherits it.
+  The narrowing happens **before** any binding/creation, so every
+  forked child inherits `cN` (a process takes the creator's full
+  range); objects created under the `s0` parent stay `s0` (see the
+  object-level note above — `default_range … target low`).
 - B carries the range into the app exec via setexecfilecon
-  (`wlsctx_app_t:s0-s0:cN`); the Xwayland and dbus-proxy satellites
+  (`wlsctx_app_t:s0:cN`); the Xwayland and dbus-proxy satellites
   do the same for their execs.
 - the broker (shared by all instances) narrows to *single-level
 `s0`* before it binds or creates anything (`mcs::self_reexec_to_s0`,
-the same re-exec, run before the listener is taken). A session dir
-it created at the full spawn range `s0-s0:c0.c1023` would not be
-`add_name`-able by a `cN` proxy (an object's level must be
-dominated by the subject's range high); at `s0` it is. The
-broker's own files stay plain `s0`; it cannot read `cN` objects
-(a `cN` level is not dominated by an `s0` high) — it never needs
-to: it only serves the (unconstrained) broker socket and fires
-the notify.
+the same re-exec, run before the listener is taken). The
+session-level objects it serves (the `$XDG_RUNTIME_DIR/wlsctx`
+session dir and `decision.sock`) are `s0` *by construction* (the
+parent's low level, not the creator's range — see the object-level
+note), so they are reachable from every category regardless of
+who creates them first; no pre-creating is needed. The narrowing
+is a *range-hygiene* measure: it keeps the broker's own **subject**
+range minimal (a single `s0` level rather than the full spawn range
+`s0-s0:c0.c1023`), so a compromised broker cannot act as a
+full-range subject or reach another instance's processes (an `s0`
+high does not dominate a `cN`).
 - SIGHUP re-execs preserve the range (an exec-context write that
   skips any pending explicit context, so the startup narrowing is
   never clobbered).
@@ -141,18 +179,16 @@ the notify.
   logged, the run continues. In unconfined mode the mechanism is off
   (labels have no category to carry).
 
-**Fresh-machine caveat:** new objects carry their *creator's*
-range (the 3.11 CIL store has no fscreate range rules — LESSONS
-#29), so the session-level dir `$XDG_RUNTIME_DIR/wlsctx` takes
-the range of whichever process creates it *first*. With the
-socket-activated deployment the first instance (at its `cN`)
-typically wins that race, pinning the dir to `cN` — a second
-instance in another category could not then `add_name` its own
-dir, and the `s0` broker could not bind `decision.sock` inside
-it. Pre-create it at `s0` once instead: `runcon
-unconfined_u:unconfined_r:wlsctx_t:s0 mkdir -m 700
-$XDG_RUNTIME_DIR/wlsctx` — or run the broker `--listen` from
-session start, so the broker (at `s0`) creates it.
+**Session-level objects are always `s0`** (no pre-creating needed):
+the session dir `$XDG_RUNTIME_DIR/wlsctx` and `decision.sock` are
+created under `/run/user/<uid>` (a `s0` parent), so — by
+`default_range … target low` (LESSONS #29) — they take the *parent's*
+low level, `s0`, whoever creates them first. There is no
+creator-range "pinning" race to win: every instance (`cN`) and the
+broker (`s0`) can reach them, because any `cN` dominates plain
+`s0`. (An earlier version of this note assumed objects carry the
+creator's range and recommended pre-creating the dir at `s0`; that
+premise was wrong — the dir is `s0` by construction.)
 
 ## Install (needs root)
 

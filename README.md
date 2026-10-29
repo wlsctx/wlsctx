@@ -525,7 +525,18 @@ reads**: the app can only read selections it put on itself, and every read
 of data copied on the host is dropped (the app sees an empty clipboard) or,
 when the broker is wired, explicitly approved by you first. The host
 session bus is unreachable by default (its socket is not in the rootfs and
-AF_UNIX is Landlock-restricted to the per-instance dir).
+AF_UNIX is Landlock-restricted to the per-instance dir). And — optionally,
+on a host where the local `wlsctx` SELinux module is installed (phase 8.2)
+— a **type-confinement layer**: the whole stack runs `wlsctx_t`
+(supervisor/pipeline/sidecars) and the sandboxed app runs `wlsctx_app_t`,
+each app instance in its own per-instance MCS category `cN`, so the base
+MLS constrain isolates the instances' **processes** from one another (a
+`cN` subject may only signal/ptrace/transition a same-`cN` process —
+*stronger* than podman's two-category `cNNN,cMMM` model) and a
+compromised app is confined to the `wlsctx_app_t` allow-set. Filesystem
+containment itself still comes from the namespaces + landlock rootfs: the
+MCS layer is process-level, not file-level (objects created under the
+`s0` runtime parent stay `s0` — see the residual-risk bullet below).
 
 **What it does NOT protect (residual risk, by design or by necessity):**
 
@@ -573,6 +584,23 @@ AF_UNIX is Landlock-restricted to the per-instance dir).
   namespaces and are isolated from *other* instances, not from each
   other; the supervisor nonetheless services the app's *children* as
   well (decision #32), so a multi-process app does not deadlock.
+- **SELinux MCS is process-level, not file-level.** The per-instance
+  category `cN` isolates the instances' **processes** (a `cN` subject
+  can only reach a same-`cN` process), but the **objects** an instance
+  creates are *not* isolated from other instances by SELinux: under the
+  live policy's `default_range … target low` rule, a `dir`/`file`/
+  `sock_file` created under the `s0` runtime parent takes the
+  *parent's* low level — `s0` — not the creator's `cN`, and any `cN`
+  dominates plain `s0`, so every instance (and the `s0` broker) can
+  read and write them. File/dir separation between instances comes from
+  the namespaces + landlock rootfs (each sandbox sees only its own
+  instance dir), not from SELinux (LESSONS #29). Relatedly, this
+  kernel's process class splits `signal` into `signull` (kill 0),
+  `sigkill` and `signal`, and the base MLS constrain does **not** cover
+  `signull`; a module CIL cannot add one, so the supervisor's kill -0
+  liveness probe is not category-scoped (a `cN` process can kill -0 a
+  `cM` process). The practical impact is minimal — kill -0 only reveals
+  a process's existence, which `/proc` already does (LESSONS #33).
 
 **SSH / git:** do not mount private keys into the sandbox. Use
 `ssh-agent` forwarding instead: keep the agent on the host, run
@@ -609,4 +637,4 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
   (Phase 7.3) are built and run per instance; neither is started by a
   plain `run`, so out of the box the host session bus is simply
   unreachable and there is no in-sandbox X server.
-- **SELinux: first-pass module built, not yet installed (needs root).** The container-era CIL blocks are gone; `selinux/` now ships a local module (`wlsctx`) defining `wlsctx_t` (supervisor/pipeline/sidecars) and `wlsctx_app_t` (the sandboxed app), plus the `xserver_t` rules the reconnaissance found missing. Built with `selinux/build.sh` (it is `checkmodule` that compiles modules, not `checkpolicy` — see there); installing is `sudo semodule -i`. Uninstalled, the stack runs unconfined exactly as before; the module is a second containment layer on top of the namespaces + nono, not a replacement for them.
+- **SELinux: local module built, installed and tuned (enforcing-mode tuning loop done, 2026-10-29).** `selinux/` ships a local module (`wlsctx`) defining `wlsctx_t` (supervisor/pipeline/sidecars) and `wlsctx_app_t` (the sandboxed app), plus the `xserver_t` rules the reconnaissance found missing and the per-instance MCS mechanics (`src/mcs.rs`). The policy is written **directly in CIL** — `selinux/wlsctx.cil` is the single source of truth *and* the install artifact (`sudo semodule -i selinux/wlsctx.cil`, then `sudo restorecon -v /usr/local/bin/wlsctx` for confined mode; no `.te`/`checkmodule`, no `build.sh`). Installed, the stack is confined; the tuning loop (audit2allow against a confined run, iterated until a confined `echo`+`cat`+`ls` produced zero denials) closed the known allow gaps. What the module deliberately does *not* do: **file-level** separation between instances (created objects are `s0`, not `cN` — see the "SELinux MCS is process-level" residual-risk bullet above) and the **`signull` (kill -0)** category gap (unfixable in a module CIL). Uninstalled, the stack runs unconfined exactly as before; the module is a second containment layer on top of the namespaces + nono, not a replacement for them.

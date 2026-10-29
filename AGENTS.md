@@ -177,14 +177,29 @@ phase 8.1).**
   `s0-s0:c0.c1023` range (a stable hash of app-id+instance-id — the
   `run` pipeline and the standalone proxy/satellites must agree,
   which they do by construction). Every wlsctx process narrows its
-  own range by a `wlsctx_t` self-`dyntransition` re-exec **before**
-  it creates or binds anything; B and the Xwayland/dbus-proxy
-  satellites carry the range into their execs via setexecfilecon (`wlsctx_app_t`/`xserver_t`); the broker narrows to single-level `s0` (`mcs::self_reexec_to_s0`) so its session-level objects stay reachable from every category. Objects created with no explicit fscreate context
-  take the creator's range, so the instance dir and everything the
-  app writes carry `cN` — cross-instance isolation works the same
-  way as podman's `cNNN,cMMM`. SIGHUP re-execs preserve the range.
-  In unconfined mode every mechanism is a no-op. Details:
-  `selinux/README.md` (the "Per-instance MCS" section), decision #38.
+  own range to a single-level `s0:cN` by a `wlsctx_t` self-
+  `dyntransition` re-exec **before** it creates or binds anything, so
+  every forked child inherits `cN` (a process takes its creator's
+  full range); B and the Xwayland/dbus-proxy satellites carry the
+  range into their execs via setexecfilecon (`wlsctx_app_t`/
+  `xserver_t`). The isolation is **process-level, not object-level**
+  (LESSONS #29): both types are in the base `mcs_constrained_type`
+  set, so the base mlsconstrain (`h1 dom h2`) lets a `cN` subject
+  signal/ptrace/transition only a *same-`cN`* process (a single
+  category is incomparable with any other — *stronger* than podman's
+  `cNNN,cMMM` model). But `dir`/`file`/`sock_file` created under the
+  `s0` runtime parent take the **parent's** low level (`default_range
+  … target low`), so the instance dir and everything the app writes
+  are `s0` and reachable from every `cN` — file/dir separation comes
+  from the namespaces + landlock rootfs, not SELinux. The broker
+  narrows to single-level `s0` (`mcs::self_reexec_to_s0`) for
+  subject-range hygiene. One known gap: this kernel's `signull`
+  (kill 0) is not in the base mlsconstrain and a module CIL can't add
+  one, so the `terminate_app` kill -0 probe is not category-scoped
+  (LESSONS #33). SIGHUP re-execs preserve the range; a failed
+  narrowing degrades to a no-MCS run. In unconfined mode every
+  mechanism is a no-op. Details: `selinux/README.md` (the
+  "Per-instance MCS" section), decision #38.
 - GPU: `/dev/dri/renderD*` nodes are bind-mounted into the sandbox's
   `/dev`; the user must be in the `render` group. `/dev` nodes are
   **bind-mounted, not mknod'd**, so future SELinux modules can use the
@@ -254,11 +269,14 @@ phase 8.1).**
   LESSONS.md #15/#16.
 - This is a personal WIP repo: the rework is phase-by-phase (PLAN.md),
   each phase committed and working. Phase 5.5 (the Firefox e2e) and
-  7.2 (the `dbus-proxy` sidecar) and 7.3 (the `xwayland` satellite)
-  are done; phase 8.2 landed its first-pass module (`selinux/` — `wlsctx_t`/`wlsctx_app_t`/the xserver_t fix, built with checkmodule, install pending root). Next up: 8.4–8.5 (the
-  integration test suite, the threat-model review), plus the full
-  chain (a sandboxed app through the proxy into sway) and the
-  drag-and-drop audit (6.5.5).
+  7.2 (the `dbus-proxy` sidecar), 7.3 (the `xwayland` satellite),
+  8.4 (the integration test suite) and 8.5 (the threat-model review)
+  are done; phase 8.2 landed the SELinux module (`selinux/` —
+  `wlsctx_t`/`wlsctx_app_t`/the xserver_t fix, written directly in
+  CIL, installed and tuning-looped to zero denials — see the
+  "Per-instance MCS" fact above for what it actually isolates).
+  Next up: the full chain (a sandboxed app through the `--proxy`
+  relay into live sway) and the drag-and-drop audit (6.5.5).
 
 ## Commit conventions
 

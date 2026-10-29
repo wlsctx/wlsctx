@@ -1,12 +1,16 @@
 //! Per-instance MCS categories (confined mode only; phase 8.2).
 //!
 //! Each app instance gets one category `cN` of the user's
-//! `s0-s0:c0.c1023` range (a stable hash of app-id + instance-id),
-//! so files one instance creates (its per-instance dir and contents,
-//! scratch, sockets, and everything the app writes, e.g. in its
-//! home) carry `cN` and are unreadable/unwritable by another
-//! instance's category — the same isolation podman gets from its
-//! `cNNN,cMMM` pairs.
+//! `s0-s0:c0.c1023` range (a stable hash of app-id + instance-id).
+//! The category isolates the instance's **processes**: a `cN`
+//! subject may only signal/ptrace/transition a same-`cN` process
+//! (a single category is incomparable with any other — *stronger*
+//! than podman's `cNNN,cMMM` model). It does **not** isolate the
+//! instance's **objects**: a `dir`/`file`/`sock_file` created under
+//! the `s0` runtime parent takes the *parent's* low level
+//! (`default_range … target low`), so it is `s0`, not `cN`, and any
+//! category may access it — file-level separation is the work of the
+//! namespaces + landlock rootfs, not SELinux (LESSONS #29).
 //!
 //! How the category gets there (see `selinux/README.md`):
 //!
@@ -18,27 +22,26 @@
 //!   equivalent; the module allows the `wlsctx_t` self-
 //!   `dyntransition`) and re-execing `/proc/self/exe` once at
 //!   startup (before it binds or creates anything, so the second
-//!   pass starts clean). Every child it forks inherits the range,
-//!   and objects created with no explicit fscreate context take the
-//!   creator's range — so the instance dir, scratch and sockets
-//!   carry `cN` for free.
+//!   pass starts clean). Every child it forks inherits the range (a
+//!   process takes its creator's full range), so the pipeline and
+//!   satellites all run at `cN`; objects created under the `s0`
+//!   parent stay `s0` (see the header note above).
 //! - **B** writes the exec context `wlsctx_app_t:<current range>`
 //!   before execing the app (module: `wlsctx_t → wlsctx_app_t`
 //!   `dyntransition`).
 //! - The **Xwayland** and **dbus-proxy** satellites do the same for
-//!   their execs (`xserver_t` / `wlsctx_app_t`), so the X socket,
-//!   MIT auth file and the bus socket they create carry `cN`.
+//!   their execs (`xserver_t` / `wlsctx_app_t`), so those *processes*
+//!   run at `cN` (the X socket, MIT auth file and bus socket they
+//!   create are `s0` — under the `s0` parent).
 //! - The **broker** (shared by all instances) narrows its range to
 //!   **single-level `s0`** the same way (`self_reexec_to_s0`),
-//!   before it binds or creates anything: the objects it creates
-//!   (the session-level runtime dir, the decision socket) must stay
-//!   reachable from every `cN`. A category set contains no
-//!   category, so an `s0` object remains readable/writable from a
-//!   `cN` process, while a `cN` object is unreachable from a
-//!   different category. (The session dir's range is decided by
-//!   whichever process creates it first — on a socket-activated
-//!   deployment that is the first instance, not the broker; see
-//!   `selinux/README.md`.)
+//!   before it binds or creates anything. This keeps the broker's
+//!   own *subject* range minimal, so a compromised broker cannot act
+//!   as a full-range subject or reach another instance's `cN`
+//!   processes (an `s0` high does not dominate a `cN`). The
+//!   session-level objects it serves (the runtime dir, the decision
+//!   socket) are `s0` by construction (the parent's low level), so
+//!   they stay reachable from every `cN` — no pre-creating needed.
 //!
 //! In unconfined mode (module uninstalled / binary not relabeled —
 //! the current label is not `wlsctx_t`) every function here is a
@@ -150,17 +153,18 @@ pub fn self_reexec_with_category(app_id: &str, instance_id: &str) -> Result<()> 
 /// single-level `s0` by a one-time self re-exec, before it binds or
 /// creates anything.
 ///
-/// The broker's objects — the session-level runtime dir it creates
-/// and the decision socket inside it — must stay reachable from
-/// every per-instance category. An object created at the full spawn
-/// range `s0-s0:c0.c1023` is **not** `add_name`-able by a `cN`
-/// process (an object's level must be dominated by the subject's
-/// range high — `c0.c1023` is not below `cN`), so on a fresh
-/// machine a broker-created session dir would break every instance
-/// dir creation. Single-level `s0` is dominated by every range high
-/// and dominates no category, so `s0` objects stay usable from every
-/// `cN`. No-op in unconfined mode and when already at `s0` (the
-/// post-re-exec invocation — the loop guard).
+/// The session-level objects it serves — the runtime dir and the
+/// decision socket inside it — are `s0` *by construction* (the
+/// parent's low level, not the creator's range — `default_range …
+/// target low`), so they stay reachable from every per-instance
+/// `cN` no matter who creates them first. The narrowing is a
+/// *range-hygiene* measure: it keeps the broker's own **subject**
+/// range minimal (a single `s0`, not the full spawn range
+/// `s0-s0:c0.c1023`), so a compromised broker cannot act as a
+/// full-range subject or reach another instance's `cN` processes (an
+/// `s0` high does not dominate a `cN`). No-op in unconfined mode and
+/// when already at `s0` (the post-re-exec invocation — the loop
+/// guard).
 pub fn self_reexec_to_s0() -> Result<()> {
     self_reexec_to_range("s0")
 }

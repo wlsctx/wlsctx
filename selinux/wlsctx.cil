@@ -52,6 +52,16 @@
 (typeattributeset cil_gen_require selinux_config_t)
 (typeattributeset cil_gen_require security_t)
 (typeattributeset mcs_constrained_type (wlsctx_t wlsctx_app_t))
+; this kernel's process class splits `signal` into signull (kill 0),
+; sigkill and signal. The base policy's mlsconstrain list constrains
+; ptrace/signal/sigkill/sigstop — but NOT signull. A module CIL cannot
+; add an mlsconstrain rule (the libsepol CIL reader rejects it:
+; "Bad constrain declaration"), so the signull grants in the process
+; allow rules below (terminate_app's kill -0 liveness probe, and
+; strace-style tools) stay *unconstrained* by MCS: any cN wlsctx
+; subject may kill -0 any wlsctx process, including another
+; instance's. That is a documented limitation of the module-based
+; approach, not a bug — see LESSONS #33.
 (allow unconfined_t wlsctx_exec_t (file (entrypoint execute getattr map open read)))
 ; installing / updating the binary (sudo from the user shell; cp
 ; probes the target with an ioctl, the update writes it)
@@ -75,8 +85,9 @@
 (allow unconfined_t wlsctx_t (dir (getattr open read search)))
 (allow unconfined_t wlsctx_t (file (getattr ioctl open read)))
 ; the user can signal the sandboxed app's host-visible process
-(allow unconfined_t wlsctx_app_t (process (getattr noatsecure rlimitinh siginh signal sigkill ptrace)))
-(allow unconfined_t xserver_t (process (getattr noatsecure rlimitinh siginh signal sigkill ptrace)))
+; (signull: the kill -0 liveness probe, strace-style tools)
+(allow unconfined_t wlsctx_app_t (process (getattr noatsecure rlimitinh siginh signal sigkill signull ptrace)))
+(allow unconfined_t xserver_t (process (getattr noatsecure rlimitinh siginh signal sigkill signull ptrace)))
 (allow unconfined_t wlsctx_app_t (dir (getattr open read search)))
 (allow unconfined_t wlsctx_app_t (file (open read)))
 (allow unconfined_t wlsctx_app_t (unix_stream_socket (read write)))
@@ -96,7 +107,7 @@
 (typetransition wlsctx_t xserver_exec_t process xserver_t)
 (allow wlsctx_t xserver_exec_t (file (entrypoint execute getattr map open read)))
 (allow wlsctx_t wlsctx_exec_t (file (entrypoint execute execute_no_trans getattr map open read)))
-(allow wlsctx_t wlsctx_t (process (dyntransition fork getattr getsched getsession getrlimit noatsecure ptrace rlimitinh setcurrent setexec setfscreate setkeycreate setpgid setsockcreate transition sigchld siginh signal sigkill sigstop)))
+(allow wlsctx_t wlsctx_t (process (dyntransition fork getattr getsched getsession getrlimit noatsecure ptrace rlimitinh setcurrent setexec setfscreate setkeycreate setpgid setsockcreate transition sigchld siginh signal sigkill signull sigstop)))
 (allow wlsctx_t wlsctx_t (dir (search)))
 (allow wlsctx_t wlsctx_t (file (append create getattr map open read unlink write)))
 ; listen(2) is checked against the socket's own context (the
@@ -130,10 +141,15 @@
 ; replies to those external clients
 (allow wlsctx_t unconfined_t (unix_stream_socket (read write)))
 (allow wlsctx_t unconfined_t (dbus (send_msg)))
-(allow wlsctx_t wlsctx_app_t (process (getattr noatsecure ptrace rlimitinh sigkill siginh signal)))
+; S supervises the app: the courtesy TERM, the kill -0 liveness
+; probe (terminate_app) and the SIGKILL escalation
+(allow wlsctx_t wlsctx_app_t (process (getattr noatsecure ptrace rlimitinh sigkill siginh signull signal)))
 (allow wlsctx_t wlsctx_app_t (process2 (nnp_transition)))
 (allow wlsctx_t wlsctx_app_t (dir (search)))
 (allow wlsctx_t wlsctx_app_t (file (open read)))
+; S resolves the app's cwd (dirfd-relative path resolution): the
+; /proc/<pid>/cwd symlink carries the *app's* type, not proc_t
+(allow wlsctx_t wlsctx_app_t (lnk_file (read)))
 (allow wlsctx_t root_t (dir (getattr search)))
 (allow wlsctx_t var_t (dir (search)))
 (allow wlsctx_t var_run_t (dir (search)))
@@ -184,7 +200,7 @@
 (allow wlsctx_t user_devpts_t (chr_file (ioctl read write)))
 (allow wlsctx_t dri_device_t (chr_file (open read write getattr)))
 (allow wlsctx_t device_t (dir (getattr open search read)))
-(allow wlsctx_app_t wlsctx_app_t (process (fork getattr signal sigkill sigstop getsched getsession getrlimit setpgid setcurrent setexec setfscreate setkeycreate setsockcreate noatsecure rlimitinh siginh sigchld)))
+(allow wlsctx_app_t wlsctx_app_t (process (fork getattr signal sigkill signull sigstop getsched getsession getrlimit setpgid setcurrent setexec setfscreate setkeycreate setsockcreate noatsecure rlimitinh siginh sigchld)))
 (allow wlsctx_app_t wlsctx_app_t (dir (create getattr open search read write add_name remove_name rmdir)))
 (allow wlsctx_app_t wlsctx_app_t (file (append create entrypoint execute execute_no_trans getattr map open read write unlink)))
 ; the app's *own* pipes (a shell pipeline `a | b`): sh `fstat`s the
@@ -214,9 +230,13 @@
 (allow wlsctx_app_t user_tmp_t (file (append create getattr ioctl open read write unlink)))
 (allow wlsctx_app_t user_tmp_t (sock_file (create getattr open read write)))
 (allow wlsctx_app_t user_tmp_t (unix_stream_socket (accept bind connectto create getattr read write)))
-; the sandbox's own /tmp: a fresh tmpfs whose mount root the base
-; policy labels tmp_t (the genfs label), not tmpfs_t — the app
-; stats it and searches it on every cwd-relative access
+; the sandbox's own /tmp is a fresh tmpfs: its mount root carries
+; the unlabeled-mount default label tmpfs_t (filecons do not
+; label fresh inodes on unlabeled mounts — the /tmp filecon
+; labels the host's /tmp, which is tmp_t) — the app stats it and
+; searches it on every cwd-relative access. The tmp_t rule covers
+; a host /tmp bind-mounted in by a profile (a bind carries the
+; inode's tmp_t SID with it).
 (allow wlsctx_app_t tmp_t (dir (getattr search)))
 (allow wlsctx_app_t tmpfs_t (dir (getattr open search read)))
 (allow wlsctx_app_t tmpfs_t (file (append create getattr map open read write unlink)))
