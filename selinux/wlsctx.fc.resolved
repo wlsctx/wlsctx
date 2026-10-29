@@ -1,6 +1,0 @@
-# Plain colon-form contexts (no gen_context): this variant is meant to
-# survive the policycoreutils 3.11 .pp -> CIL store conversion, which
-# serializes the filecon context verbatim and chokes on the
-# gen_context() placeholder (see LESSONS.md).
-/usr/local/bin/wlsctx system_u:object_r:wlsctx_exec_t:s0
-/usr/bin/wlsctx      system_u:object_r:wlsctx_exec_t:s0

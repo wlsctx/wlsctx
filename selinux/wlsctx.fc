@@ -1,9 +1,0 @@
-# File contexts for the wlsctx module.
-#
-# Installing the module (semodule -i) registers these but does not
-# relabel anything; the binary keeps its current label until you
-# run `restorecon` (or `chcon -t wlsctx_exec_t`). Until then the
-# binary is user_home_t / bin_t and runs unconfined — the module is
-# inert except for the xserver_t rules (see README.md).
-/usr/local/bin/wlsctx gen_context(system_u:object_r:wlsctx_exec_t,s0)
-/usr/bin/wlsctx        gen_context(system_u:object_r:wlsctx_exec_t,s0)
