@@ -318,6 +318,17 @@ fn run_proxy(args: &WaylandArgs) -> Result<()> {
 /// here), prompt the user for each denied foreign clipboard read, and
 /// answer the proxy.
 fn run_broker(args: &BrokerArgs) -> Result<()> {
+    // MCS (phase 8.2): a confined broker narrows its range to
+    // single-level `s0` before it binds or creates anything, so the
+    // session-level objects it creates (the runtime dir, the
+    // decision socket) stay reachable from every per-instance
+    // category. This must run *before* `take_activated_socket`
+    // (which consumes the LISTEN_* environment): the re-exec then
+    // re-runs with the variables intact, the systemd-passed fd
+    // (CLOEXEC-cleared by the manager) survives the execve, and the
+    // post-re-exec invocation hits the loop guard (already `s0`).
+    // No-op in unconfined mode.
+    wlsctx::mcs::self_reexec_to_s0()?;
     let xdg = std::env::var("XDG_RUNTIME_DIR").context(
         "XDG_RUNTIME_DIR must be set: the broker keeps its decision \
          socket in $XDG_RUNTIME_DIR/wlsctx",

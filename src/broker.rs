@@ -736,10 +736,26 @@ pub fn take_activated_socket() -> Option<UnixListener> {
     sd_notify::listen_fds()
         .ok()
         .and_then(|mut it| it.next())
-        .map(|fd| {
+        .and_then(|fd| {
+            // The fd must still be open: it crosses the MCS
+            // narrowing re-exec, and although the systemd manager
+            // passes activation fds with CLOEXEC cleared (so the
+            // execve keeps them), a CLOEXEC fd would have been
+            // closed by the exec and is worthless here.
+            // SAFETY: `borrow_raw` only borrows; the fd is a valid,
+            // open one from `listen_fds` (or not — that is what the
+            // `F_GETFD` probes).
+            let live = nix::fcntl::fcntl(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+                nix::fcntl::FcntlArg::F_GETFD,
+            )
+            .is_ok();
+            if !live {
+                return None;
+            }
             // SAFETY: listen_fds() consumed the LISTEN_* environment
             // variables, so this process is the sole user of the fd.
-            unsafe { UnixListener::from_raw_fd(fd) }
+            Some(unsafe { UnixListener::from_raw_fd(fd) })
         })
 }
 

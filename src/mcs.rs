@@ -26,11 +26,17 @@
 //! - The **Xwayland** and **dbus-proxy** satellites do the same for
 //!   their execs (`xserver_t` / `wlsctx_app_t`), so the X socket,
 //!   MIT auth file and the bus socket they create carry `cN`.
-//! - The **broker** never narrows (it is shared by all instances and
-//!   its sockets stay plain `s0`, which every `cN` can still
-//!   reach — a category set contains no category, so `s0` objects
-//!   remain readable/writable from a `cN` process, while a `cN`
-//!   object is unreachable from a different category).
+//! - The **broker** (shared by all instances) narrows its range to
+//!   **single-level `s0`** the same way (`self_reexec_to_s0`),
+//!   before it binds or creates anything: the objects it creates
+//!   (the session-level runtime dir, the decision socket) must stay
+//!   reachable from every `cN`. A category set contains no
+//!   category, so an `s0` object remains readable/writable from a
+//!   `cN` process, while a `cN` object is unreachable from a
+//!   different category. (The session dir's range is decided by
+//!   whichever process creates it first — on a socket-activated
+//!   deployment that is the first instance, not the broker; see
+//!   `selinux/README.md`.)
 //!
 //! In unconfined mode (module uninstalled / binary not relabeled —
 //! the current label is not `wlsctx_t`) every function here is a
@@ -87,28 +93,59 @@ fn write_exec_context(ctx: &str) -> io::Result<()> {
     })
 }
 
-/// S (and the standalone proxy): narrow our own range to the
-/// instance's category by a one-time self re-exec.
+/// S (and the standalone proxy/satellites): narrow our own range to
+/// the instance's category by a one-time self re-exec.
 ///
 /// No-op in unconfined mode and when the range is already narrowed
 /// (the post-re-exec invocation) — that double call is the loop
-/// guard. On a write failure (logged by the caller) the run simply
-/// continues without MCS.
+/// guard. On a write failure (logged) the run simply continues
+/// without MCS.
 pub fn self_reexec_with_category(app_id: &str, instance_id: &str) -> Result<()> {
+    self_reexec_to_range(&format!(
+        "s0-s0:c{}",
+        instance_category(app_id, instance_id)
+    ))
+}
+
+/// The **broker** (shared by all instances): narrow our own range to
+/// single-level `s0` by a one-time self re-exec, before it binds or
+/// creates anything.
+///
+/// The broker's objects — the session-level runtime dir it creates
+/// and the decision socket inside it — must stay reachable from
+/// every per-instance category. An object created at the full spawn
+/// range `s0-s0:c0.c1023` is **not** `add_name`-able by a `cN`
+/// process (an object's level must be dominated by the subject's
+/// range high — `c0.c1023` is not below `cN`), so on a fresh
+/// machine a broker-created session dir would break every instance
+/// dir creation. Single-level `s0` is dominated by every range high
+/// and dominates no category, so `s0` objects stay usable from every
+/// `cN`. No-op in unconfined mode and when already at `s0` (the
+/// post-re-exec invocation — the loop guard).
+pub fn self_reexec_to_s0() -> Result<()> {
+    self_reexec_to_range("s0")
+}
+
+/// The one-time self re-exec to a target range, shared by
+/// [`self_reexec_with_category`] (an instance's `s0-s0:cN`) and
+/// [`self_reexec_to_s0`] (the broker's `s0`).
+///
+/// No-op in unconfined mode and when the current range is already
+/// the target (the post-re-exec invocation — the loop guard). A
+/// write failure means the target is outside the user's exp-range
+/// (a non-standard MCS setup) or the module lacks the
+/// self-`dyntransition`; the caller degrades to a run without MCS
+/// rather than aborting.
+fn self_reexec_to_range(target: &str) -> Result<()> {
     let Some((user, role, ty, range)) = current_label() else {
         return Ok(());
     };
     if ty != "wlsctx_t" {
         return Ok(()); // unconfined mode
     }
-    let target = format!("s0-s0:c{}", instance_category(app_id, instance_id));
     if range == target {
-        return Ok(()); // already narrowed (post-re-exec invocation)
+        return Ok(()); // already at the target (post-re-exec invocation)
     }
-    // A write failure means the category is outside the user's
-    // range (a non-standard MCS setup) or the module lacks the
-    // self-dyntransition; degrade to a run without per-instance
-    // isolation rather than aborting the whole run.
     if let Err(e) = write_exec_context(&format!("{user}:{role}:wlsctx_t:{target}")) {
         log::warn!("{e}");
         return Ok(());
