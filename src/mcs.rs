@@ -11,8 +11,10 @@
 //! How the category gets there (see `selinux/README.md`):
 //!
 //! - **S** (and the standalone proxy/satellites) narrows its *own*
-//!   label from `wlsctx_t:s0` to `wlsctx_t:s0-s0:cN` by writing its
-//!   exec context (`/proc/self/attr/exec` — the setexecfilecon
+//!   label from `wlsctx_t:s0` to the instance's category (a low==high
+//!   `s0-s0:cN`, which the kernel reports as the single level
+//!   `s0:cN` — range strings are canonical-form on read) by writing
+//!   its exec context (`/proc/self/attr/exec` — the setexecfilecon
 //!   equivalent; the module allows the `wlsctx_t` self-
 //!   `dyntransition`) and re-execing `/proc/self/exe` once at
 //!   startup (before it binds or creates anything, so the second
@@ -63,6 +65,20 @@ pub fn instance_category(app_id: &str, instance_id: &str) -> u32 {
 /// Parse `/proc/self/attr/current` into (user, role, type, range).
 fn current_label() -> Option<(String, String, String, String)> {
     let s = std::fs::read_to_string("/proc/self/attr/current").ok()?;
+    parse_label(&s)
+}
+
+/// Parse a `user:role:type:range` context string.
+///
+/// The kernel NUL-terminates the selinuxfs attr strings, and
+/// `str::trim` does *not* strip a NUL (it is not Unicode whitespace)
+/// — truncate at the first NUL first. Without that, the range comes
+/// back as `s0\0`, the `range == target` loop guard in
+/// [`self_reexec_to_range`] never matches, and the one-time self
+/// re-exec becomes an infinite loop (260k execves in one strace
+/// session).
+fn parse_label(s: &str) -> Option<(String, String, String, String)> {
+    let s = &s[..s.find('\0').unwrap_or(s.len())];
     let mut parts = s.trim().splitn(4, ':');
     let user = parts.next()?.to_string();
     let role = parts.next()?.to_string();
@@ -81,10 +97,27 @@ pub fn is_confined() -> bool {
 /// The kernel validates the context on the *exec*; a write failure
 /// here (bad type, out-of-range category) degrades the caller to a
 /// run without MCS.
+///
+/// The open deliberately omits `O_CREAT`: the file always exists
+/// (procfs instantiates it on lookup), while `O_CREAT` turns the
+/// first open in a fresh in-sandbox procfs into a `may_o_create`
+/// probe (namei.c) that SELinux answers with an `add_name` denial
+/// on the self-labeled `attr/` directory — non-fatal (the kernel
+/// drops `O_CREAT` and re-resolves, and the open still succeeds),
+/// but an audit record on every run. The plain open hits only the
+/// file's own permissions, which the module grants.
 fn write_exec_context(ctx: &str) -> io::Result<()> {
+    use std::io::Write;
     let mut b = ctx.as_bytes().to_vec();
     b.push(0); // attr files take NUL-terminated contexts
-    std::fs::write("/proc/self/attr/exec", &b).map_err(|e| {
+    let res = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open("/proc/self/attr/exec")?;
+        f.write_all(&b)
+    })();
+    res.map_err(|e| {
         io::Error::other(format!(
             "writing /proc/self/attr/exec ({ctx:?}): {e} — the module may \
              not be installed or the category may be out of the user's \
@@ -101,8 +134,14 @@ fn write_exec_context(ctx: &str) -> io::Result<()> {
 /// guard. On a write failure (logged) the run simply continues
 /// without MCS.
 pub fn self_reexec_with_category(app_id: &str, instance_id: &str) -> Result<()> {
+    // The kernel reports a low==high range as a *single* level
+    // (`mls_sid_to_context` collapses it — `s0:cN`, not `s0-s0:cN`),
+    // and the loop guard in `self_reexec_to_range` compares the
+    // current range against this target, so the target must be in
+    // that canonical form. Writing either form as the exec context
+    // parses to the same range; reporting only happens on read.
     self_reexec_to_range(&format!(
-        "s0-s0:c{}",
+        "s0:c{}",
         instance_category(app_id, instance_id)
     ))
 }
@@ -136,6 +175,12 @@ pub fn self_reexec_to_s0() -> Result<()> {
 /// (a non-standard MCS setup) or the module lacks the
 /// self-`dyntransition`; the caller degrades to a run without MCS
 /// rather than aborting.
+///
+/// The guard compares the range *as the kernel reports it* from
+/// `/proc/self/attr/current`: a low==high range is collapsed to a
+/// single level (`s0:cN`, not `s0-s0:cN`; plain `s0` stays `s0`),
+/// so `target` must be in that canonical form, or the guard never
+/// matches and this becomes an infinite re-exec loop.
 fn self_reexec_to_range(target: &str) -> Result<()> {
     let Some((user, role, ty, range)) = current_label() else {
         return Ok(());
@@ -186,11 +231,72 @@ pub fn preserve_range() -> Result<()> {
     if ty != "wlsctx_t" {
         return Ok(());
     }
+    // Same NUL-termination trap as `current_label`: the pending
+    // context (and the literal `default`) is NUL-terminated, and
+    // `trim` does not strip that — without the truncation
+    // `default\0` would look like an explicit context.
     let pending = std::fs::read_to_string("/proc/self/attr/exec").unwrap_or_default();
-    if !pending.trim().is_empty() && pending.trim() != "default" {
+    let pending = &pending[..pending.find('\0').unwrap_or(pending.len())];
+    let pending = pending.trim();
+    if !pending.is_empty() && pending != "default" {
         return Ok(()); // an explicit context is already set; keep it
     }
     write_exec_context(&format!("{user}:{role}:{ty}:{range}")).map_err(|e| {
         anyhow::anyhow!("{e} — the re-exec will reset the range to the file context's")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kernel NUL-terminates the selinuxfs attr strings; the parse
+    /// must strip it, or the range carries the NUL, the `range ==
+    /// target` loop guard never matches, and the one-time self re-exec
+    /// loops forever (the 260k-execve incident).
+    #[test]
+    fn parse_label_strips_nul_termination() {
+        let l = parse_label("unconfined_u:unconfined_r:wlsctx_t:s0\0").unwrap();
+        assert_eq!(
+            l,
+            (
+                "unconfined_u".into(),
+                "unconfined_r".into(),
+                "wlsctx_t".into(),
+                "s0".into()
+            )
+        );
+        // The canonical single-level form the kernel reports for a
+        // low==high category range (post instance re-exec).
+        let l = parse_label("unconfined_u:unconfined_r:wlsctx_t:s0:c264\0").unwrap();
+        assert_eq!(l.3, "s0:c264");
+        // A low!=high range is not collapsed; both sides are reported.
+        let l =
+            parse_label("unconfined_u:unconfined_r:wlsctx_t:s0-s0:c0.c1023\0").unwrap();
+        assert_eq!(l.3, "s0-s0:c0.c1023");
+        // And a payload that stops carrying a NUL still parses.
+        let l = parse_label("u:r:ty:s0").unwrap();
+        assert_eq!(l.3, "s0");
+    }
+
+    #[test]
+    fn parse_label_rejects_garbage() {
+        assert!(parse_label("").is_none());
+        assert!(parse_label("u:r:ty\0").is_none());
+        assert!(parse_label("u:r\0:ty:range").is_none()); // NUL inside the string
+    }
+
+    #[test]
+    fn instance_category_is_stable_and_in_range() {
+        assert_eq!(
+            instance_category("claw", "1"),
+            instance_category("claw", "1")
+        );
+        assert!(instance_category("claw", "1") < NUM_CATEGORIES);
+        // FNV-1a 64 low bits: these two inputs hash to c885 and c604.
+        assert_ne!(
+            instance_category("claw", "1"),
+            instance_category("claw", "2")
+        );
+    }
 }
