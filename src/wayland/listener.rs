@@ -78,6 +78,9 @@ pub fn obtain_listener(args: &WaylandArgs) -> Result<(String, String, UnixListen
 
 /// Bind a listening socket at `path`, refusing to steal a socket that a
 /// live process still serves and only replacing genuinely stale ones.
+/// The parent directory is created if missing (owner-only, decision
+/// #40) so a long-lived sidecar can (re)start after the last `run`'s
+/// teardown removed the per-instance runtime dir.
 ///
 /// `pub(crate)` so the `run` pipeline (Phase 5.1) can bind its tagged
 /// socket from the supervisor side.
@@ -89,6 +92,32 @@ pub fn obtain_listener(args: &WaylandArgs) -> Result<(String, String, UnixListen
 /// that would break it, so we bail instead. The probe itself creates one
 /// pending connection on a live listener, which we close immediately.
 pub(crate) fn bind_socket(path: &path::Path) -> Result<UnixListener> {
+    // `bind(2)` needs the parent dir to exist. A socket that
+    // outlives a single run (a `--proxy` relay, tag-and-park) may be
+    // started — or re-exec'd — after the last `run`'s teardown
+    // removed the per-instance runtime dir, so recreate the parent
+    // here instead of failing with an opaque "path is not writable"
+    // (decision #40). Only a parent we just created gets the
+    // owner-only tightening (the sidecars' posture): a pre-existing
+    // dir keeps its own mode — an ad-hoc `--listen /tmp/x` must not
+    // re-mode `/tmp`.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && parent != path::Path::new("/")
+    {
+        let parent_existed = fs::symlink_metadata(parent).is_ok();
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating the parent dir of {path:?}"))?;
+        if !parent_existed {
+            let _ =
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).inspect_err(|e| {
+                    warn!(
+                        "chmod {} to 0700 failed (continuing with umask permissions): {e}",
+                        parent.display()
+                    );
+                });
+        }
+    }
     match fs::metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => match UnixStream::connect(path) {
             Ok(_) => bail!(
@@ -262,6 +291,50 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600, "the bound socket must be owner-only");
+        });
+    }
+
+    /// Decision #40: a sidecar (re)started after the last `run`'s
+    /// teardown removed the per-instance runtime dir must recreate
+    /// the parent, not fail with an opaque bind error.
+    #[test]
+    fn listen_creates_missing_parent_dir() {
+        let dir = TmpDir::new("listen-parent");
+        // Two missing levels: the instance dir and one above it.
+        let sock = dir.path().join("wlsctx/foot-1/wayland-1");
+        with_env(&[("XDG_RUNTIME_DIR", None)], || {
+            let (_, _, listener) =
+                obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
+                    .expect("a missing parent dir must be created, not an error");
+            assert_eq!(socket_path(&listener).as_deref(), Some(sock.as_path()));
+            let mode = fs::metadata(sock.parent().unwrap())
+                .expect("parent exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "a created parent must be owner-only");
+        });
+    }
+
+    /// A pre-existing parent keeps its mode (an ad-hoc `--listen`
+    /// into a dir wlsctx did not create must not be re-moded).
+    #[test]
+    fn listen_preexisting_parent_keeps_its_mode() {
+        let dir = TmpDir::new("listen-parent-preexisting");
+        let inst = dir.path().join("inst");
+        fs::create_dir(&inst).unwrap();
+        fs::set_permissions(&inst, fs::Permissions::from_mode(0o755)).unwrap();
+        let sock = inst.join("wayland-1");
+        with_env(&[("XDG_RUNTIME_DIR", None)], || {
+            let (_, _, listener) =
+                obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
+                    .expect("bind into an existing parent must work");
+            assert_eq!(socket_path(&listener).as_deref(), Some(sock.as_path()));
+            let mode = fs::metadata(&inst).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o755,
+                "a pre-existing parent must keep its mode"
+            );
         });
     }
 

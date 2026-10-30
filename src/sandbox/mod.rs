@@ -17,11 +17,12 @@ pub(crate) mod supervise;
 pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, fork};
 use std::ffi::OsString;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -214,7 +215,12 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
         ) {
             Ok(t) => t,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&runtime_dir);
+                // No fork happened, so this run leaves nothing that
+                // outlives the process — but the dir may hold a live
+                // sidecar's socket (a relay sharing the instance dir),
+                // which a blind `remove_dir_all` would destroy
+                // (decision #40).
+                remove_runtime_dir(&runtime_dir, None);
                 return Err(e).context("creating the tagged Wayland socket");
             }
         };
@@ -675,7 +681,11 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // that the app is dead: dropping S's listener copy and
             // the reference pipe is what triggers the compositor's
             // untag (the pipe's EOF), and that happens no later than
-            // this point.
+            // this point. The path is captured before the drop: the
+            // cleanup below unlinks that one file by path (the untag
+            // already happened; a liveness probe could still be
+            // accepted by the compositor's now-dying dup).
+            let own_tagged = tagged.as_ref().map(|t| t.host_path.clone());
             drop(tagged);
             // Best-effort cleanup of the per-instance sub-cgroup: the
             // app is dead, so it is empty (a parallel instance sharing
@@ -703,12 +713,13 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // 5.4: the per-instance runtime dir is no longer needed
             // (the tagged socket, and whatever the app created in
             // it). The step-1 carry is a *bind*, so the dir is still
-            // at its host path (decision #28).
-            if let Err(e) = std::fs::remove_dir_all(&runtime_dir)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                log::warn!("cleaning up the runtime dir {runtime_dir} failed: {e}");
-            }
+            // at its host path (decision #28). But the dir is
+            // *shared*: a long-lived sidecar (the `--proxy` relay,
+            // `dbus-proxy`, `xwayland`) may bind its public socket
+            // here too, and a blind `remove_dir_all` would destroy a
+            // running sidecar's socket file (decision #40) — so the
+            // removal spares the live ones.
+            remove_runtime_dir(&runtime_dir, own_tagged.as_deref());
             // 5.4: the signals S was asked to stop on override the
             // app's status: HUP keeps the historical `wlsctx`
             // semantics — 129 (128+SIGHUP) — and a TERM/INT that
@@ -724,6 +735,154 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             };
             Ok(code)
         }
+    }
+}
+
+/// Best-effort removal of the per-instance runtime dir that spares
+/// the **live** sockets of the sidecars sharing it (decision #40).
+///
+/// The `--proxy` relay, the `dbus-proxy` sidecar, and the `xwayland`
+/// satellite all bind their public socket inside the same
+/// per-instance runtime dir the `run` pipeline creates. A blind
+/// `remove_dir_all` (the historical behaviour) destroyed a running
+/// sidecar's socket file: its listener fd survives the unlink, but
+/// the path is gone, so the next `run`'s carry handed the sandbox an
+/// empty dir and the app found no compositor ("no compositor
+/// running?"). The sidecar's own `--listen` path therefore outlives
+/// every `run`:
+///
+/// * every **socket** file in the dir is liveness-probed with
+///   `connect(2)` — the same test
+///   [`crate::wayland::listener::bind_socket`] uses when it refuses
+///   to steal a socket — and kept while a live process serves it
+///   (a successful connect; the probe connection is dropped
+///   straight away). A refused connect is a stale socket of a dead
+///   server and is removed, exactly as `remove_dir_all` used to.
+///   A probe that fails for any other reason keeps the file: never
+///   destroy what cannot be identified.
+/// * S's **own** tagged socket (`own_tagged`; it is served by the
+///   compositor's dup, not by this process, and the compositor's
+///   now-dying dup could still accept a probe) is unlinked by path
+///   without probing, as before.
+/// * everything else — the app's per-run state, dead sidecars'
+///   leftovers, subdirectories — is removed recursively, as before.
+/// * finally the dir itself is `rmdir`'d: it survives (logged)
+///   while a kept socket remains in it, and is removed the first
+///   time a run tears down with nothing live left — the cleanup is
+///   lazy, and the sidecar never has to do it for itself.
+///
+/// All steps are best-effort: a failure here only loses hygiene,
+/// never the run's result.
+fn remove_runtime_dir(dir: &str, own_tagged: Option<&str>) {
+    let dir = std::path::Path::new(dir);
+    let mut kept = 0usize;
+    sweep_runtime_dir(dir, own_tagged, &mut kept);
+    match std::fs::remove_dir(dir) {
+        Ok(()) => debug!("runtime dir removed: {dir:?}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty && kept > 0 => {
+            info!(
+                "instance dir {dir:?} kept: {kept} live sidecar socket(s) share it \
+                 (the sidecar outlives this run; the next run will re-expose the \
+                 socket through the carry)"
+            );
+        }
+        Err(e) => warn!("cleaning up the runtime dir {dir:?} failed: {e}"),
+    }
+}
+
+/// One level of [`remove_runtime_dir`]: remove every entry of `dir`
+/// except a socket file a live process serves (and is not
+/// `own_tagged`); recurse into subdirectories.
+fn sweep_runtime_dir(dir: &std::path::Path, own_tagged: Option<&str>, kept: &mut usize) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!("cleaning the runtime dir {}: read_dir failed: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("cleaning the runtime dir {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "cleaning {}: stat {} failed: {e}; leaving it in place",
+                    dir.display(),
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if meta.file_type().is_socket() {
+            if own_tagged.is_some_and(|o| same_path(&path, o)) {
+                // S's own tagged socket: the untag already happened
+                // with the listener drop; unlink it by path without
+                // probing (see [`remove_runtime_dir`]).
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(conn) => {
+                    // A live process serves this path: keep it. The
+                    // probe's connection is dropped here; the server
+                    // (a relay) sees one instantly-closed connection.
+                    drop(conn);
+                    *kept += 1;
+                    info!(
+                        "keeping {}: served by a live sidecar sharing the \
+                         instance dir",
+                        path.display()
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // A stale socket of a dead server: removed, as
+                    // `remove_dir_all` used to.
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => {
+                    warn!(
+                        "cannot liveness-probe {} ({e}); keeping it",
+                        path.display()
+                    );
+                    *kept += 1;
+                }
+            }
+        } else if meta.file_type().is_dir() {
+            sweep_runtime_dir(&path, own_tagged, kept);
+            if let Err(e) = std::fs::remove_dir(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+                && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            {
+                warn!(
+                    "cleaning {}: rmdir {} failed: {e}",
+                    dir.display(),
+                    path.display()
+                );
+            }
+        } else {
+            // A regular file, symlink, or fifo: per-run app state —
+            // gone, as before.
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Path equality that tolerates a symlinked ancestor: canonicalize
+/// both sides when possible, fall back to a byte comparison.
+fn same_path(a: &std::path::Path, b: &str) -> bool {
+    match (a.canonicalize(), std::path::Path::new(b).canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == std::path::Path::new(b),
     }
 }
 
@@ -904,12 +1063,113 @@ fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxConfig, WaylandSpec, run_sandboxed};
+    use super::{SandboxConfig, WaylandSpec, remove_runtime_dir, run_sandboxed};
     use crate::sandbox::mounts;
     use crate::sandbox::namespaces::NetworkMode;
     use crate::sandbox::userns::tests::run_in_child;
     use std::ffi::OsString;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    // A listener whose fd is closed behind the wrapper's back,
+    // leaving the socket file in place — a sidecar (relay,
+    // satellite) that died without unlinking.
+    fn leave_stale_socket(listener: UnixListener) {
+        let raw = listener.as_raw_fd();
+        // SAFETY: `raw` is the listener's own fd; closing it out from
+        // under the wrapper and forgetting the wrapper means the fd
+        // is closed exactly once, and the (now dead) socket file
+        // stays put.
+        unsafe { libc::close(raw) };
+        std::mem::forget(listener);
+    }
+
+    /// Decision #40: the run's teardown must not destroy a
+    /// long-lived sidecar's socket that shares the instance dir —
+    /// live ones are kept (the dir survives), stale ones and the
+    /// app's state are removed.
+    #[test]
+    fn runtime_dir_cleanup_keeps_live_foreign_socket() {
+        let dir = crate::testutil::TmpDir::new("runtime-cleanup");
+        let inst = dir.path().join("inst");
+        std::fs::create_dir(&inst).unwrap();
+        let live = inst.join("wayland-1");
+        let stale = inst.join("bus.sock");
+        let regular = inst.join("app-state");
+        let sub = inst.join("nested");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f"), "x").unwrap();
+        std::fs::write(&regular, "state").unwrap();
+        let live_l = UnixListener::bind(&live).unwrap();
+        let stale_l = UnixListener::bind(&stale).unwrap();
+        leave_stale_socket(stale_l);
+
+        remove_runtime_dir(inst.to_str().unwrap(), None);
+
+        assert!(
+            live.exists(),
+            "a live sidecar's socket must survive the run's teardown"
+        );
+        UnixStream::connect(&live)
+            .unwrap_or_else(|e| panic!("the kept socket must still serve: {e}"));
+        assert!(!stale.exists(), "a stale socket must be removed");
+        assert!(!regular.exists(), "the app's per-run state must be removed");
+        assert!(!sub.exists(), "nested app state must be removed");
+        assert!(
+            inst.exists(),
+            "the dir must remain while a live socket is in it"
+        );
+        drop(live_l);
+    }
+
+    /// The run's *own* tagged socket is served by the compositor's
+    /// dup, not by this process: the liveness probe would keep it,
+    /// so it is removed by path instead (the untag already happened
+    /// with the listener drop).
+    #[test]
+    fn runtime_dir_cleanup_removes_own_tagged_even_if_served() {
+        let dir = crate::testutil::TmpDir::new("runtime-cleanup-own");
+        let inst = dir.path().join("inst");
+        std::fs::create_dir(&inst).unwrap();
+        let own = inst.join("wayland-1");
+        let _l = UnixListener::bind(&own).unwrap();
+
+        remove_runtime_dir(inst.to_str().unwrap(), Some(own.to_str().unwrap()));
+
+        assert!(
+            !own.exists(),
+            "the run's own tagged socket is removed by path, not probed"
+        );
+        assert!(
+            !inst.exists(),
+            "the now-empty dir must go with it"
+        );
+    }
+
+    /// With nothing live left, the lazy cleanup removes the dir
+    /// itself (the historical behaviour, restored once no sidecar
+    /// shares the dir).
+    #[test]
+    fn runtime_dir_cleanup_removes_dir_when_nothing_live() {
+        let dir = crate::testutil::TmpDir::new("runtime-cleanup-empty");
+        let inst = dir.path().join("inst");
+        std::fs::create_dir(&inst).unwrap();
+        let stale = inst.join("wayland-1");
+        let l = UnixListener::bind(&stale).unwrap();
+        leave_stale_socket(l);
+        std::fs::write(inst.join("state"), "x").unwrap();
+
+        remove_runtime_dir(inst.to_str().unwrap(), None);
+
+        assert!(!inst.exists(), "with nothing live the dir itself must go");
+    }
+
+    #[test]
+    fn runtime_dir_cleanup_missing_dir_is_a_noop() {
+        let dir = crate::testutil::TmpDir::new("runtime-cleanup-missing");
+        remove_runtime_dir(dir.path().join("nope").to_str().unwrap(), None);
+    }
 
     /// The tagged-socket run used by the live test below.
     fn tagged_config() -> SandboxConfig {
@@ -935,8 +1195,11 @@ mod tests {
     /// `connect(2)` succeeds (the compositor holds the listener, the
     /// supervisor mediates the allow). When the run ends, S's
     /// listener copy and the reference pipe close with the process
-    /// (5.2): the socket file remains (nothing unlinks it) but no
-    /// longer serves — a host-side `connect(2)` is refused.
+    /// (5.2) — the compositor untags on the pipe's EOF — and the
+    /// run's cleanup unlinks the socket file and removes the
+    /// per-instance runtime dir (5.4; decision #40 spares only
+    /// *foreign* live sockets, and there is no sidecar in this
+    /// test, so the dir goes).
     ///
     /// Needs a running wlroots compositor providing
     /// `wp_security_context_v1` (this project's target desktop,
