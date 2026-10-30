@@ -294,11 +294,15 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
         )?;
     }
     std::fs::create_dir("/dev/pts").context("creating /dev/pts")?;
+    // `MS_NOSUID` only — never `MS_NODEV` here: the VFS `may_open_dev`
+    // denies `open(2)` of any device file underneath an `MNT_NODEV`
+    // mount (EACCES, decided before any LSM hook), which would make the
+    // ptmx — the very point of this mount — unopenable (decision #39).
     mount(
         "none",
         "/dev/pts",
         "devpts",
-        libc::MS_NOSUID | libc::MS_NODEV,
+        libc::MS_NOSUID,
         "newinstance,ptmxmode=0666,mode=0620",
     )?;
     // The new instance's ptmx — binding the host's would hand the
