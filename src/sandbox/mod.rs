@@ -18,8 +18,9 @@ pub(crate) mod userns;
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, error, info, warn};
+use nix::errno::Errno;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, fork};
+use nix::unistd::{ForkResult, Pid, fork};
 use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
@@ -520,11 +521,22 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     // when B (the pid namespace's PID 1) dies
                     // (decision #14) — we exit by choice, so no
                     // orphans.
-                    let code = match waitpid(Some(child), None) {
+                    // `EINTR` is retried, never fatal (decision #41):
+                    // A inherits S's narrow signal block (the three
+                    // forwarded signals only), so any other signal
+                    // that reaches it interrupts this wait — and a
+                    // fatal `EINTR` here used to exit 126 *without*
+                    // reaping B, leaving B (reparented to the host
+                    // init) running on forever, unsupervised.
+                    let code = match waitpid_retry(child, "the app child") {
                         Ok(WaitStatus::Exited(_, code)) => code,
                         Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-                        other => {
-                            error!("waiting for the app child failed: {other:?}");
+                        Ok(other) => {
+                            error!("unexpected wait status for the app child: {other:?}");
+                            126
+                        }
+                        Err(e) => {
+                            error!("waiting for the app child failed: {e:#}");
                             126
                         }
                     };
@@ -583,6 +595,9 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             let mut supervisor: Option<std::thread::JoinHandle<()>> = None;
             // Assigned in both arms below (armed or not).
             let forwarder: Option<std::thread::JoinHandle<()>>;
+            // decision #41: armed once the handoff completes, held to
+            // the end of the run (see the struct's docs).
+            let mut kill_guard = AppKillGuard::disarmed();
             let handoff_ok = match supervise::recv_fd(ss) {
                 Ok(Some(notify)) => {
                     // 5.4: A reported B's host-visible pid right after
@@ -594,6 +609,10 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                             None
                         }
                     };
+                    // decision #41: the app is running; from this
+                    // instant, any exit of this process must not
+                    // leave its lineage behind (see the guard).
+                    kill_guard.sub_cgroup = Some(sub_cgroup.clone());
                     unsafe { libc::close(ss) };
                     log::debug!(
                         "S[{}]: got the listener (fd {})",
@@ -655,8 +674,15 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 }
             };
 
-            // Reap A, which carries B's status.
-            let code = match waitpid(Some(child), None).context("waiting for the sandbox child")? {
+            // Reap A, which carries B's status. `EINTR` is retried,
+            // never fatal (decision #41): S blocks only the three
+            // signals it forwards, so any other signal that reaches
+            // it (a terminal session's TSTP/TTIN/TTOU/CHLD — even a
+            // plain SIGSTOP→SIGCONT cycle) interrupts the blocking
+            // wait, and a fatal `EINTR` here used to kill S — and
+            // with it the forwarder thread, whose TERM→KILL
+            // escalation is the only thing keeping B finite.
+            let code = match waitpid_retry(child, "the sandbox child")? {
                 WaitStatus::Exited(_, code) => code,
                 // 128+signal, the shell convention.
                 WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
@@ -985,6 +1011,94 @@ fn terminate_app(pid: i32, stop: &Arc<AtomicBool>) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A `waitpid` that retries `EINTR` (decision #41).
+///
+/// Both reapers live to block in `waitpid` and on nothing else: S
+/// blocks only the three signals it forwards (the signalfd thread
+/// is their sole consumer), and A inherits that block. Any *other*
+/// signal that reaches either of them — a terminal session's
+/// `SIGTSTP`/`SIGTTIN`/`SIGTTOU`/`SIGCHLD`, even a plain
+/// `SIGSTOP`→`SIGCONT` cycle (a signal sent without `SA_RESTART`
+/// is not restarted) — interrupts the blocking wait, and the old
+/// code treated the resulting `EINTR` as fatal in both places (S's
+/// `?`, A's `126` exit). Either death orphans B: a dead A reaps
+/// nothing, and a dead S takes the forwarder thread — and with it
+/// the 2 s KILL escalation — with it. Retrying turns the
+/// interrupt into a non-event; the [`AppKillGuard`] is the
+/// backstop for whatever still goes wrong.
+fn waitpid_retry(pid: Pid, what: &str) -> Result<WaitStatus> {
+    loop {
+        // nix 0.31: `waitpid` returns `Result<WaitStatus, Errno>`
+        // (`nix::Error` is a type alias for `Errno`).
+        match waitpid(Some(pid), None) {
+            Err(Errno::EINTR) => continue,
+            other => return other.with_context(|| format!("waiting for {what}")),
+        }
+    }
+}
+
+/// The app-kill backstop (decision #41).
+///
+/// B is the sandbox's pid namespace's PID 1: while it lives, the
+/// app (and its descendants) live, and no signal from outside the
+/// namespace can default-kill it (decision #13) — a reparented B is
+/// immortal in practice. The supervision that keeps B finite (the
+/// forwarder thread's TERM→KILL escalation) runs inside S, so *any*
+/// exit of S with the app still alive (an error `?`, a panic) used
+/// to orphan the whole app forever.
+///
+/// The guard is armed the moment the handoff completes and dropped
+/// at the end of S's run. Its sweep kills every process still in
+/// the instance sub-cgroup (`cgroup.procs` is recursive: B and all
+/// of its descendants — B entered the sub-cgroup with A, decision
+/// #20). The kernel's own zap of a dying pidns init is *not* relied
+/// on (decision #14: on 7.2.11 the SIGKILL to surviving members was
+/// empirically a no-op — strays reparent and survive). On the
+/// normal path the sweep is an empty no-op (B and its lineage have
+/// already been reaped, and the sub-cgroup has been removed); it
+/// fires — loudly, with a warning — only when a live process is
+/// found, i.e. exactly the incident it exists to end.
+struct AppKillGuard {
+    /// `None` until the handoff completes (no armed guard, no app).
+    sub_cgroup: Option<String>,
+}
+
+impl AppKillGuard {
+    fn disarmed() -> Self {
+        Self { sub_cgroup: None }
+    }
+}
+
+impl Drop for AppKillGuard {
+    fn drop(&mut self) {
+        let Some(cg) = self.sub_cgroup.take() else {
+            return;
+        };
+        let mut killed = 0usize;
+        if let Ok(list) = std::fs::read_to_string(format!("{cg}/cgroup.procs")) {
+            for line in list.lines() {
+                let p = match line.trim().parse::<i32>() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                // SAFETY: signalling a host pid read from the
+                // kernel's own bookkeeping; a failure (ESRCH: it
+                // exited between the read and the signal) is
+                // exactly the desired state.
+                if unsafe { libc::kill(p, libc::SIGKILL) } == 0 {
+                    killed += 1;
+                }
+            }
+        }
+        if killed > 0 {
+            warn!(
+                "app-kill guard: the run is ending with {killed} process(es) \
+                 still alive in {cg} — SIGKILL sent to all of them"
+            );
+        }
     }
 }
 
