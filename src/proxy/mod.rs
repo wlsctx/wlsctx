@@ -150,8 +150,9 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, recvmsg, send, sendmsg,
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, recvmsg, send,
+    sendmsg,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsString};
@@ -233,6 +234,25 @@ impl ProxySocket {
         let mut cmsg_buffer = RecvAncillaryBuffer::new(&mut cmsg_space);
         let mut iov = [IoSliceMut::new(buf)];
         let msg = recvmsg(self.fd.as_fd(), &mut iov, &mut cmsg_buffer, flags)?;
+        // A truncated ancillary message means the kernel dropped a
+        // file descriptor that the message stream expects: on a unix
+        // stream socket that is either the control buffer being too
+        // small (it is not — it is sized for 28) or a failed dup of
+        // a received fd, which is how a SELinux file-receive denial
+        // (the receiver must hold `file:read`/`file:write` on the
+        // object's type, checked in `security_file_receive`) presents
+        // itself. Both are silent data loss: the message bytes arrive
+        // intact and the missing fd surfaces one parse later as
+        // "references a fd that has not arrived". Fail at the point
+        // of loss, with the actual cause.
+        if msg.flags.intersects(ReturnFlags::CTRUNC) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a received file descriptor was dropped by the kernel \
+                 (MSG_CTRUNC) — usually a SELinux file-receive denial \
+                 against this process; the message stream is corrupt",
+            ));
+        }
         for cmsg in cmsg_buffer.drain() {
             if let RecvAncillaryMessage::ScmRights(iter) = cmsg {
                 // `CMSG_CLOEXEC` fds arrive exactly once and are exclusively
@@ -642,7 +662,37 @@ impl Relay {
         let take = src_fds.len().min(n_fds);
         let mut scratch: VecDeque<OwnedFd> = src_fds.drain(0..take).collect();
         let (msg, rest) = wire::parse_message(raw, desc.signature, &mut scratch)
-            .map_err(|e| RelayEnd::Protocol(e.to_string()))?;
+            .map_err(|e| {
+                // The failure names the message: a `MissingFd` here
+                // means the sender put an `fd` argument in the
+                // message but no matching SCM_RIGHTS arrived with it
+                // (or the pair got split across the relay's
+                // reassembly boundary and the fd was consumed by an
+                // earlier message). Without the sender/opcode, a
+                // dropped connection is undiagnosable.
+                let what = match &e {
+                    wire::Error::MissingFd => format!(
+                        "'{}' on {} ({:?}) references a file descriptor \
+                         that never arrived ({} of {} fd(s) were queued)",
+                        desc.name,
+                        sender.name,
+                        dir,
+                        take,
+                        n_fds
+                    ),
+                    other => other.to_string(),
+                };
+                RelayEnd::Protocol(what)
+            })?;
+        debug!(
+            "{:?}: {} '{}' on {} ({} fd(s) consumed, {} queued)",
+            dir,
+            if dir == Dir::ClientToServer { "c2s" } else { "s2c" },
+            desc.name,
+            sender.name,
+            take,
+            src_fds.len()
+        );
         if !rest.is_empty() {
             // The message carries more data than its signature
             // declares: the sender is lying about its protocol.
