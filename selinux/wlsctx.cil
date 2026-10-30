@@ -51,6 +51,17 @@
 (typeattributeset cil_gen_require init_t)
 (typeattributeset cil_gen_require selinux_config_t)
 (typeattributeset cil_gen_require security_t)
+(typeattributeset cil_gen_require devpts_t)
+(typeattributeset cil_gen_require fonts_t)
+(typeattributeset cil_gen_require user_fonts_t)
+(typeattributeset cil_gen_require flatpak_home_t)
+(typeattributeset cil_gen_require cpu_online_t)
+(typeattributeset cil_gen_require fonts_cache_t)
+(typeattributeset cil_gen_require user_fonts_cache_t)
+(typeattributeset cil_gen_require fs_t)
+(typeattributeset cil_gen_require sysctl_t)
+(typeattributeset cil_gen_require sysctl_vm_t)
+(typeattributeset cil_gen_require sysctl_vm_overcommit_t)
 (typeattributeset mcs_constrained_type (wlsctx_t wlsctx_app_t))
 ; this kernel's process class splits `signal` into signull (kill 0),
 ; sigkill and signal. The base policy's mlsconstrain list constrains
@@ -74,9 +85,20 @@
 ; ways between the two sockets
 ; userspace tools (ls, cat) inspecting wlsctx's /proc entries
 (allow unconfined_t wlsctx_t (lnk_file (getattr read)))
-; strace probing wlsctx process fds
-(allow unconfined_t wlsctx_t (unix_stream_socket (getattr)))
-(allow unconfined_t wlsctx_t (unix_stream_socket (connectto read write)))
+; the compositor (and other session processes) use wlsctx's sockets.
+; `fd use` is the SCM_RIGHTS dup of the tagged listener (and the
+; reference pipe) that `create_listener` hands the compositor — without
+; it the compositor's dup fails and libwayland-server reports a
+; protocol-level "invalid arguments for ...create_listener". The
+; socket grants cover accepting the per-connection tagged socket the
+; proxy opens upstream, reading/writing the Wayland protocol on it,
+; plus the reference pipe's EOF (the untag when the proxy exits);
+; getattr is the strace/getsockopt probe. The socket and fd classes
+; are not in this kernel's base mlsconstrain, so the full-range
+; unconfined subject passes the level check against the cN socket.
+(allow unconfined_t wlsctx_t (fd (use)))
+(allow unconfined_t wlsctx_t (unix_stream_socket (accept connectto getattr getopt read write setopt)))
+(allow unconfined_t wlsctx_t (fifo_file (read write)))
 ; the user can trace wlsctx processes (strace/gdb while iterating on them:
 ; the kernel re-checks the tracer's ptrace permission on the *new* context
 ; at every SID-changing exec, so without this even `strace wlsctx --help`
@@ -91,6 +113,15 @@
 (allow unconfined_t wlsctx_app_t (dir (getattr open read search)))
 (allow unconfined_t wlsctx_app_t (file (open read)))
 (allow unconfined_t wlsctx_app_t (unix_stream_socket (read write)))
+; the compositor (and any other unconfined session process) receives
+; the app's in-memory objects through the relay's SCM_RIGHTS forward:
+; the same `__file_has_perm` double-check as the relay's own receive —
+; `fd:use` against the memfd's creator context (the app's SID), then
+; the file perms implied by the fd's f_mode (base-policy grants cover
+; the file side; only the app type is new to policy). A denial drops
+; the fd from the received cmsg (MSG_CTRUNC) and the compositor
+; rejects the message as "invalid arguments".
+(allow unconfined_t wlsctx_app_t (fd (use)))
 (allow unconfined_t wlsctx_t (dbus (send_msg)))
 (allow unconfined_t wlsctx_app_t (dbus (send_msg)))
 (typetransition unconfined_t wlsctx_exec_t process wlsctx_t)
@@ -129,8 +160,12 @@
 (allow wlsctx_t file_type (dir (mounton)))
 (allow wlsctx_t tmp_t (dir (create getattr open search read write add_name remove_name rmdir mounton setattr)))
 (allow wlsctx_t tmp_t (file (append create getattr map open read write unlink mounton)))
-; `--listen /tmp/foo.sock`: a plain tmp socket
-(allow wlsctx_t tmp_t (sock_file (create getattr open read write unlink)))
+; `--listen /tmp/foo.sock`: a plain tmp socket. `setattr` is the
+; chmod(0600) the SIGHUP in-place re-exec does when it re-binds a
+; pre-existing socket (the re-exec re-runs `bind_listener`, which
+; resets the mode on every bind — including one that just reuses a
+; live socket).
+(allow wlsctx_t tmp_t (sock_file (create getattr open read write unlink setattr)))
 (allow wlsctx_t cgroup_t (dir (create getattr open search read write add_name remove_name rmdir)))
 (allow wlsctx_t cgroup_t (file (getattr open read write)))
 (allow wlsctx_t unconfined_t (system (start)))
@@ -138,15 +173,39 @@
 ; host-side wlsctx stdout/stderr go through shell-created pipes
 ; (the ioctl is the isatty probe)
 (allow wlsctx_t unconfined_t (fifo_file (read write ioctl)))
-; replies to those external clients
-(allow wlsctx_t unconfined_t (unix_stream_socket (read write)))
+; the upstream connect (the compositor's wayland socket, created by
+; an unconfined session process) plus the replies to those external
+; clients. connectto is checked against the *socket's* context (the
+; creator's type/range), not the path file's; the socket and fd
+; classes are not in this kernel's base mlsconstrain list, so the
+; category-narrowed subject (s0:cN) passes the level check here
+(allow wlsctx_t unconfined_t (unix_stream_socket (connectto read write)))
 (allow wlsctx_t unconfined_t (dbus (send_msg)))
 ; S supervises the app: the courtesy TERM, the kill -0 liveness
 ; probe (terminate_app) and the SIGKILL escalation
 (allow wlsctx_t wlsctx_app_t (process (getattr noatsecure ptrace rlimitinh sigkill siginh signull signal)))
 (allow wlsctx_t wlsctx_app_t (process2 (nnp_transition)))
 (allow wlsctx_t wlsctx_app_t (dir (search)))
-(allow wlsctx_t wlsctx_app_t (file (open read)))
+; the app's in-memory objects (a `memfd_create` buffer — the
+; `wl_shm` pool foot hands the compositor — or a pipe/socket passed
+; as a clipboard `receive` target) carry the app's own context:
+; an anonymous inode is labeled `current_sid()` at creation, and
+; the file object's SID is the creator's context too. The kernel's
+; SCM_RIGHTS receive path (`scm_detach_fds` → `receive_fd` →
+; `security_file_receive` → `__file_has_perm`) checks the
+; *receiving* process — here, the relay — twice: first `fd:use`
+; (sender SID ≠ file SID), then the file permissions implied by the
+; object's `f_mode` (a RW pool needs read+write on the inode's
+; type). A denial drops the fd from the received cmsg: recvmsg
+; still returns the message bytes with MSG_CTRUNC set — invisible
+; unless the receiver checks the flag, which the relay now does
+; (`ProxySocket::recv`). Without `fd:use` and `write`, every
+; `create_pool` the app sends (and every in-memory clipboard read)
+; dies at the relay.
+(allow wlsctx_t wlsctx_app_t (fd (use)))
+(allow wlsctx_t wlsctx_app_t (file (open read write)))
+(allow wlsctx_t wlsctx_app_t (fifo_file (read write)))
+(allow wlsctx_t wlsctx_app_t (unix_stream_socket (read write)))
 ; S resolves the app's cwd (dirfd-relative path resolution): the
 ; /proc/<pid>/cwd symlink carries the *app's* type, not proc_t
 (allow wlsctx_t wlsctx_app_t (lnk_file (read)))
@@ -171,12 +230,35 @@
 (allow wlsctx_t locale_t (dir (search)))
 (allow wlsctx_t locale_t (file (getattr map open read)))
 (allow wlsctx_t tmpfs_t (dir (add_name create getattr search setattr write)))
-(allow wlsctx_t tmpfs_t (file (create mounton open write)))
+; the app's `wl_shm` buffer: foot `memfd_create`s its pixel pool and
+; passes the fd to the relay over the downstream socket (SCM_RIGHTS).
+; That memfd is an anonymous inode in the sandbox's fresh `/dev/shm`
+; tmpfs, so it carries the tmpfs's default label (`tmpfs_t`) — NOT the
+; app's SID (`wlsctx_app_t`): an anonymous inode in a fresh tmpfs takes
+; the mount's fs label, and `default_range … target low` pins it to `s0`
+; (LESSONS #29). The relay is the *receiving* end of the SCM_RIGHTS dup,
+; so the kernel's `security_file_receive` → `__file_has_perm` checks the
+; *relay* (not the app) against the memfd's type: `fd:use` (receiving
+; SID ≠ file SID) plus the file perms the fd's `f_mode` implies (an
+; `O_RDWR` pool → read+write). A denial drops the fd from the received
+; cmsg — the message bytes arrive intact with `MSG_CTRUNC` set, so the
+; relay only sees it if it checks the flag (`ProxySocket::recv`), which
+; it now does. `write` is kept beside `read` because the pool is
+; read-write and `__file_has_perm` checks both from `f_mode`.
+(allow wlsctx_t tmpfs_t (fd (use)))
+(allow wlsctx_t tmpfs_t (file (create mounton open read write)))
 (allow wlsctx_t tmpfs_t (lnk_file (create)))
 (allow wlsctx_t home_root_t (dir (getattr open read search)))
 (allow wlsctx_t user_home_dir_t (dir (getattr search)))
 (allow wlsctx_t user_home_t (dir (getattr search)))
 (allow wlsctx_t config_home_t (dir (getattr search)))
+; the per-app profile: S reads `~/.config/wlsctx/apps/<app-id>.toml`
+; before the first fork (a `config_home_t` *file* — the dir search
+; above covers only traversal). A stat/getattr denial makes
+; `Path::is_file()` return false, and `profile::load` silently
+; degrades to the empty ad-hoc profile (the session's env then leaks
+; into the app — LESSONS #34).
+(allow wlsctx_t config_home_t (file (getattr open read)))
 (allow wlsctx_t data_home_t (dir (getattr)))
 (allow wlsctx_t cache_home_t (dir (getattr)))
 (allow wlsctx_t gconf_home_t (dir (getattr search)))
@@ -185,6 +267,11 @@
 (allow wlsctx_t user_tmp_t (dir (create getattr open search read write add_name remove_name rmdir setattr)))
 (allow wlsctx_t user_tmp_t (file (append create getattr ioctl open read write unlink)))
 (allow wlsctx_t user_tmp_t (sock_file (create getattr open read write unlink setattr)))
+; the relay receives the compositor's shm fds (the XKB keymap file,
+; clipboard buffers) over SCM_RIGHTS — the receive-side `fd:use`
+; against the file's type (those files are `user_tmp_t`: the
+; `/dev/shm` file transition of an unconfined creator)
+(allow wlsctx_t user_tmp_t (fd (use)))
 (allow wlsctx_t user_tmp_t (unix_stream_socket (accept bind connectto create getattr read write getopt setopt)))
 (allow wlsctx_t session_dbusd_tmp_t (sock_file (getattr open read write)))
 (allow wlsctx_t unconfined_dbusd_t (unix_stream_socket (accept connectto getattr read write getopt setopt)))
@@ -250,6 +337,15 @@
 ; the app's own unix sockets (socketpairs, local listeners):
 ; same socket-class self-permissions as its tcp/udp rule set
 (allow wlsctx_app_t wlsctx_app_t (unix_stream_socket (accept bind connect connectto create getattr read write getopt setopt listen)))
+; the app's own /proc/self/exe symlink carries its own type (the
+; genfs rule labels /proc/*/exe with the exec'd file's type), so a
+; lib that resolves its own path (and `stat /proc/self/exe` in
+; general) reads a `wlsctx_app_t` lnk_file, not a `proc_t` one.
+(allow wlsctx_app_t wlsctx_app_t (lnk_file (read)))
+; pipes the app creates for itself (its own child's stdio, internal
+; plumbing) carry the app's own type; FIONBIO on one is a plain
+; `ioctl` (0x542a), as bash and friends do on any pipe.
+(allow wlsctx_app_t wlsctx_app_t (fifo_file (getattr ioctl read write)))
 (allow wlsctx_app_t wlsctx_app_t (tcp_socket (create getattr name_bind connect read write getopt setopt)))
 (allow wlsctx_app_t wlsctx_app_t (udp_socket (create getattr name_bind connect read write getopt setopt)))
 (allow wlsctx_app_t null_device_t (chr_file (open read write getattr ioctl)))
@@ -258,7 +354,26 @@
 (allow wlsctx_app_t zero_device_t (chr_file (getattr)))
 (allow wlsctx_app_t ptmx_t (chr_file (open read write getattr ioctl)))
 (allow wlsctx_app_t devtty_t (chr_file (open read write getattr ioctl)))
-(allow wlsctx_app_t user_devpts_t (chr_file (read write)))
+; the sandbox's `/dev/ptmx` is a relative symlink into the fresh
+; devpts instance (the build's step 5, decision #39), so the symlink
+; itself carries the fresh tmpfs's default label (tmpfs_t), not
+; ptmx_t — following it is an `lnk_file read` on tmpfs_t. The
+; fresh instance's own ptmx is devpts_t (the host's genfs label for
+; /dev/pts/ptmx), and the dynamically created slaves are
+; user_devpts_t (the same genfs match the host's /dev/pts/N get).
+; grantpt/unlockpt (TIOCSPTLCK/TIOCGPTN) are ioctls on the master;
+; winch handling is an ioctl on the slave.
+(allow wlsctx_app_t tmpfs_t (lnk_file (read)))
+(allow wlsctx_app_t devpts_t (dir (getattr search)))
+(allow wlsctx_app_t devpts_t (chr_file (open read write getattr ioctl)))
+(allow wlsctx_app_t user_devpts_t (chr_file (open read write getattr ioctl)))
+; the compositor's keymap file: wlroots writes each client's XKB
+; keymap to a shm file (`/dev/shm/wlroots-*` — `user_tmp_t`, the
+; file transition a `unconfined_t` creator gets there), hands the
+; fd to the client out-of-band, and unlinks it. The app only ever
+; `mmap`s the passed fd (the path is gone by then), so this is
+; `map` (plus the plain file reads for completeness).
+(allow wlsctx_app_t user_tmp_t (file (getattr open read map)))
 (allow wlsctx_app_t dri_device_t (chr_file (open read write getattr)))
 (allow wlsctx_app_t proc_t (dir (getattr search)))
 (allow wlsctx_app_t proc_t (file (getattr open read)))
@@ -278,7 +393,9 @@
 (allow wlsctx_app_t user_home_dir_t (dir (getattr open search read)))
 (allow wlsctx_app_t user_home_t (dir (create getattr open search read write add_name remove_name)))
 (allow wlsctx_app_t cache_home_t (dir (create getattr open search read write add_name remove_name)))
-(allow wlsctx_app_t config_home_t (dir (create getattr open search read write add_name remove_name)))
+; `lock`/`watch`: fish takes a lock and an inotify watch on its
+; config dir (live-reload)
+(allow wlsctx_app_t config_home_t (dir (create getattr open search read write add_name remove_name lock watch)))
 (allow wlsctx_app_t data_home_t (dir (create getattr open search read write add_name remove_name)))
 (allow wlsctx_app_t gconf_home_t (dir (create getattr open search read write add_name remove_name)))
 (allow wlsctx_app_t user_home_t (file (append create entrypoint execute execute_no_trans getattr map open read write unlink)))
@@ -295,8 +412,42 @@
 ; `stat /` and PATH lookup fail):
 (allow wlsctx_app_t bin_t (dir (getattr search)))
 (allow wlsctx_app_t bin_t (lnk_file (read)))
-(allow wlsctx_app_t usr_t (dir (getattr search)))
+; `read` (readdir) covers fontconfig's enumeration of the
+; conf.d-style dirs under /usr/share (conf.avail) — a plain
+; stat (getattr) cannot list their entries.
+(allow wlsctx_app_t usr_t (dir (getattr open read search)))
 (allow wlsctx_app_t usr_t (lnk_file (read)))
+; fontconfig's directory scans: the system tree and the user's
+; `~/.local/share/fonts`; `$XDG_DATA_HOME` enumeration stats every
+; subdirectory, including flatpak_home_t. `cpu_online_t` is
+; glibc's read of /sys/devices/system/cpu/online. `read` (readdir)
+; is what makes the directories enumerable — without it fontconfig
+; cannot find the user's fonts at all and the app's font load
+; fails (a `getattr`-only grant is the trap here).
+(allow wlsctx_app_t fonts_t (dir (getattr open search read)))
+(allow wlsctx_app_t fonts_t (file (getattr open read map)))
+; `open` (in addition to `read`): fontconfig `open()`s each user font
+; dir before `getdents`-ing it — a `read`-only grant passes the
+; permission check but the `open(2)` itself is still denied, so the
+; directory is never enumerated (LESSONS #35: the silent-degradation
+; class, where a partial grant looks fine but the op still fails).
+(allow wlsctx_app_t user_fonts_t (dir (getattr open search read)))
+(allow wlsctx_app_t user_fonts_t (file (getattr open read map)))
+; the fontconfig caches (`/var/cache/fontconfig`,
+; `~/.cache/fontconfig`): read the dir and its index files. If the
+; app cannot refresh a stale cache, fontconfig falls back to a live
+; directory scan, which the grants above allow — so the caches need
+; no write access.
+; the app receives the compositor's keymap fd through the relay
+; (SCM_RIGHTS): the receive-side `fd:use` against the file's type
+(allow wlsctx_app_t user_tmp_t (fd (use)))
+; `map`: fontconfig mmaps the cache index files before reading them
+(allow wlsctx_app_t fonts_cache_t (dir (getattr search read)))
+(allow wlsctx_app_t fonts_cache_t (file (getattr open read map)))
+(allow wlsctx_app_t user_fonts_cache_t (dir (getattr search read)))
+(allow wlsctx_app_t user_fonts_cache_t (file (getattr open read map)))
+(allow wlsctx_app_t flatpak_home_t (dir (getattr search read)))
+(allow wlsctx_app_t cpu_online_t (file (getattr open read)))
 (allow wlsctx_app_t lib_t (lnk_file (read)))
 (allow wlsctx_app_t etc_t (lnk_file (read)))
 (allow wlsctx_app_t root_t (dir (getattr search)))
@@ -312,9 +463,23 @@
 ; ls formatting mtimes: tzset reads /etc/localtime, a symlink
 ; (labeled locale_t, not etc_t) into the zoneinfo tree
 (allow wlsctx_app_t locale_t (lnk_file (read)))
-(allow wlsctx_app_t lib_t (dir (search)))
+; `getattr` on the lib dirs: import mechanisms (python) stat the
+; search paths before traversing them
+(allow wlsctx_app_t lib_t (dir (getattr search)))
 (allow wlsctx_app_t lib_t (lnk_file (read)))
+; /proc/sys: platform/runtime introspection (read-only; the values
+; are kernel-constant, not instance data)
+(allow wlsctx_app_t sysctl_t (dir (getattr search)))
+; `sysctl_vm_t` is the /proc/sys/vm subtree (a distinct type, not
+; `sysctl_t`): foot's glibc stats it for runtime tuning.
+(allow wlsctx_app_t sysctl_vm_t (dir (getattr search)))
+; `/proc/sys/vm/overcommit_memory` has its own type; glibc's malloc
+; runtime tuning reads it
+(allow wlsctx_app_t sysctl_vm_overcommit_t (file (getattr open read)))
 (allow wlsctx_app_t usr_t (dir (search)))
+; VFS superblock objects are stat'd during path lookup on some
+; mount types (`filesystem getattr`)
+(allow wlsctx_app_t fs_t (filesystem (getattr)))
 (allow wlsctx_app_t xserver_t (unix_stream_socket (connectto read write)))
 (allow xserver_t wlsctx_app_t (unix_stream_socket (read write)))
 (allow xserver_t user_tmp_t (file (getattr open read)))
