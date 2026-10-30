@@ -90,6 +90,7 @@ phase 8.1).**
   `supervise` (notify-fd handoff, app-pid report, verdict pipe, the
   S-side supervisor loop, #23/#25/#26), `mod` (S→A→B pipeline,
   `run_sandboxed`, the S-side signal forwarder / `terminate_app`,
+  the `waitpid_retry` + `AppKillGuard` orphan backstop, #41,
   sd-notify, #33)
 - `src/profile/` — per-app TOML profiles (`gpu`, `ro_binds`, `rw_binds`,
   `mask`, `env`, …; `deny_unknown_fields`)
@@ -286,12 +287,15 @@ phase 8.1).**
   for `SCM_RIGHTS` (a dropped fd is silent `MSG_CTRUNC`), the
   fresh-tmpfs symlink label trap, and the `dir` `open`/`read`
   distinction).
-  Next up: a confined-mode run of the `dbus-proxy`/`xwayland`
-  satellites and the broker (the relay is now verified confined;
-  they are not), the 6.5.5 `serve`-label drag refinement (the
-  audit itself is closed), and 6.4 (the varlink tier) stays
-  parked until a released systemd ships `PIDs` in
-  `StartTransient`.
+  Next up: the `PR_SET_PDEATHSIG` cascade for the SIGKILL-to-S
+  boundary decision #41 leaves open (A←S — A never execs, so a
+  `pre_exec` set survives — and B←A — B execs, so it needs the
+  decision-#37 `LD_PRELOAD` restore shim), then a confined-mode
+  run of the `dbus-proxy`/`xwayland` satellites and the broker
+  (the relay is now verified confined; they are not), then the
+  6.5.5 `serve`-label drag refinement (the audit itself is
+  closed); 6.4 (the varlink tier) stays parked until a released
+  systemd ships `PIDs` in `StartTransient`.
 
 ## Commit conventions
 
