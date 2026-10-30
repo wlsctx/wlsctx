@@ -276,11 +276,20 @@ phase 8.1).**
   CIL, installed and tuning-looped to zero denials — see the
   "Per-instance MCS" fact above for what it actually isolates).
   The full chain is verified at probe level (a sandboxed
-  `wayland-info` through the `--proxy` relay into live sway).
-  Next up: a real GUI app through the relay — ideally under
-  enforcing mode (the relay/satellites/broker have not yet run in
-  confined mode) — and the 6.5.5 `serve`-label drag refinement
-  (the audit itself is closed); 6.4 (the varlink tier) stays
+  `wayland-info` through the `--proxy` relay into live sway) and,
+  under **enforcing mode**, with a real GUI app: `foot` rendered
+  through the `--proxy` relay into live sway with zero denials
+  across the whole boot+render cycle (v2.14 — the enforcing-mode
+  tuning closed five gap classes, decisions #39–#40 and LESSONS
+  #34–#36: devpts `MS_NODEV`, the `run` teardown sparing live
+  sidecar sockets, the relay's receive-side `fd:use`/`file` grants
+  for `SCM_RIGHTS` (a dropped fd is silent `MSG_CTRUNC`), the
+  fresh-tmpfs symlink label trap, and the `dir` `open`/`read`
+  distinction).
+  Next up: a confined-mode run of the `dbus-proxy`/`xwayland`
+  satellites and the broker (the relay is now verified confined;
+  they are not), the 6.5.5 `serve`-label drag refinement (the
+  audit itself is closed), and 6.4 (the varlink tier) stays
   parked until a released systemd ships `PIDs` in
   `StartTransient`.
 
