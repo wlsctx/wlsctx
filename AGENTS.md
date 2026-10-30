@@ -275,8 +275,14 @@ phase 8.1).**
   `wlsctx_t`/`wlsctx_app_t`/the xserver_t fix, written directly in
   CIL, installed and tuning-looped to zero denials — see the
   "Per-instance MCS" fact above for what it actually isolates).
-  Next up: the full chain (a sandboxed app through the `--proxy`
-  relay into live sway) and the drag-and-drop audit (6.5.5).
+  The full chain is verified at probe level (a sandboxed
+  `wayland-info` through the `--proxy` relay into live sway).
+  Next up: a real GUI app through the relay — ideally under
+  enforcing mode (the relay/satellites/broker have not yet run in
+  confined mode) — and the 6.5.5 `serve`-label drag refinement
+  (the audit itself is closed); 6.4 (the varlink tier) stays
+  parked until a released systemd ships `PIDs` in
+  `StartTransient`.
 
 ## Commit conventions
 
