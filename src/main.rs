@@ -562,6 +562,13 @@ fn format_secs(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::policy_from_cli;
+    use crate::sandbox::userns::tests::run_in_child;
+    use crate::testutil::TmpDir;
+    use nix::sys::wait::waitpid;
+    use nix::unistd::{ForkResult, fork};
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use wlsctx::pdeathsig::{ensure_shim, get, set};
 
     #[test]
     fn absent_flag_is_pass_through_not_hide_all() {
@@ -594,5 +601,157 @@ mod tests {
         assert_eq!(p.allow_count(), 2);
         assert!(p.allows("wl_shm"));
         assert!(p.allows("wl_seat"));
+    }
+
+    /// Compile a C probe that reads its own `PR_GET_PDEATHSIG` and
+    /// exits 0 iff it is 10 (`SIGUSR1`), 3 if the syscall fails, 4 if
+    /// it is anything else. The read uses the 7.x convention (the
+    /// value is written to the pointer in `arg2`), so the probe is a
+    /// faithful stand-in for what the app process sees after its exec.
+    fn build_probe(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let c = dir.join(format!("{name}.c"));
+        std::fs::write(
+            &c,
+            r#"#include <sys/prctl.h>
+#include <unistd.h>
+int main(void) {
+    int v = -12345;
+    if (prctl(PR_GET_PDEATHSIG, &v, 0, 0, 0) != 0) {
+        return 3;
+    }
+    return (v == 10) ? 0 : 4;
+}
+"#,
+        )
+        .unwrap_or_else(|e| panic!("writing the probe source {c:?}: {e}"));
+        let bin = dir.join(name);
+        let out = std::process::Command::new("cc")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&bin)
+            .arg(&c)
+            .output()
+            .unwrap_or_else(|e| panic!("invoking cc for {name}: {e}"));
+        if !out.status.success() {
+            panic!(
+                "cc {name} failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        bin
+    }
+
+    /// decision #42: the 7.x set/fork-reset mechanics. `set` must
+    /// read back its value; `fork` must **reset** the child to 0
+    /// (not inherit it); and the child's own `set` must then read
+    /// back. This is why every link in the cascade arms itself after
+    /// its own fork instead of relying on inheritance.
+    #[test]
+    fn pdeathsig_set_get_and_fork_reset() {
+        let (code, out, err) = run_in_child(|o| {
+            if !set(10) {
+                let _ = writeln!(o, "set: failed");
+                return 11;
+            }
+            let after_set = get();
+            let _ = writeln!(o, "after_set: {after_set}");
+            match unsafe { fork() } {
+                Ok(ForkResult::Child) => {
+                    // The fork just now reset the value to 0.
+                    let in_child = get();
+                    let _ = writeln!(o, "in_child: {in_child}");
+                    if !set(10) {
+                        let _ = writeln!(o, "child set: failed");
+                        std::process::exit(12);
+                    }
+                    let after_set2 = get();
+                    let _ = writeln!(o, "after_set2: {after_set2}");
+                    std::process::exit(0);
+                }
+                Ok(ForkResult::Parent { child }) => {
+                    // Wait for the grandchild so its (shared) pipe
+                    // write end is released before the drain.
+                    let _ = waitpid(Some(child), None);
+                    0
+                }
+                Err(e) => {
+                    let _ = writeln!(o, "fork: {e}");
+                    13
+                }
+            }
+        });
+        assert_eq!(code, Some(0), "unexpected exit:\n{out}\n{err}");
+        assert!(
+            out.contains("after_set: 10"),
+            "set must read back 10:\n{out}"
+        );
+        assert!(out.contains("in_child: 0"), "fork must reset to 0:\n{out}");
+        assert!(
+            out.contains("after_set2: 10"),
+            "the child's set must read back 10:\n{out}"
+        );
+    }
+
+    /// decision #42: a plain same-uid `exec` (no setuid/setgid, no
+    /// capability change) does **not** clear the belt — `fs/exec.c`
+    /// clears `pdeathsig` only for `bprm->secureexec` and
+    /// `kernel/cred.c` only on an actual credential change. So the
+    /// pre-exec `set` survives the exec. (The confined run clears it
+    /// — a SELinux credential change — which is what the shim
+    /// re-arms; see the next test.)
+    #[test]
+    fn plain_exec_preserves_the_pdeathsig_belt() {
+        let dir = TmpDir::new("pdeathsig-exec");
+        let probe = build_probe(dir.path(), "exec-probe");
+        let probe_s = probe.to_string_lossy().into_owned();
+        let (code, out, err) = run_in_child(move |o| {
+            if !set(10) {
+                let _ = writeln!(o, "set: failed");
+                std::process::exit(14);
+            }
+            // A plain exec: the belt (10) must survive. `exec` (safe
+            // in this toolchain) replaces the process on success —
+            // the only way out of the call is its failure `Error`.
+            let mut cmd = std::process::Command::new(&probe_s);
+            let e = cmd.exec();
+            let _ = writeln!(o, "exec: {e}");
+            std::process::exit(15);
+        });
+        assert_eq!(
+            code,
+            Some(0),
+            "the probe must read back 10 after a plain exec:\n{out}\n{err}"
+        );
+    }
+
+    /// decision #42: with **no** pre-exec belt, the `LD_PRELOAD`
+    /// shim's constructor re-arms the signal across the exec. This is
+    /// the confined-mode answer (the exec's SELinux credential change
+    /// clears the belt) and the belt-and-bridle for any exec that
+    /// does clear it.
+    #[test]
+    fn pdeathsig_shim_rearms_after_exec() {
+        let dir = TmpDir::new("pdeathsig-shim");
+        let shim = ensure_shim(dir.path().to_str().expect("an absolute path"), 10)
+            .expect("the shim must compile (cc is on the dev host)");
+        let probe = build_probe(dir.path(), "shim-probe");
+        let probe_s = probe.to_string_lossy().into_owned();
+        let shim_s = shim.to_string_lossy().into_owned();
+        let (code, out, err) = run_in_child(move |o| {
+            // No belt: leave the value at 0 (what the fork reset it
+            // to) so the *only* thing that can arm it is the shim.
+            let _ = set(0);
+            let mut cmd = std::process::Command::new(&probe_s);
+            cmd.env("LD_PRELOAD", &shim_s);
+            // As above: the only way out of `exec` is a failure `Error`.
+            let e = cmd.exec();
+            let _ = writeln!(o, "exec: {e}");
+            std::process::exit(17);
+        });
+        assert_eq!(
+            code,
+            Some(0),
+            "the shim must re-arm 10 across the exec:\n{out}\n{err}"
+        );
     }
 }

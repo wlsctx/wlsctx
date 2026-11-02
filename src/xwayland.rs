@@ -49,13 +49,17 @@
 //! `--no-rootless` for the framed window). As a lifetime backstop
 //! the sidecar sets `PR_SET_PDEATHSIG` to SIGTERM in `pre_exec`,
 //! and re-arms it inside the child with a small `LD_PRELOAD` shim
-//! (`ensure_shim`) where the exec clears it (here: a SELinux domain
-//! transition into `xserver_t` changes the process's security
-//! credentials, and the kernel clears pdeathsig on such an exec):
-//! Xwayland has no lifetime fd (unlike `xdg-dbus-proxy`), so without
-//! this a SIGKILL'd satellite would leave an idle X server holding
-//! the instance socket; with it, Xwayland gets SIGTERM whenever the
-//! satellite dies — however it dies — and shuts down cleanly.
+//! (`crate::pdeathsig::ensure_shim`) for the exec that clears it
+//! (the `xserver_t` transition changes the SID, and 7.2's
+//! `security/selinux/hooks.c` sets `bprm->secureexec` on a denied
+//! `noatsecure` between the old and new SIDs, so the exec clears
+//! the belt; decision #37 field-verified exactly that on the
+//! then-current kernel — the shim re-arms it either way, which is
+//! the point of it): Xwayland has no lifetime fd
+//! (unlike `xdg-dbus-proxy`), so without this a SIGKILL'd satellite
+//! would leave an idle X server holding the instance socket; with
+//! it, Xwayland gets SIGTERM whenever the satellite dies — however
+//! it dies — and shuts down cleanly.
 //!
 //! The sidecar sets `umask(0077)` before creating anything: the
 //! instance dir (if new) and the socket it binds are owner-only from
@@ -366,60 +370,6 @@ fn bind_unix(fd: &std::os::fd::BorrowedFd<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// The C source of the pdeathsig-restore shim ([`ensure_shim`]).
-const PDEATHSIG_SHIM_SRC: &str = r#"
-#define _GNU_SOURCE
-#include <signal.h>
-#include <sys/prctl.h>
-__attribute__((constructor)) static void wlsctx_restore_pdeathsig(void) {
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
-}
-"#;
-
-/// Compile (or reuse) the pdeathsig-restore shim in the instance dir.
-///
-/// The satellite sets `PR_SET_PDEATHSIG` in `pre_exec`, but this
-/// machine's Xwayland execs into the `xserver_t` SELinux domain, and
-/// the kernel clears pdeathsig on any exec that changes the
-/// process's security credentials (`security_bprm_committing_creds`)
-/// — with neither setuid nor AT_SECURE (both stay unset, which is
-/// why glibc still honors `LD_PRELOAD` here). The shim's constructor
-/// re-sets the signal after the transition; on systems that do not
-/// clear it, the re-set is a harmless no-op.
-///
-/// Returns `None` (and logs a warning) when no compiler is
-/// available: the satellite still works, a SIGKILL'd satellite then
-/// leaves an idle Xwayland behind, and the SIGTERM path still tears
-/// down cleanly.
-fn ensure_shim(dir: &str) -> Option<std::path::PathBuf> {
-    let dir = std::path::Path::new(dir);
-    let so = dir.join("pdeathsig-restore.so");
-    if so.exists() {
-        return Some(so);
-    }
-    let c = dir.join("pdeathsig-restore.c");
-    if std::fs::write(&c, PDEATHSIG_SHIM_SRC).is_err() {
-        return None;
-    }
-    match process::Command::new("cc")
-        .arg("-shared")
-        .arg("-fPIC")
-        .arg("-o")
-        .arg(&so)
-        .arg(&c)
-        .status()
-    {
-        Ok(s) if s.success() => Some(so),
-        _ => {
-            eprintln!(
-                "wlsctx: warning: could not compile the pdeathsig restore shim ({c:?}); \
-                 a SIGKILL'd satellite would leave Xwayland behind"
-            );
-            None
-        }
-    }
-}
-
 /// The `Xwayland` command line: `BIN :N -listenfd 4 -displayfd 5
 /// -auth <path> -nolisten tcp [-rootless]`.
 ///
@@ -504,8 +454,9 @@ pub fn run(cfg: Config) -> Result<()> {
     let listen_fd = listen.as_fd().as_raw_fd();
     let df_child_fd = df_child.as_fd().as_raw_fd();
 
-    // The pdeathsig-restore shim (see `ensure_shim`), if it builds.
-    let shim = ensure_shim(&dir);
+    // The pdeathsig-restore shim (decision #37; see
+    // `crate::pdeathsig`), if it builds.
+    let shim = crate::pdeathsig::ensure_shim(&dir, libc::SIGTERM);
 
     let argv = xwayland_argv(&cfg, &auth);
     let wl_display = wayland_display(&cfg)?;
@@ -522,7 +473,7 @@ pub fn run(cfg: Config) -> Result<()> {
         .stdout(process::Stdio::inherit())
         .stderr(process::Stdio::inherit());
     // Re-arm the lifetime backstop inside the child (see
-    // `ensure_shim`): append to any inherited LD_PRELOAD.
+    // `crate::pdeathsig`): append to any inherited LD_PRELOAD.
     if let Some(shim) = &shim {
         let shim_s = shim.to_string_lossy().into_owned();
         match std::env::var("LD_PRELOAD") {

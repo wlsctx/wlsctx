@@ -26,7 +26,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 /// The tagged Wayland socket of this run (Phase 5.1), created by S
@@ -77,6 +77,13 @@ pub(crate) struct SandboxConfig {
 /// │     reaps B, exits with B's status
 /// │  └─ B: ipc → uts → net (per mode) → fresh /proc → verify → exec (PID 1)
 /// ```
+///
+/// The pdeathsig cascade (decision #42) covers S dying without a
+/// controlled exit (a SIGKILL, a crash): A carries
+/// pdeathsig←S(`SIGUSR1`) and kills B, and B carries
+/// pdeathsig←A — re-armed across its confined exec by the
+/// `LD_PRELOAD` shim (`wlsctx::pdeathsig`) — so no member of the
+/// lineage is left behind unsupervised.
 ///
 /// `S` (us) never enters a namespace, so the app remains a normal,
 /// reappable child for signalling and `waitpid`. When `B` (PID 1)
@@ -189,6 +196,22 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     let runtime_dir = mounts::instance_runtime_dir(config);
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("creating the per-instance runtime dir {runtime_dir}"))?;
+    // decision #42: the pdeathsig-restore shim (B's post-exec
+    // re-arm; see `wlsctx::pdeathsig`), built here — before any
+    // fork — into the instance runtime dir, which the rootfs carry
+    // brings into the sandbox at `sandbox_runtime` (defined below).
+    // Only in confined mode: a confined exec is a credential change
+    // and the kernel clears pdeathsig on it; unconfined, the
+    // pre-exec setting below already survives the exec, and there
+    // is no reason to put an `LD_PRELOAD` in front of the app. A
+    // failed build degrades to the pre-exec belt alone (logged in
+    // `ensure_shim`) — an app's launch must never depend on the
+    // shim existing.
+    let shim = if wlsctx::mcs::is_confined() {
+        wlsctx::pdeathsig::ensure_shim(&runtime_dir, libc::SIGUSR1)
+    } else {
+        None
+    };
     // The same dir's path *inside the sandbox* (the fresh `/run`'s
     // systemd-standard location, decision #28). The policy grants
     // and the app's env use this string: it is the one the app sees,
@@ -287,6 +310,27 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                 sa,
                 aw
             );
+            // decision #42: the pdeathsig cascade, first link
+            // (A←S): whenever S dies — a SIGKILL, a crash, anything
+            // the AppKillGuard cannot intercept — the kernel queues
+            // SIGUSR1 at us. SIGUSR1, deliberately not SIGTERM: A
+            // keeps the pre-fork block on TERM/INT/HUP (below), and
+            // a pdeathsig that lands in a block stays *pending*
+            // forever and would never be delivered, while the block
+            // itself must stay (a group-wide Ctrl-C must not kill
+            // A before it reaps B). Nothing else in the pipeline
+            // sends USR1, so the signal means exactly "S is gone".
+            // A never execs, so the setting survives (unlike B's —
+            // see the shim). 7.2 `fork` resets the value to 0 (it
+            // is *not* inherited), so B arms its own link itself,
+            // explicitly, right before its exec.
+            if !wlsctx::pdeathsig::set(libc::SIGUSR1) {
+                let e = std::io::Error::last_os_error();
+                error!(
+                    "A: setting the pdeathsig failed: {e}; \
+                     the S-death backstop is off for this run"
+                );
+            }
             // A *keeps* the pre-fork block on the forwardable
             // signals: it must survive a group-wide TERM/INT/HUP
             // (Ctrl-C, `timeout`, systemd's kill) until it has
@@ -430,9 +474,85 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                         error!("sandbox setup failed: {e:#}");
                         std::process::exit(126);
                     }
-                    exec_app(command, &app_env(config, &runtime_dir));
+                    // decision #42: B's link in the cascade (B←A).
+                    // 7.2 `fork` reset the value to 0, so this set
+                    // is an arming, not a re-arm (the belt) — and
+                    // in confined mode the shim (the bridle)
+                    // re-arms it *after* the transition: a SELinux
+                    // exec that *changes the domain* (the confined
+                    // run: `wlsctx_t` → `wlsctx_app_t`) sets
+                    // `secureexec` (the default-denied `noatsecure`
+                    // check in the SID-change branch of
+                    // `security/selinux/hooks.c`), so `fs/exec.c`
+                    // clears the belt — `commit_creds`
+                    // (`kernel/cred.c`) clears it independently on
+                    // an actual credential change as well. In
+                    // unconfined mode nothing clears it, the belt
+                    // survives the exec as is, and no shim is built
+                    // (above) or loaded.
+                    // `prctl` is not trapped by the filter
+                    // installed above, so the constructor is safe
+                    // to run under it; the loader's `openat` of the
+                    // `.so` is trapped and allowed (the file sits in
+                    // the app's own writable runtime dir).
+                    if !wlsctx::pdeathsig::set(libc::SIGUSR1) {
+                        let e = std::io::Error::last_os_error();
+                        warn!("B: re-arming the pdeathsig failed: {e}");
+                    }
+                    let mut env = app_env(config, &runtime_dir);
+                    if let Some(shim) = &shim {
+                        let shim_in = std::path::Path::new(&sandbox_runtime)
+                            .join(shim.file_name().expect("the shim path has a file name"));
+                        let shim_s = shim_in.to_string_lossy().into_owned();
+                        // Append, never clobber: a profile may set
+                        // its own LD_PRELOAD.
+                        if let Some(existing) = env.get("LD_PRELOAD").cloned() {
+                            env.insert("LD_PRELOAD".into(), format!("{existing}:{shim_s}"));
+                        } else {
+                            env.insert("LD_PRELOAD".into(), shim_s);
+                        }
+                    }
+                    exec_app(command, &env);
                 }
                 ForkResult::Parent { child } => {
+                    // decision #42: install the pdeathsig handler
+                    // now — *after* the second fork, so B does not
+                    // inherit it (B's USR1 stays at its default
+                    // disposition: a delivery to B kills B, which
+                    // is the pre-exec answer to "A is gone"; B's
+                    // exec resets the handler again, and in
+                    // confined mode the loader re-arms the
+                    // *signal*). The handler only sets a flag (a
+                    // single word store — the only
+                    // async-signal-safe action it takes); the
+                    // actual teardown runs in normal context
+                    // below, woken by the `EINTR` the delivery
+                    // causes in A's blocking operations. `sa_mask`
+                    // is A's current block, so the TERM/INT/HUP
+                    // block is not dropped for the handler's
+                    // duration (an empty `sa_mask` would unblock
+                    // them while the handler runs).
+                    {
+                        let mask = match &fwd_mask {
+                            Some(m) => *m,
+                            None => nix::sys::signal::SigSet::empty(),
+                        };
+                        let act = nix::sys::signal::SigAction::new(
+                            nix::sys::signal::SigHandler::Handler(a_s_gone_handler),
+                            nix::sys::signal::SaFlags::empty(),
+                            mask,
+                        );
+                        // SAFETY: a valid handler and a valid mask
+                        // (A's own block or empty); no SA_SIGINFO.
+                        if let Err(e) = unsafe {
+                            nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGUSR1, &act)
+                        } {
+                            warn!(
+                                "A: installing the pdeathsig handler failed: {e}; \
+                                 the S-death backstop is off for this run"
+                            );
+                        }
+                    }
                     // A is done with the B→A pipe's write end (B holds
                     // the only writer now) — close our copy *before*
                     // blocking on the read below: if B dies before
@@ -528,12 +648,22 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     // fatal `EINTR` here used to exit 126 *without*
                     // reaping B, leaving B (reparented to the host
                     // init) running on forever, unsupervised.
-                    let code = match waitpid_retry(child, "the app child") {
+                    // decision #42: if the pdeathsig was delivered
+                    // while A was in one of its fast (non-blocking)
+                    // operations, tear down before entering the
+                    // blocking wait.
+                    a_pdeath_check(child.as_raw());
+                    let code = match waitpid_retry(child, "the app child", Some(&A_S_GONE)) {
                         Ok(WaitStatus::Exited(_, code)) => code,
                         Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
                         Ok(other) => {
                             error!("unexpected wait status for the app child: {other:?}");
                             126
+                        }
+                        // The pdeathsig escape (see `waitpid_retry`):
+                        // S is gone — kill B and leave.
+                        Err(e) if e.downcast_ref::<Errno>() == Some(&Errno::EINTR) => {
+                            a_tear_down(child.as_raw());
                         }
                         Err(e) => {
                             error!("waiting for the app child failed: {e:#}");
@@ -682,7 +812,7 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
             // wait, and a fatal `EINTR` here used to kill S — and
             // with it the forwarder thread, whose TERM→KILL
             // escalation is the only thing keeping B finite.
-            let code = match waitpid_retry(child, "the sandbox child")? {
+            let code = match waitpid_retry(child, "the sandbox child", None)? {
                 WaitStatus::Exited(_, code) => code,
                 // 128+signal, the shell convention.
                 WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
@@ -825,7 +955,10 @@ fn sweep_runtime_dir(dir: &std::path::Path, own_tagged: Option<&str>, kept: &mut
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            warn!("cleaning the runtime dir {}: read_dir failed: {e}", dir.display());
+            warn!(
+                "cleaning the runtime dir {}: read_dir failed: {e}",
+                dir.display()
+            );
             return;
         }
     };
@@ -876,10 +1009,7 @@ fn sweep_runtime_dir(dir: &std::path::Path, own_tagged: Option<&str>, kept: &mut
                     let _ = std::fs::remove_file(&path);
                 }
                 Err(e) => {
-                    warn!(
-                        "cannot liveness-probe {} ({e}); keeping it",
-                        path.display()
-                    );
+                    warn!("cannot liveness-probe {} ({e}); keeping it", path.display());
                     *kept += 1;
                 }
             }
@@ -1014,6 +1144,62 @@ fn terminate_app(pid: i32, stop: &Arc<AtomicBool>) {
     }
 }
 
+/// decision #42: set by A's SIGUSR1 handler (the pdeathsig: S has
+/// died), consumed by A's loops and teardown. A plain `i32` is a
+/// `sig_atomic_t` on this platform: the handler's single-word
+/// store is atomic on this architecture, which is the whole of its
+/// async-signal-safe work. A is single-threaded, so there is no
+/// other writer and no synchronization beyond that.
+static A_S_GONE: AtomicI32 = AtomicI32::new(0);
+
+/// A's pdeathsig handler (decision #42): set the flag and return.
+/// The teardown deliberately does *not* run here — a signal handler
+/// may only do async-signal-safe work, and the teardown's logging
+/// and `kill` sequence belongs in normal context. The delivery
+/// interrupts A's blocking `waitpid` with `EINTR`, and that is the
+/// wake-up. The only action is the single word store (a
+/// `sig_atomic_t` on this platform), which is atomic on this
+/// architecture.
+extern "C" fn a_s_gone_handler(_sig: i32) {
+    A_S_GONE.store(1, Ordering::Relaxed);
+}
+
+/// decision #42: check the pdeathsig flag (call sites: A's fast
+/// operations, before its blocking wait). Never returns when the
+/// flag is set.
+fn a_pdeath_check(b_host_pid: i32) {
+    if A_S_GONE.load(Ordering::Relaxed) != 0 {
+        a_tear_down(b_host_pid);
+    }
+}
+
+/// decision #42: A's answer to "S is gone": kill B and exit.
+///
+/// B is the only process that matters here, and a `SIGKILL` from
+/// A reaches it both pre-exec and post-exec (decision #13: a
+/// pid-ns init ignores *default-action* signals from outside its
+/// namespace, but `SIGKILL`/`SIGSTOP` from an ancestor namespace
+/// are delivered — A is in the host ns, an ancestor of B's). B's
+/// descendants (the app's children) die with the pid namespace
+/// when its init is killed (the kernel's `zap_pid_ns_processes`);
+/// A cannot sweep the instance sub-cgroup itself — the fresh
+/// rootfs has no cgroup2 view (decision #12: on 7.2 the cgroup2
+/// filesystem is not re-rooted by the cgroup ns) — and S, the
+/// process that can (the [`AppKillGuard`]), is exactly the one
+/// that is dead. The exit code is 137 (128+`SIGKILL`), the
+/// convention for "killed"; it is consumed by nobody (S, the only
+/// reader of A's status, is dead), it just marks the run.
+fn a_tear_down(b_host_pid: i32) -> ! {
+    warn!(
+        "A: the supervisor is gone (pdeathsig) — killing the app \
+         (pid {b_host_pid}) and exiting: the run cannot survive S"
+    );
+    // SAFETY: signalling a pid that was valid at the second fork;
+    // a failure (ESRCH: B died meanwhile) is the desired state.
+    let _ = unsafe { libc::kill(b_host_pid, libc::SIGKILL) };
+    std::process::exit(137);
+}
+
 /// A `waitpid` that retries `EINTR` (decision #41).
 ///
 /// Both reapers live to block in `waitpid` and on nothing else: S
@@ -1029,12 +1215,26 @@ fn terminate_app(pid: i32, stop: &Arc<AtomicBool>) {
 /// the 2 s KILL escalation — with it. Retrying turns the
 /// interrupt into a non-event; the [`AppKillGuard`] is the
 /// backstop for whatever still goes wrong.
-fn waitpid_retry(pid: Pid, what: &str) -> Result<WaitStatus> {
+///
+/// `interrupted` (decision #42): when `Some` and set by the time
+/// an `EINTR` arrives, the retry loop stops and reports the
+/// *unwrapped* `Errno::EINTR` to the caller instead of continuing
+/// — the caller (A) distinguishes this from any other error and
+/// tears down. `None` (S) retries every `EINTR` as before.
+fn waitpid_retry(pid: Pid, what: &str, interrupted: Option<&AtomicI32>) -> Result<WaitStatus> {
     loop {
         // nix 0.31: `waitpid` returns `Result<WaitStatus, Errno>`
         // (`nix::Error` is a type alias for `Errno`).
         match waitpid(Some(pid), None) {
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => {
+                if interrupted.is_some_and(|f| f.load(Ordering::Relaxed) != 0) {
+                    // Deliberately not `with_context`'d: the caller
+                    // must be able to tell this `EINTR` apart
+                    // (`downcast_ref::<Errno>`).
+                    return Err(anyhow!(Errno::EINTR));
+                }
+                continue;
+            }
             other => return other.with_context(|| format!("waiting for {what}")),
         }
     }
@@ -1177,14 +1377,20 @@ fn exec_app(command: &[OsString], env: &std::collections::BTreeMap<String, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxConfig, WaylandSpec, remove_runtime_dir, run_sandboxed};
+    use super::{
+        A_S_GONE, SandboxConfig, WaylandSpec, a_pdeath_check, a_s_gone_handler, a_tear_down,
+        remove_runtime_dir, run_sandboxed, waitpid_retry,
+    };
     use crate::sandbox::mounts;
     use crate::sandbox::namespaces::NetworkMode;
     use crate::sandbox::userns::tests::run_in_child;
+    use nix::errno::Errno;
+    use nix::unistd::ForkResult;
     use std::ffi::OsString;
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::time::{Duration, Instant};
 
     // A listener whose fd is closed behind the wrapper's back,
     // leaving the socket file in place — a sidecar (relay,
@@ -1255,10 +1461,7 @@ mod tests {
             !own.exists(),
             "the run's own tagged socket is removed by path, not probed"
         );
-        assert!(
-            !inst.exists(),
-            "the now-empty dir must go with it"
-        );
+        assert!(!inst.exists(), "the now-empty dir must go with it");
     }
 
     /// With nothing live left, the lazy cleanup removes the dir
@@ -1593,5 +1796,130 @@ print('CONNECT-OK')";
             msg.contains("READY=1"),
             "the notify message is not READY=1: {msg:?}"
         );
+    }
+
+    /// decision #42: the A-side teardown path,
+    /// driven end to end inside one test child: the production
+    /// handler install (the same `SigAction`/`sigaction` call A
+    /// makes), a *kernel-initiated* USR1 at a process blocked in
+    /// `waitpid` (a one-shot `timer_create` — the pdeathsig's own
+    /// delivery shape: the kernel queues the signal, no other
+    /// process sends it, and no pid namespace is involved — a raw
+    /// pidns probe is never run in a live session, LESSONS #39),
+    /// the `waitpid_retry` escape, and `a_tear_down` (kill the app
+    /// child, exit 137). The pdeathsig *delivery itself* (S dying)
+    /// is covered by the field verification, not here.
+    #[test]
+    fn a_tear_down_on_s_death_flag() {
+        let (code, out, err) = run_in_child(|o| {
+            // Play A: the production handler install (empty block:
+            // this flat test child has none to preserve).
+            let act = nix::sys::signal::SigAction::new(
+                nix::sys::signal::SigHandler::Handler(a_s_gone_handler),
+                nix::sys::signal::SaFlags::empty(),
+                nix::sys::signal::SigSet::empty(),
+            );
+            // SAFETY: valid handler and mask; no SA_SIGINFO.
+            if unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGUSR1, &act) }
+                .is_err()
+            {
+                let _ = writeln!(o, "sigaction: failed");
+                return 3;
+            }
+            // Play B: a grandchild that lives until killed.
+            // SAFETY: fork(2) in a test child; it only sleeps.
+            match unsafe { nix::unistd::fork() } {
+                Ok(ForkResult::Child) => loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                },
+                Ok(ForkResult::Parent { child }) => {
+                    let _ = writeln!(o, "bpid: {}", child.as_raw());
+                    // One-shot timer 500 ms out, delivering USR1 to
+                    // this process (kernel-initiated).
+                    // SAFETY: fixed `timer_create`/`timer_settime`;
+                    // both structs are fully initialized.
+                    let mut sev: libc::sigevent = unsafe { std::mem::zeroed() };
+                    sev.sigev_notify = libc::SIGEV_SIGNAL;
+                    sev.sigev_signo = libc::SIGUSR1;
+                    let spec = libc::itimerspec {
+                        it_interval: libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        },
+                        it_value: libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 500_000_000,
+                        },
+                    };
+                    let mut t: libc::timer_t = std::ptr::null_mut();
+                    if unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut t) } != 0
+                        || unsafe { libc::timer_settime(t, 0, &spec, std::ptr::null_mut()) } != 0
+                    {
+                        let _ = writeln!(o, "timer: failed");
+                        return 4;
+                    }
+                    // If the USR1 was already delivered (early,
+                    // before the wait — the same race A covers with
+                    // its pre-wait check), tear down without
+                    // waiting; the handler has set the flag.
+                    a_pdeath_check(child.as_raw());
+                    let r = waitpid_retry(child, "test app", Some(&A_S_GONE));
+                    let is_eintr = r.as_ref().err().and_then(|e| e.downcast_ref::<Errno>())
+                        == Some(&Errno::EINTR);
+                    let _ = writeln!(o, "escape: {is_eintr}");
+                    if is_eintr {
+                        a_tear_down(child.as_raw());
+                    }
+                    5
+                }
+                Err(e) => {
+                    let _ = writeln!(o, "fork: {e}");
+                    2
+                }
+            }
+        });
+        assert_eq!(
+            code,
+            Some(137),
+            "the teardown must exit 137 (128+SIGKILL):\n{out}\n{err}"
+        );
+        // The USR1 may have been consumed *before* the blocking wait
+        // (the pre-wait check tore down — correct behaviour, no
+        // escape line to report); if a wait was entered, its only
+        // way out is the pdeathsig escape.
+        if let Some(line) = out.lines().find(|l| l.starts_with("escape: ")) {
+            assert_eq!(
+                line, "escape: true",
+                "an interrupted wait must be the pdeathsig escape:\n{out}"
+            );
+        }
+        // B must be dead. The test process is not a child subreaper,
+        // so the SIGKILL'd grandchild is a *zombie* until init reaps
+        // it after the child's death — tolerate that window: dead
+        // means ESRCH on the probe or state `Z` in `/proc`.
+        let bpid = out
+            .lines()
+            .find_map(|l| l.strip_prefix("bpid: "))
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .expect("the child reported B's pid");
+        let mut dead = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            // SAFETY: liveness probe of a pid this test created.
+            dead = unsafe { libc::kill(bpid, 0) } != 0
+                || std::fs::read_to_string(format!("/proc/{bpid}/status"))
+                    .ok()
+                    .is_some_and(|s| {
+                        s.lines().any(|l| {
+                            l.strip_prefix("State:")
+                                .is_some_and(|v| v.trim().starts_with('Z'))
+                        })
+                    });
+            if dead {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(dead, "B must be dead after the teardown (pid {bpid})");
     }
 }

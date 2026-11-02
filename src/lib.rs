@@ -20,5 +20,6 @@
 pub mod broker;
 pub mod dbus_proxy;
 pub mod mcs;
+pub mod pdeathsig;
 pub mod proxy;
 pub mod xwayland;
