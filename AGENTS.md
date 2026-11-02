@@ -79,8 +79,22 @@ phase 8.1).**
     `--display`); `-auth` (MIT cookie), `-nolisten tcp`, `-rootless`
     by default. The lifetime backstop for a SIGKILL'd satellite is
     `PR_SET_PDEATHSIG` (set in `pre_exec`, re-armed in the child by
-    an on-demand-compiled `LD_PRELOAD` shim — the SELinux transition
-    into `xserver_t` clears it on exec; decision #37, LESSONS #19-20)
+    the shared `pdeathsig` shim — the SELinux transition into
+    `xserver_t` clears it on exec; decision #37, LESSONS #19-20)
+- `pdeathsig.rs` — the `PR_SET_PDEATHSIG` lifetime backstop shared
+  by the run pipeline (decision #42) and the `xwayland` satellite
+  (decision #37): `set`/`get` (7.2.11 semantics: `fork` *resets* the
+  value to 0 — it is not inherited, so every cascade link arms
+  itself after its own fork; `execve` clears it when `bprm->secureexec`
+  is set — setuid/setgid/caps, or a SELinux *domain change*, whose
+  default-denied `noatsecure` check sets it — or on an actual
+  credential change; `PR_GET_PDEATHSIG` writes the value to the `arg2`
+  pointer)
+  and `ensure_shim` (the on-demand-compiled `LD_PRELOAD` `.so` whose
+  constructor re-arms the signal after an exec; the file is
+  signal-suffixed, `pdeathsig-restore-<sig>.so`, so `SIGUSR1` (the
+  run pipeline) and `SIGTERM` (the satellite) don't collide in the
+  shared per-instance runtime dir)
 - `src/wayland/` — the tagged Wayland socket for the `run` pipeline:
   `listener` (socket activation / `--listen`), `roundtrip` (bounded
   sync), `context` (the `wp_security_context_v1` exchange)
@@ -90,8 +104,14 @@ phase 8.1).**
   `supervise` (notify-fd handoff, app-pid report, verdict pipe, the
   S-side supervisor loop, #23/#25/#26), `mod` (S→A→B pipeline,
   `run_sandboxed`, the S-side signal forwarder / `terminate_app`,
-  the `waitpid_retry` + `AppKillGuard` orphan backstop, #41,
-  sd-notify, #33)
+  the `waitpid_retry` + `AppKillGuard` orphan backstop, #41, the
+  decision-#42 `PR_SET_PDEATHSIG` cascade — A sets `SIGUSR1` after
+  the first fork and installs its handler after the second (B does
+  not inherit it); the handler only sets a flag, and the delivery's
+  `EINTR` makes `waitpid_retry` escape so A kills B and exits 137;
+  B re-arms its own link pre-exec and, in confined mode, an
+  `LD_PRELOAD` shim re-arms it across the exec (see `pdeathsig.rs`)
+  — sd-notify, #33)
 - `src/profile/` — per-app TOML profiles (`gpu`, `ro_binds`, `rw_binds`,
   `mask`, `env`, …; `deny_unknown_fields`)
 - `src/systemd.rs` — the transient session-bus scope (phase 6.1, #35)
@@ -287,15 +307,16 @@ phase 8.1).**
   for `SCM_RIGHTS` (a dropped fd is silent `MSG_CTRUNC`), the
   fresh-tmpfs symlink label trap, and the `dir` `open`/`read`
   distinction).
-  Next up: the `PR_SET_PDEATHSIG` cascade for the SIGKILL-to-S
-  boundary decision #41 leaves open (A←S — A never execs, so a
-  `pre_exec` set survives — and B←A — B execs, so it needs the
-  decision-#37 `LD_PRELOAD` restore shim), then a confined-mode
-  run of the `dbus-proxy`/`xwayland` satellites and the broker
-  (the relay is now verified confined; they are not), then the
-  6.5.5 `serve`-label drag refinement (the audit itself is
-  closed); 6.4 (the varlink tier) stays parked until a released
-  systemd ships `PIDs` in `StartTransient`.
+  Next up: the field verification of the decision-#42
+  `PR_SET_PDEATHSIG` cascade (A←S `SIGUSR1` — A never execs, so a
+  post-fork set survives; B←A — B execs, so an `LD_PRELOAD` shim
+  re-arms it across the confined exec — SIGKILL S by explicit PID →
+  no orphans), then a confined-mode run of the `dbus-proxy`/
+  `xwayland` satellites and the broker (the relay is now verified
+  confined; they are not), then the 6.5.5 `serve`-label drag
+  refinement (the audit itself is closed); 6.4 (the varlink tier)
+  stays parked until a released systemd ships `PIDs` in
+  `StartTransient`.
 
 ## Commit conventions
 
