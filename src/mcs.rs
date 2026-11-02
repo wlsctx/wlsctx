@@ -143,10 +143,7 @@ pub fn self_reexec_with_category(app_id: &str, instance_id: &str) -> Result<()> 
     // current range against this target, so the target must be in
     // that canonical form. Writing either form as the exec context
     // parses to the same range; reporting only happens on read.
-    self_reexec_to_range(&format!(
-        "s0:c{}",
-        instance_category(app_id, instance_id)
-    ))
+    self_reexec_to_range(&format!("s0:c{}", instance_category(app_id, instance_id)))
 }
 
 /// The **broker** (shared by all instances): narrow our own range to
@@ -275,8 +272,7 @@ mod tests {
         let l = parse_label("unconfined_u:unconfined_r:wlsctx_t:s0:c264\0").unwrap();
         assert_eq!(l.3, "s0:c264");
         // A low!=high range is not collapsed; both sides are reported.
-        let l =
-            parse_label("unconfined_u:unconfined_r:wlsctx_t:s0-s0:c0.c1023\0").unwrap();
+        let l = parse_label("unconfined_u:unconfined_r:wlsctx_t:s0-s0:c0.c1023\0").unwrap();
         assert_eq!(l.3, "s0-s0:c0.c1023");
         // And a payload that stops carrying a NUL still parses.
         let l = parse_label("u:r:ty:s0").unwrap();

@@ -303,9 +303,8 @@ mod tests {
         // Two missing levels: the instance dir and one above it.
         let sock = dir.path().join("wlsctx/foot-1/wayland-1");
         with_env(&[("XDG_RUNTIME_DIR", None)], || {
-            let (_, _, listener) =
-                obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
-                    .expect("a missing parent dir must be created, not an error");
+            let (_, _, listener) = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
+                .expect("a missing parent dir must be created, not an error");
             assert_eq!(socket_path(&listener).as_deref(), Some(sock.as_path()));
             let mode = fs::metadata(sock.parent().unwrap())
                 .expect("parent exists")
@@ -326,15 +325,11 @@ mod tests {
         fs::set_permissions(&inst, fs::Permissions::from_mode(0o755)).unwrap();
         let sock = inst.join("wayland-1");
         with_env(&[("XDG_RUNTIME_DIR", None)], || {
-            let (_, _, listener) =
-                obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
-                    .expect("bind into an existing parent must work");
+            let (_, _, listener) = obtain_listener(&test_wayland_listen(sock.to_str().unwrap()))
+                .expect("bind into an existing parent must work");
             assert_eq!(socket_path(&listener).as_deref(), Some(sock.as_path()));
             let mode = fs::metadata(&inst).unwrap().permissions().mode() & 0o777;
-            assert_eq!(
-                mode, 0o755,
-                "a pre-existing parent must keep its mode"
-            );
+            assert_eq!(mode, 0o755, "a pre-existing parent must keep its mode");
         });
     }
 

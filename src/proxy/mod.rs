@@ -150,9 +150,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
-    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, recvmsg, send,
-    sendmsg,
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, send, sendmsg,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsString};
@@ -661,33 +660,32 @@ impl Relay {
             .count();
         let take = src_fds.len().min(n_fds);
         let mut scratch: VecDeque<OwnedFd> = src_fds.drain(0..take).collect();
-        let (msg, rest) = wire::parse_message(raw, desc.signature, &mut scratch)
-            .map_err(|e| {
-                // The failure names the message: a `MissingFd` here
-                // means the sender put an `fd` argument in the
-                // message but no matching SCM_RIGHTS arrived with it
-                // (or the pair got split across the relay's
-                // reassembly boundary and the fd was consumed by an
-                // earlier message). Without the sender/opcode, a
-                // dropped connection is undiagnosable.
-                let what = match &e {
-                    wire::Error::MissingFd => format!(
-                        "'{}' on {} ({:?}) references a file descriptor \
+        let (msg, rest) = wire::parse_message(raw, desc.signature, &mut scratch).map_err(|e| {
+            // The failure names the message: a `MissingFd` here
+            // means the sender put an `fd` argument in the
+            // message but no matching SCM_RIGHTS arrived with it
+            // (or the pair got split across the relay's
+            // reassembly boundary and the fd was consumed by an
+            // earlier message). Without the sender/opcode, a
+            // dropped connection is undiagnosable.
+            let what = match &e {
+                wire::Error::MissingFd => format!(
+                    "'{}' on {} ({:?}) references a file descriptor \
                          that never arrived ({} of {} fd(s) were queued)",
-                        desc.name,
-                        sender.name,
-                        dir,
-                        take,
-                        n_fds
-                    ),
-                    other => other.to_string(),
-                };
-                RelayEnd::Protocol(what)
-            })?;
+                    desc.name, sender.name, dir, take, n_fds
+                ),
+                other => other.to_string(),
+            };
+            RelayEnd::Protocol(what)
+        })?;
         debug!(
             "{:?}: {} '{}' on {} ({} fd(s) consumed, {} queued)",
             dir,
-            if dir == Dir::ClientToServer { "c2s" } else { "s2c" },
+            if dir == Dir::ClientToServer {
+                "c2s"
+            } else {
+                "s2c"
+            },
             desc.name,
             sender.name,
             take,
