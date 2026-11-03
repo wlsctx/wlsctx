@@ -278,8 +278,8 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     mount("/", "/", "none", libc::MS_BIND | libc::MS_REC, "")?;
 
     // 3) /dev: a fresh tmpfs with the standard nodes (bound, so they
-    //    keep their genfs labels) and a fresh devpts instance,
-    //    isolated from the host's pts.
+    //    keep their genfs labels), a fresh devpts instance (isolated
+    //    from the host's pts) and a fresh /dev/shm.
     mount("none", "/dev", "tmpfs", 0, "mode=755")?;
     for n in DEV_NODES {
         // The fresh tmpfs is empty: the bind target must exist first.
@@ -308,6 +308,16 @@ pub(crate) fn build_rootfs(cfg: &SandboxConfig) -> Result<()> {
     // The new instance's ptmx — binding the host's would hand the
     // app the host's pts master. Relative target, devtmpfs style.
     symlink("pts/ptmx", "/dev/ptmx").context("symlinking /dev/ptmx")?;
+    // /dev/shm: a fresh private tmpfs (mode 1777, like the host's).
+    // The build previously never created it, so any app that opens a
+    // shared-memory file (or maps one through the `wl_shm`/`posix`
+    // path) got `ENOENT` on the directory — the `wev` windowing test
+    // hit exactly this. It is not part of the carried tree, so it
+    // must be built here on the fresh `/dev` tmpfs. Its inodes take
+    // the fresh-tmpfs default label (`tmpfs_t`), which the app's
+    // `tmpfs_t` grants (dir + file) already cover; no new policy.
+    std::fs::create_dir("/dev/shm").context("creating /dev/shm")?;
+    mount("none", "/dev/shm", "tmpfs", 0, "mode=1777")?;
     if cfg.gpu {
         build_gpu()?;
     }

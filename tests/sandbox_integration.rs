@@ -136,8 +136,8 @@ def fstype(mp):
         if len(p) >= 3 and p[1] == mp:
             r = p[2]
     return r or "ABSENT"
-for k, mp in [("MT_DEV","/dev"),("MT_SYS","/sys"),("MT_RUN","/run"),
-              ("MT_TMP","/tmp"),("MT_PROC","/proc")]:
+for k, mp in [("MT_DEV","/dev"),("MT_DEVSHM","/dev/shm"),("MT_SYS","/sys"),
+              ("MT_RUN","/run"),("MT_TMP","/tmp"),("MT_PROC","/proc")]:
     print(k + "=" + fstype(mp))
 print("DEV_NODES=" + "|".join(sorted(os.path.basename(x) for x in glob.glob("/dev/*"))))
 print("SYS_FS=" + "|".join(sorted(os.listdir("/sys/fs"))))
@@ -432,6 +432,7 @@ fn rootfs_is_rebuilt_not_masked() {
     let run = expect_ok(run_probe("it-fs", &[], &[], ROOTFS), "the rootfs probe");
     for (k, want) in [
         ("MT_DEV", "tmpfs"),
+        ("MT_DEVSHM", "tmpfs"),
         ("MT_SYS", "tmpfs"),
         ("MT_RUN", "tmpfs"),
         ("MT_TMP", "tmpfs"),
@@ -444,10 +445,12 @@ fn rootfs_is_rebuilt_not_masked() {
             run.out
         );
     }
+    // `shm` is the build's own fresh tmpfs mount (the `wev`-class
+    // apps need it to exist); everything else must be a bound node.
     assert_eq!(
         kv(&run.out, "DEV_NODES"),
-        Some("full|null|ptmx|pts|random|tty|urandom|zero"),
-        "/dev holds more than the standard nodes (it is not a fresh tmpfs of binds):\n{}",
+        Some("full|null|ptmx|pts|random|shm|tty|urandom|zero"),
+        "/dev holds more than the standard nodes + the fresh /dev/shm (it is not a fresh tmpfs of binds):\n{}",
         run.out
     );
     assert_eq!(
