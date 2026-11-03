@@ -85,16 +85,26 @@ phase 8.1).**
   by the run pipeline (decision #42) and the `xwayland` satellite
   (decision #37): `set`/`get` (7.2.11 semantics: `fork` *resets* the
   value to 0 — it is not inherited, so every cascade link arms
-  itself after its own fork; `execve` clears it when `bprm->secureexec`
-  is set — setuid/setgid/caps, or a SELinux *domain change*, whose
-  default-denied `noatsecure` check sets it — or on an actual
-  credential change; `PR_GET_PDEATHSIG` writes the value to the `arg2`
-  pointer)
+  itself after its own fork; `execve` clears it **unconditionally on
+  any SELinux SID change** (`selinux_bprm_committing_creds`,
+  `security/selinux/hooks.c:2545`, commit `4ac212ad4e8f`) — the
+  confined exec — and via the legacy paths (`bprm->secureexec`:
+  setuid/setgid/caps or a *denied* `noatsecure`; `commit_creds` on an
+  actual credential change); `PR_GET_PDEATHSIG` writes the value to
+  the `arg2` pointer)
   and `ensure_shim` (the on-demand-compiled `LD_PRELOAD` `.so` whose
-  constructor re-arms the signal after an exec; the file is
-  signal-suffixed, `pdeathsig-restore-<sig>.so`, so `SIGUSR1` (the
-  run pipeline) and `SIGTERM` (the satellite) don't collide in the
-  shared per-instance runtime dir)
+  constructor re-arms the signal after an exec; in confined mode it
+  also relabels the `.so` to the module's `wlsctx_shim_t` — a 7.2
+  `PROT_EXEC` mapping needs `file:execute`, which the confined
+  consumers hold only on that type, LESSONS #41 — and runs the
+  `cc` under a *pinned* exec context, so the vforked compiler stays
+  `wlsctx_t` instead of the module's `typetransition` dragging it
+  into `wlsctx_app_t`, LESSONS #42; the xattr paths go over as
+  `CString` — a raw Rust byte buffer is not NUL-terminated and the
+  kernel reads past it (LESSONS #43); the file is signal-suffixed,
+  `pdeathsig-restore-<sig>.so`, so `SIGUSR1` (the run pipeline) and
+  `SIGTERM` (the satellite) don't collide in the shared per-instance
+  runtime dir)
 - `src/wayland/` — the tagged Wayland socket for the `run` pipeline:
   `listener` (socket activation / `--listen`), `roundtrip` (bounded
   sync), `context` (the `wp_security_context_v1` exchange)
@@ -307,11 +317,18 @@ phase 8.1).**
   for `SCM_RIGHTS` (a dropped fd is silent `MSG_CTRUNC`), the
   fresh-tmpfs symlink label trap, and the `dir` `open`/`read`
   distinction).
-  Next up: the field verification of the decision-#42
-  `PR_SET_PDEATHSIG` cascade (A←S `SIGUSR1` — A never execs, so a
-  post-fork set survives; B←A — B execs, so an `LD_PRELOAD` shim
-  re-arms it across the confined exec — SIGKILL S by explicit PID →
-  no orphans), then a confined-mode run of the `dbus-proxy`/
+  The decision-#42 `PR_SET_PDEATHSIG` cascade is field-verified on
+  both legs (v2.17, LESSONS #44): SIGKILL S → the belt's USR1, A's
+  handler tears B down; SIGKILL A → the belt delivers USR1 into B
+  (the strace signature `si_code=SI_USER`, `si_pid=0` is the
+  cross-pidns pdeathsig marker — the delivery is kernel-internal and
+  invisible to the audit exit filter), and the `AppKillGuard` sweep
+  ends the run with no orphans; the one piece not cleanly isolated
+  is B's own USR1-terminate disposition (B resumed via
+  `restart_syscall` — an `SA_RESTART` action is suspected from the
+  Rust ELF/dynamic-linker startup), which is not load-bearing while
+  the guard exists.
+  Next up: a confined-mode run of the `dbus-proxy`/
   `xwayland` satellites and the broker (the relay is now verified
   confined; they are not), then the 6.5.5 `serve`-label drag
   refinement (the audit itself is closed); 6.4 (the varlink tier)
