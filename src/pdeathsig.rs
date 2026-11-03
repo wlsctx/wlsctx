@@ -17,24 +17,51 @@
 //! * `fork(2)` **resets** the value to 0 (`kernel/fork.c`:
 //!   `p->pdeath_signal = 0`) — it is *not* inherited. Every link
 //!   in a cascade must set it itself, after its own fork;
-//! * `execve` **clears** it on a *domain-changing* exec: the
-//!   `bprm->secureexec` clear in `fs/exec.c` fires whenever
-//!   `secureexec` is set, and a SELinux exec that **changes the
-//!   process's domain** (the confined run: `wlsctx_t` →
-//!   `wlsctx_app_t` / `xserver_t`) sets it unless the policy
-//!   grants the `noatsecure` process permission between the two
-//!   SIDs (`security/selinux/hooks.c`:
-//!   `bprm->secureexec |= !!avc_has_perm(…, PROCESS__NOATSECURE, …)`)
-//!   — that permission is denied by default, so the belt is
-//!   cleared and the post-exec shim re-arms it. setuid/setgid and
-//!   a capability change set `secureexec` too, and `commit_creds`
-//!   (`kernel/cred.c`) clears it independently when uid/gid/caps
-//!   actually change. A *same-domain* exec (unconfined) sets none
-//!   of these, so the pre-exec belt survives — which is why the
-//!   shim is built only in confined mode. (The shim was also
-//!   field-verified necessary on the decision-#37-era kernel,
-//!   LESSONS #19–20; it covers any kernel or exec that clears the
-//!   belt.)
+//! * `execve` **clears** it on any *SID-changing* exec,
+//!   **unconditionally**: `selinux_bprm_committing_creds`
+//!   (`security/selinux/hooks.c:2545`, commit `4ac212ad4e8f`)
+//!   sets `current->pdeath_signal = 0` whenever the exec changes
+//!   the process's SID (`new_crsec->sid != new_crsec->osid`) —
+//!   the confined runs do (`wlsctx_t` → `wlsctx_app_t` /
+//!   `xserver_t`). No permission can prevent it (in particular,
+//!   this policy's granted `noatsecure` on the `wlsctx_t` →
+//!   `wlsctx_app_t` transition is irrelevant to it). The legacy
+//!   paths coexist: a *denied* `noatsecure` check sets
+//!   `bprm->secureexec` (the `xserver_t` transition, where it is
+//!   not granted, takes it), `fs/exec.c` clears the belt on
+//!   `secureexec` (setuid/setgid and a capability change set it
+//!   too), and `commit_creds` (`kernel/cred.c`) clears it
+//!   independently on an actual credential change. But on this
+//!   policy the unconditional SID-transition clear is the
+//!   mechanism that fires on every confined exec — including the
+//!   ones where `noatsecure` is granted. A *same-domain* exec
+//!   (unconfined) changes no SID and none of these fire, so the
+//!   pre-exec belt survives — which is why the run pipeline
+//!   builds the shim only in confined mode (the `xwayland`
+//!   satellite builds it unconditionally: its exec transitions to
+//!   `xserver_t` in confined mode and the re-arm is idempotent in
+//!   the other). (The shim was also field-verified necessary on
+//!   the decision-#37-era kernel, LESSONS #19–20; it covers any
+//!   kernel or exec that clears the belt.)
+//!
+//!   **The `.so`'s label:** in confined mode `ensure_shim`
+//!   relabels the compiled `.so` to the module's dedicated
+//!   `wlsctx_shim_t` type (setxattr — on this kernel `filecon`
+//!   does not label created inodes). A confined consumer maps it
+//!   with `PROT_EXEC`, which on 7.2 needs `file:execute`
+//!   (`file_map_prot_to_av`) — granted on `wlsctx_shim_t` by the
+//!   two consumer types only, and on no base-policy type an
+//!   app can read from the instance runtime dir. A failed
+//!   relabel degrades like a failed build (a warning; the
+//!   confined consumer cannot map a mislabeled `.so`). And the
+//!   on-demand compile itself runs with the current context
+//!   *pinned* into the cred's one-shot exec context (written to
+//!   `/proc/self/attr/exec` before the vfork of `cc`, cleared
+//!   after): the vforked child shares this cred, and the explicit
+//!   context keeps the compiler in `wlsctx_t` instead of the
+//!   module's `typetransition` dragging it into `wlsctx_app_t`
+//!   (`wlsctx_t + bin_t:process`), which lacks the `tmp_t`
+//!   grants for its temp files.
 //! * `PR_GET_PDEATHSIG` **writes the value to the pointer in
 //!   `arg2`** and returns 0 (or -EFAULT) — the ≤ 6.x convention of
 //!   returning the value is gone (`kernel/sys.c`).
@@ -83,6 +110,19 @@ __attribute__((constructor)) static void wlsctx_restore_pdeathsig(void) {{
 /// `ensure_shim` reuses whatever file is already there — so
 /// different signals must not collide on one name.
 ///
+/// In confined mode the `.so` is (re)labeled to the module's
+/// `wlsctx_shim_t` type after compilation — and on the reuse
+/// path, when a file left by an older build does not carry it yet
+/// (see the module docs for why a confined consumer cannot map a
+/// mislabeled `.so`).
+///
+/// In confined mode the `cc` spawn additionally runs under a
+/// pinned exec context (`pin_self_exec_context` /
+/// `clear_exec_context` below): the compiler is vforked from
+/// this process and shares its cred, and the module's
+/// `typetransition` rules would otherwise carry it into
+/// `wlsctx_app_t` (see those functions for why that matters).
+///
 /// Returns the `.so` path, or `None` (with a warning) when no
 /// compiler is available (see the module docs for the
 /// degradation).
@@ -90,6 +130,7 @@ pub fn ensure_shim(dir: &str, sig: i32) -> Option<PathBuf> {
     let dir = std::path::Path::new(dir);
     let so = dir.join(format!("pdeathsig-restore-{sig}.so"));
     if so.exists() {
+        relabel_if_needed(&so);
         return Some(so);
     }
     let c = dir.join(format!("pdeathsig-restore-{sig}.c"));
@@ -97,7 +138,8 @@ pub fn ensure_shim(dir: &str, sig: i32) -> Option<PathBuf> {
         eprintln!("wlsctx: warning: could not write the pdeathsig-restore shim source {c:?}");
         return None;
     }
-    match std::process::Command::new("cc")
+    pin_self_exec_context();
+    let compiled = match std::process::Command::new("cc")
         .arg("-shared")
         .arg("-fPIC")
         .arg("-o")
@@ -105,14 +147,178 @@ pub fn ensure_shim(dir: &str, sig: i32) -> Option<PathBuf> {
         .arg(&c)
         .status()
     {
-        Ok(s) if s.success() => Some(so),
+        Ok(s) if s.success() => true,
         _ => {
             eprintln!(
                 "wlsctx: warning: could not compile the pdeathsig-restore shim {c:?}; \
                  a SIGKILL'd supervisor would leave its child behind"
             );
-            None
+            false
         }
+    };
+    clear_exec_context();
+    if !compiled {
+        return None;
+    }
+    relabel_if_needed(&so);
+    Some(so)
+}
+
+/// Write the current process's own context into the one-shot exec
+/// context (`/proc/self/attr/exec`), so that a child which `exec`s
+/// out of this process's *shared cred* — the `cc` below, vforked by
+/// the std `Command` — lands in **exactly this** context. The
+/// explicit context bypasses the module's `typetransition` rules
+/// (`wlsctx_t + bin_t:process` → `wlsctx_app_t` would otherwise
+/// carry the compiler into the app domain, which lacks the
+/// `tmp_t` dir/file grants for its temp files — a hard failure when
+/// the CWD is not a writable `user_tmp_t` dir, and denials even
+/// when it is) — and because the old and new SID are identical,
+/// `check_nnp_nosuid` (`security/selinux/hooks.c`) takes its
+/// `new_crsec->sid == old_crsec->sid` fast path: no `noatsecure`,
+/// no NNP/NOSUID checks at all.
+///
+/// The write is *one-shot per cred*: the consuming child's `exec`
+/// copies the cred (`bprm_set_creds`) and zeroes its own copy of
+/// `exec_sid`, while this process's cred keeps the pending SID
+/// until `clear_exec_context` — so the two are always paired.
+fn pin_self_exec_context() {
+    if !crate::mcs::is_confined() {
+        return;
+    }
+    let cur = match std::fs::read_to_string("/proc/self/attr/current") {
+        Ok(c) => c.trim().to_string(),
+        Err(_) => return, // no readable current context; nothing to pin
+    };
+    if std::fs::write("/proc/self/attr/exec", &cur).is_err() {
+        eprintln!(
+            "wlsctx: warning: could not pin the exec context before the shim compile \
+             ({cur:?}); the compiler may transition into wlsctx_app_t (the module's \
+             typetransition) and hit temp-file denials"
+        );
+    }
+}
+
+/// Clear the one-shot exec context pending on this process's cred
+/// (an empty `attr/exec` write zeroes `exec_sid` — the 7.2 setattr
+/// path treats a zero-length value as "no context"), so that
+/// children forked *later* (the S→A→B pipeline, the satellite
+/// processes) do not inherit a stale one: if their own
+/// `attr/exec` write ever fails, a stale pending context would
+/// make them `exec` into *this* context instead of the module's
+/// `typetransition` target.
+fn clear_exec_context() {
+    if !crate::mcs::is_confined() {
+        return;
+    }
+    let _ = std::fs::write("/proc/self/attr/exec", "");
+}
+
+/// The SELinux context the shim `.so` must carry for a confined
+/// consumer to map it: the module's `wlsctx_shim_t` type at level
+/// `s0` (objects created in the instance dir take the parent's low
+/// level, and `s0` is dominated by every `s0:cN`, so every
+/// instance's consumers can map it).
+fn shim_context() -> Option<String> {
+    // The user comes from the current process context (the
+    // context must belong to a user allowed to use `object_r`).
+    let user = std::fs::read_to_string("/proc/self/attr/current")
+        .ok()?
+        .split(':')
+        .next()?
+        .trim()
+        .to_string();
+    Some(format!("{user}:object_r:wlsctx_shim_t:s0"))
+}
+
+/// Read the file's current SELinux label (the `security.selinux`
+/// xattr), or `None` (SELinux off or the xattr absent).
+fn current_label(so: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    // A `CString`: the kernel reads the path as a NUL-terminated
+    // string, and a raw Rust `String` buffer does not guarantee a
+    // NUL at `len` (a reused allocator block can carry stale
+    // bytes past it — the kernel then walks into them and the
+    // call fails ENOENT on a mangled path; LESSONS #43).
+    let path = std::ffi::CString::new(so.as_os_str().as_bytes()).ok()?;
+    let mut buf = [0u8; 256];
+    // SAFETY: `path` is a valid NUL-terminated C string; `buf` is
+    // valid for `buf.len()` bytes.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"security.selinux".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    (0 < n).then(|| {
+        let n = n as usize;
+        String::from_utf8_lossy(&buf[..n]).trim_end_matches('\0').to_string()
+    })
+}
+
+/// Set the shim's SELinux label to the module's `wlsctx_shim_t`
+/// (confined mode only) when it does not already carry it. A
+/// failed relabel only warns — the degradation is the documented
+/// one (a confined consumer cannot map a mislabeled `.so`, and a
+/// SIGKILL'd supervisor would leave its child behind).
+fn relabel_if_needed(so: &std::path::Path) {
+    if !crate::mcs::is_confined() {
+        return;
+    }
+    let want = match shim_context() {
+        Some(c) => c,
+        None => return, // no readable current context; nothing to do
+    };
+    if current_label(so).as_deref() == Some(want.as_str()) {
+        return;
+    }
+    // The 7.2 setxattr relabel path (selinux_inode_setxattr):
+    // `file:relabelfrom` (subject → the old label),
+    // `file:relabelto` (subject → this one), and
+    // `filesystem:associate` (this SID → the mount's SID) — all
+    // granted by the module. The kernel NUL-terminates the value
+    // itself (`kmemdup_nul`), so the exact length is passed for
+    // it; the *path* is read as a C string, so it must be a
+    // `CString` (a raw `String` buffer's byte at `len` is not a
+    // guaranteed NUL — on a reused allocator block the kernel
+    // walks into the stale tail and the call fails `ENOENT` on
+    // a mangled path, while every Rust-level log of the path
+    // looks correct; LESSONS #43).
+    use std::os::unix::ffi::OsStrExt;
+    let path = match std::ffi::CString::new(so.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "wlsctx: warning: could not label the pdeathsig-restore shim {so:?} \
+                 (non-UTF-8 path); a confined consumer cannot map it \
+                 (`file:execute` is granted only on wlsctx_shim_t) — a \
+                 SIGKILL'd supervisor would leave its child behind"
+            );
+            return;
+        }
+    };
+    // SAFETY: `path` is a valid NUL-terminated C string; `want`
+    // is a valid byte sequence of length `want.len()` (the
+    // kernel appends the NUL).
+    let r = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            c"security.selinux".as_ptr(),
+            want.as_bytes().as_ptr() as *const libc::c_void,
+            want.len(),
+            0,
+        )
+    };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!(
+            "wlsctx: warning: could not label the pdeathsig-restore shim {so:?} \
+             as {want:?} ({e}); a confined consumer cannot map it \
+             (`file:execute` is granted only on wlsctx_shim_t) — a \
+             SIGKILL'd supervisor would leave its child behind"
+        );
     }
 }
 

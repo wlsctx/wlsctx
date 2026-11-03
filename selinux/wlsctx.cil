@@ -6,6 +6,18 @@
 (type wlsctx_app_t)
 (roletype object_r wlsctx_app_t)
 (roletype unconfined_r wlsctx_app_t)
+; decision #42: the pdeathsig-restore shim (.so) type. A confined
+; consumer must *map it with PROT_EXEC* — on this kernel a PROT_EXEC
+; mapping needs `file:execute` (file_map_prot_to_av), which no
+; base-policy type grants to `wlsctx_app_t`/`xserver_t` on a file in
+; the instance runtime dir. Dedicated type, NOT a member of `lib_t`
+; (which every app type can read): the two consumer types below get
+; the grants, nothing else can touch it. `ensure_shim` relabels the
+; compiled `.so` to it with setxattr (on this kernel `filecon`
+; statements do not label created inodes and their contexts are not
+; pre-registered in the sidtab — the sidtab expands on demand).
+(type wlsctx_shim_t)
+(roletype object_r wlsctx_shim_t)
 (typeattributeset cil_gen_require file_type)
 (typeattributeset cil_gen_require mcs_constrained_type)
 (typeattributeset cil_gen_require unconfined_t)
@@ -31,6 +43,7 @@
 (typeattributeset cil_gen_require etc_t)
 (typeattributeset cil_gen_require tmpfs_t)
 (typeattributeset cil_gen_require tmp_t)
+(typeattributeset cil_gen_require unlabeled_t)
 (typeattributeset cil_gen_require node_t)
 (typeattributeset cil_gen_require device_t)
 (typeattributeset cil_gen_require null_device_t)
@@ -62,7 +75,7 @@
 (typeattributeset cil_gen_require sysctl_t)
 (typeattributeset cil_gen_require sysctl_vm_t)
 (typeattributeset cil_gen_require sysctl_vm_overcommit_t)
-(typeattributeset mcs_constrained_type (wlsctx_t wlsctx_app_t))
+(typeattributeset mcs_constrained_type (wlsctx_t wlsctx_app_t wlsctx_shim_t))
 ; this kernel's process class splits `signal` into signull (kill 0),
 ; sigkill and signal. The base policy's mlsconstrain list constrains
 ; ptrace/signal/sigkill/sigstop — but NOT signull. A module CIL cannot
@@ -106,6 +119,15 @@
 (allow unconfined_t wlsctx_t (process (ptrace)))
 (allow unconfined_t wlsctx_t (dir (getattr open read search)))
 (allow unconfined_t wlsctx_t (file (getattr ioctl open read)))
+; the shim `.so` sits in the user's own per-instance runtime dir
+; (the instance dir is `user_tmp_t`, user territory): without a
+; grant here the user's shell cannot even `stat` it (the entry shows
+; as `-??????????` in `ls`) or `unlink` it, and `rm -rf` on the
+; instance dir fails — `sudo` included (root bypasses DAC, not MAC).
+; Deliberately *not* `read`/`execute`/`map`: only the two consumer
+; types hold those, so a stray unconfined process can at most see
+; and delete the file, never load it.
+(allow unconfined_t wlsctx_shim_t (file (getattr unlink)))
 ; the user can signal the sandboxed app's host-visible process
 ; (signull: the kill -0 liveness probe, strace-style tools)
 (allow unconfined_t wlsctx_app_t (process (getattr noatsecure rlimitinh siginh signal sigkill signull ptrace)))
@@ -218,7 +240,12 @@
 (allow wlsctx_t etc_t (dir (getattr search)))
 (allow wlsctx_t usr_t (dir (getattr open read search)))
 (allow wlsctx_t bin_t (dir (getattr search)))
-(allow wlsctx_t bin_t (file (entrypoint execute getattr map open read)))
+; `execute_no_trans`: the on-demand shim compile (decision #42) pins
+; the `cc` vforked by `ensure_shim` to *this* domain (a same-domain
+; exec — the bprm check then requires `execute_no_trans`, not
+; `execute` + the `typetransition` above); the compiler's own
+; children (cc1/as/ld, all `bin_t`) take the same path.
+(allow wlsctx_t bin_t (file (entrypoint execute execute_no_trans getattr map open read)))
 (allow wlsctx_t bin_t (lnk_file (read)))
 (allow wlsctx_t bin_t (process (noatsecure rlimitinh siginh)))
 (allow wlsctx_t shell_exec_t (file (entrypoint execute execute_no_trans map open read)))
@@ -265,13 +292,33 @@
 ; setattr: chmod of created dirs (mode 0700) and of the sockets
 ; (bind_listener sets 0600)
 (allow wlsctx_t user_tmp_t (dir (create getattr open search read write add_name remove_name rmdir setattr)))
-(allow wlsctx_t user_tmp_t (file (append create getattr ioctl open read write unlink)))
+; `relabelfrom`: the pdeathsig-restore shim's relabel to
+; `wlsctx_shim_t` (below) starts from this type — the `.so` is
+; created here (the default label for files in the instance dir)
+; before `ensure_shim` sets the shim label on it.
+(allow wlsctx_t user_tmp_t (file (append create getattr ioctl open read write unlink relabelfrom)))
 (allow wlsctx_t user_tmp_t (sock_file (create getattr open read write unlink setattr)))
 ; the relay receives the compositor's shm fds (the XKB keymap file,
 ; clipboard buffers) over SCM_RIGHTS — the receive-side `fd:use`
 ; against the file's type (those files are `user_tmp_t`: the
 ; `/dev/shm` file transition of an unconfined creator)
 (allow wlsctx_t user_tmp_t (fd (use)))
+; decision #42: `ensure_shim` compiles the pdeathsig-restore `.so`
+; into the instance runtime dir and relabels it to `wlsctx_shim_t`.
+; The 7.2 setxattr relabel path (selinux_inode_setxattr) checks
+; `file:relabelfrom` (subject → the old label, the user_tmp_t rule
+; above), `file:relabelto` (subject → this label), and
+; `filesystem:associate` — whose *subject* is the **new** label's
+; SID (this type, not the relabelling subject) and whose target is
+; the **mount's** SID: the host's `/run/user/<uid>` tmpfs the
+; runtime dir sits on carries `tmpfs_t` (the sbsec default for a
+; plain tmpfs on this kernel — a *seclabel-only* tmpfs, i.e. one
+; without any fs type, would carry `unlabeled_t`; kept for that).
+; The teardown sweep unlinks the `.so` (it keeps its label until
+; then).
+(allow wlsctx_t wlsctx_shim_t (file (getattr relabelto unlink)))
+(allow wlsctx_shim_t tmpfs_t (filesystem (associate)))
+(allow wlsctx_shim_t unlabeled_t (filesystem (associate)))
 (allow wlsctx_t user_tmp_t (unix_stream_socket (accept bind connectto create getattr read write getopt setopt)))
 (allow wlsctx_t session_dbusd_tmp_t (sock_file (getattr open read write)))
 (allow wlsctx_t unconfined_dbusd_t (unix_stream_socket (accept connectto getattr read write getopt setopt)))
@@ -324,7 +371,13 @@
 ; searches it on every cwd-relative access. The tmp_t rule covers
 ; a host /tmp bind-mounted in by a profile (a bind carries the
 ; inode's tmp_t SID with it).
-(allow wlsctx_app_t tmp_t (dir (getattr search)))
+; `tmp_t` file create/write: the on-demand shim compile's compiler
+; children (cc1/as/ld — each `exec`s `bin_t` out of a `wlsctx_t`
+; parent and takes this domain through the `typetransition` above;
+; only the driver `cc` itself is kept `wlsctx_t` by the pinned exec
+; context, LESSONS #42) stage their temp files in the host's `/tmp`.
+(allow wlsctx_app_t tmp_t (dir (getattr open read search write add_name remove_name)))
+(allow wlsctx_app_t tmp_t (file (append create getattr map open read write unlink)))
 (allow wlsctx_app_t tmpfs_t (dir (getattr open search read)))
 (allow wlsctx_app_t tmpfs_t (file (append create getattr map open read write unlink)))
 (allow wlsctx_app_t session_dbusd_tmp_t (sock_file (getattr open read write)))
@@ -405,6 +458,15 @@
 (allow wlsctx_app_t gconf_home_t (file (append create getattr map open read write unlink)))
 (allow wlsctx_app_t bin_t (file (entrypoint execute execute_no_trans getattr map open read)))
 (allow wlsctx_app_t lib_t (file (entrypoint execute execute_no_trans getattr map open read)))
+; decision #42: the post-exec pdeathsig-restore shim (the bridle of
+; the B←A cascade leg). The confined exec into `wlsctx_app_t`
+; changed the process's SID, so `selinux_bprm_committing_creds`
+; (`security/selinux/hooks.c:2545`, commit 4ac212ad4e8f) zeroed the
+; belt; the app's glibc loader then maps the `.so` (open/fstat plus
+; the mmap — on 7.2 a `PROT_EXEC` mapping needs `file:execute`, not
+; only `map`), and its constructor re-arms the signal.
+(allow wlsctx_app_t wlsctx_shim_t (file (execute getattr map open read)))
+(allow wlsctx_app_t wlsctx_shim_t (fd (use)))
 (allow wlsctx_app_t usr_t (file (entrypoint execute execute_no_trans getattr map open read)))
 ; the app resolves and stats the system trees it execs from
 ; (path lookup = search on every dir of the path; stat = getattr;
@@ -483,6 +545,13 @@
 (allow wlsctx_app_t xserver_t (unix_stream_socket (connectto read write)))
 (allow xserver_t wlsctx_app_t (unix_stream_socket (read write)))
 (allow xserver_t user_tmp_t (file (getattr open read)))
+; decision #37: the Xwayland satellite's own shim (the same
+; mechanism, `SIGTERM`): its `xserver_t` transition changes the SID
+; (the belt is cleared), and the satellite's glibc loader maps the
+; `.so` to re-arm it — the same `file:execute` requirement as the
+; app's.
+(allow xserver_t wlsctx_shim_t (file (execute getattr map open read)))
+(allow xserver_t wlsctx_shim_t (fd (use)))
 (allow xserver_t user_tmp_t (sock_file (getattr open read)))
 (allow xserver_t user_tmp_t (unix_stream_socket (accept getattr read write)))
 ; Xwayland binds and listens its own X socket (the satellite

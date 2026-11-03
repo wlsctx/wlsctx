@@ -200,13 +200,15 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
     // re-arm; see `wlsctx::pdeathsig`), built here — before any
     // fork — into the instance runtime dir, which the rootfs carry
     // brings into the sandbox at `sandbox_runtime` (defined below).
-    // Only in confined mode: a confined exec is a credential change
-    // and the kernel clears pdeathsig on it; unconfined, the
-    // pre-exec setting below already survives the exec, and there
-    // is no reason to put an `LD_PRELOAD` in front of the app. A
-    // failed build degrades to the pre-exec belt alone (logged in
-    // `ensure_shim`) — an app's launch must never depend on the
-    // shim existing.
+    // Only in confined mode: a confined exec changes the process's
+    // SID, and the kernel unconditionally clears pdeathsig on any
+    // SID change (`selinux_bprm_committing_creds`,
+    // `security/selinux/hooks.c:2545`); unconfined, the pre-exec
+    // setting below already survives the exec, and there is no
+    // reason to put an `LD_PRELOAD` in front of the app. A failed
+    // build (or relabel) degrades to the pre-exec belt alone
+    // (logged in `ensure_shim`) — an app's launch must never
+    // depend on the shim existing.
     let shim = if wlsctx::mcs::is_confined() {
         wlsctx::pdeathsig::ensure_shim(&runtime_dir, libc::SIGUSR1)
     } else {
@@ -476,20 +478,25 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                     }
                     // decision #42: B's link in the cascade (B←A).
                     // 7.2 `fork` reset the value to 0, so this set
-                    // is an arming, not a re-arm (the belt) — and
-                    // in confined mode the shim (the bridle)
-                    // re-arms it *after* the transition: a SELinux
-                    // exec that *changes the domain* (the confined
-                    // run: `wlsctx_t` → `wlsctx_app_t`) sets
-                    // `secureexec` (the default-denied `noatsecure`
-                    // check in the SID-change branch of
-                    // `security/selinux/hooks.c`), so `fs/exec.c`
-                    // clears the belt — `commit_creds`
-                    // (`kernel/cred.c`) clears it independently on
-                    // an actual credential change as well. In
-                    // unconfined mode nothing clears it, the belt
-                    // survives the exec as is, and no shim is built
-                    // (above) or loaded.
+                    // is an arming, not a re-arm (the belt). In
+                    // confined mode the shim (the bridle) re-arms
+                    // it *after* the transition: the confined exec
+                    // (`wlsctx_t` → `wlsctx_app_t`) changes the
+                    // process's SID, and `selinux_bprm_committing_creds`
+                    // (`security/selinux/hooks.c:2545`, commit
+                    // `4ac212ad4e8f`) *unconditionally* zeros
+                    // `pdeath_signal` on any SID change — no
+                    // permission (not even the granted `noatsecure`)
+                    // can prevent it. (The legacy `secureexec`
+                    // clear in `fs/exec.c` — set on a *denied*
+                    // `noatsecure` check, setuid, or a capability
+                    // change — and `commit_creds`'s independent
+                    // clear on an actual credential change are
+                    // secondary: this policy grants `noatsecure` on
+                    // this transition, and the uid/caps are
+                    // unchanged.) In unconfined mode the exec
+                    // changes no SID, the belt survives as is, and
+                    // no shim is built (above) or loaded.
                     // `prctl` is not trapped by the filter
                     // installed above, so the constructor is safe
                     // to run under it; the loader's `openat` of the
