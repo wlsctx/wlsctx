@@ -132,9 +132,20 @@
 ; (signull: the kill -0 liveness probe, strace-style tools)
 (allow unconfined_t wlsctx_app_t (process (getattr noatsecure rlimitinh siginh signal sigkill signull ptrace)))
 (allow unconfined_t xserver_t (process (getattr noatsecure rlimitinh siginh signal sigkill signull ptrace)))
+; the host's own tools (ps, htop, ls -Z, cat /proc/<pid>/…): on this
+; kernel the whole /proc/<pid>/ tree is labeled with the target
+; process's own context (LESSONS #45), so observing a sandboxed
+; process or a satellite is a check against *their* types, not
+; proc_t — getattr is the path-lookup permission every one of them
+; needs first (open/read alone do not make the path resolvable).
 (allow unconfined_t wlsctx_app_t (dir (getattr open read search)))
-(allow unconfined_t wlsctx_app_t (file (open read)))
-(allow unconfined_t wlsctx_app_t (unix_stream_socket (read write)))
+(allow unconfined_t wlsctx_app_t (file (getattr open read)))
+(allow unconfined_t wlsctx_app_t (lnk_file (getattr read)))
+; connectto: a user client pointing at the instance's public D-Bus
+; socket (the dbus-proxy sidecar's) or at any socket the app created
+; — the socket object carries the *creator's* SID (the app's), so
+; the connect is checked against wlsctx_app_t, not the file's.
+(allow unconfined_t wlsctx_app_t (unix_stream_socket (connectto read write)))
 ; the compositor (and any other unconfined session process) receives
 ; the app's in-memory objects through the relay's SCM_RIGHTS forward:
 ; the same `__file_has_perm` double-check as the relay's own receive —
@@ -372,8 +383,15 @@
 ; the isatty probe on a host-redirected stderr/stdout file (sh's
 ; TIOCGPGRP before it writes — harmless on a regular file, it just
 ; needs to be answerable)
-(allow wlsctx_app_t user_tmp_t (file (append create getattr ioctl open read write unlink)))
-(allow wlsctx_app_t user_tmp_t (sock_file (create getattr open read write)))
+; `setattr`: the pdeathsig shim's `setexecfilecon` relabel of its own
+; `wlsctx_shim_t` copy (the relabel writes the new xattr onto a
+; `user_tmp_t` file in the per-instance runtime dir)
+(allow wlsctx_app_t user_tmp_t (file (append create getattr ioctl open read write unlink setattr)))
+; `unlink`: the app-side cleanup of its own instance-dir sockets on
+; shutdown (the D-Bus proxy's glib socket unlinks the file on
+; dispose) — without it a clean exit leaves the file and the next
+; start needs the sidecar's stale-socket probe to clear it.
+(allow wlsctx_app_t user_tmp_t (sock_file (create getattr open read write unlink)))
 (allow wlsctx_app_t user_tmp_t (unix_stream_socket (accept bind connectto create getattr read write)))
 ; the sandbox's own /tmp is a fresh tmpfs: its mount root carries
 ; the unlabeled-mount default label tmpfs_t (filecons do not
