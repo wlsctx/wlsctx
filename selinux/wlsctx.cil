@@ -236,6 +236,17 @@
 (allow wlsctx_t var_run_t (dir (search)))
 (allow wlsctx_t proc_t (dir (getattr search)))
 (allow wlsctx_t proc_t (lnk_file (read)))
+; NOTE: /proc/<pid>/ (incl. comm and attr/) is labeled with the
+; *target process's own context*, not by the proc_t genfs rules:
+; the pident inodes take the task's sid at creation
+; (security_task_to_inode) and are re-labeled on every credential
+; change (pid_update_inode — so our setexecfilecon execs re-label
+; the execing process's own /proc/self/ tree). The comm restore in
+; main() therefore needs no proc_t grant: the process writes its
+; own comm, which is its own type (the wlsctx_t → wlsctx_t file
+; allow above). The kernel additionally restricts comm writes to
+; the owning thread group (7.2.11 `comm_write`), so only self-
+; writes are possible anyway.
 (allow wlsctx_t sysfs_t (dir (getattr search)))
 (allow wlsctx_t etc_t (dir (getattr search)))
 (allow wlsctx_t usr_t (dir (getattr open read search)))

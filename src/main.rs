@@ -37,6 +37,30 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.validate()?;
 
+    // Restore the process name. Every self re-exec in the stack
+    // (the MCS narrowing, the SIGHUP rebuild) execs `/proc/self/exe`,
+    // and the kernel sets the comm to the executed path's basename —
+    // "exe" — which would break name-based observation of re-exec'd
+    // processes (ps, the journal, the audit log's comm field). The
+    // write runs on every main() pass, so a re-exec'd instance
+    // fixes its own name on the second pass; A and B inherit the
+    // name at fork, and B's later app exec takes the app's. A
+    // failed write only costs the cosmetic name (unconfined mode:
+    // the name is already "wlsctx" from the binary, the write is a
+    // no-op).
+    // The bare name (no newline): this kernel's comm writer no longer
+    // strips a trailing one (7.2.11 `comm_write` copies into a
+    // zero-padded buffer and passes it to `set_task_comm` as-is), so
+    // a newline would land *inside* the 15-char comm.
+    let comm = c"wlsctx";
+    let fd = unsafe { libc::open(c"/proc/self/comm".as_ptr(), libc::O_WRONLY) };
+    if fd >= 0 {
+        unsafe {
+            libc::write(fd, comm.as_ptr().cast(), comm.count_bytes());
+            libc::close(fd);
+        }
+    }
+
     match cli.command {
         // `run`: exec the command inside the sandbox and exit with
         // its exit code.
