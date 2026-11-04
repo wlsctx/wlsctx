@@ -17,7 +17,12 @@
 //! * **`serve`** — the app is writing its own data into the fd a
 //!   requester handed through a `send` event on one of the app's
 //!   source objects: the per-mime byte flow behind a `set` (or a
-//!   `start_drag`).
+//!   `start_drag`). The `selection` label is `drag` when the source
+//!   is the client's active drag (a `start_drag` that has not yet
+//!   finished or been destroyed — the 6.5.5 refinement; a
+//!   `wl_data_source` is shared by the clipboard and the drag and
+//!   the wire does not say which), `clipboard` for every other
+//!   stable-protocol source, and `primary` for the zwp protocol.
 //!
 //! ## The sink: the host journal
 //!

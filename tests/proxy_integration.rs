@@ -1595,6 +1595,576 @@ fn clipboard_deny_is_audited_with_a_drop() {
 }
 
 // ------------------------------------------------------------------------
+// Phase 9 (the 6.5.5 serve-label refinement): the drag
+// ------------------------------------------------------------------------
+//
+// A `wl_data_source` is shared by the clipboard and the drag, and the
+// wire does not say which. The relay tracks the client's active drag
+// source (a `start_drag` that has not yet finished or been destroyed),
+// so the `send` (serve) records on that source are labeled
+// `selection=drag` rather than the shared `clipboard` label. This
+// exercises that through the full three-party path: a fake compositor
+// that completes a drag (enter → receive → send, then
+// dnd_drop_performed + dnd_finished), a real `wayland-client` app that
+// starts the drag and serves its own data, and the audit assertion
+// that the serve record carries `selection=drag` while the
+// (stable-protocol) read record next to it still carries
+// `selection=clipboard` — the exact contrast the refinement exists to
+// make.
+
+/// The drag fake compositor. Like [`Srv2`], it answers everything the
+/// app asks for, but speaks the drag path: on `start_drag` it creates
+/// an offer for the app's source and announces the drag (a
+/// `data_offer` + `enter`), and on the offer's `receive` it asks the
+/// source to `send` (the per-mime byte flow the relay audits as a
+/// `serve`) and then ends the drag (`dnd_drop_performed` +
+/// `dnd_finished`).
+struct DragSrv {
+    /// The app's `wl_data_device` (the drag's events are sent on it).
+    device: Option<srv_wl_data_device::WlDataDevice>,
+    /// The source of the app's active drag (kept alive to send
+    /// `send`/`dnd_*` events on it).
+    source: Option<srv_wl_data_source::WlDataSource>,
+}
+
+impl GlobalDispatch<srv_wl_compositor::WlCompositor, ()> for DragSrv {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_wl_compositor::WlCompositor>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl GlobalDispatch<srv_wl_data_device_manager::WlDataDeviceManager, ()> for DragSrv {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_wl_data_device_manager::WlDataDeviceManager>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl GlobalDispatch<srv_wl_seat::WlSeat, ()> for DragSrv {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<srv_wl_seat::WlSeat>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl ServerDispatch<srv_wl_compositor::WlCompositor, ()> for DragSrv {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_compositor::WlCompositor,
+        request: srv_wl_compositor::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        // Only `CreateSurface` allocates (the drag's origin surface).
+        if let srv_wl_compositor::Request::CreateSurface { id } = request {
+            data_init.init(id, ());
+        }
+    }
+}
+
+impl ServerDispatch<srv_wl_surface::WlSurface, ()> for DragSrv {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_surface::WlSurface,
+        _request: srv_wl_surface::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+impl ServerDispatch<srv_wl_data_device_manager::WlDataDeviceManager, ()> for DragSrv {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_data_device_manager::WlDataDeviceManager,
+        request: srv_wl_data_device_manager::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            // The seat argument is only validated; the device carries
+            // no per-client state in this fake.
+            srv_wl_data_device_manager::Request::CreateDataSource { id } => {
+                data_init.init(
+                    id,
+                    SourceState {
+                        mime: std::sync::Mutex::new(None),
+                    },
+                );
+            }
+            srv_wl_data_device_manager::Request::GetDataDevice { seat: _, id } => {
+                data_init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ServerDispatch<srv_wl_seat::WlSeat, ()> for DragSrv {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_seat::WlSeat,
+        _request: srv_wl_seat::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+impl ServerDispatch<srv_wl_data_device::WlDataDevice, ()> for DragSrv {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &srv_wl_data_device::WlDataDevice,
+        request: srv_wl_data_device::Request,
+        _data: &(),
+        dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // The app starts a drag from a source it created: create
+        // an offer for it and announce the drag, exactly like a
+        // real compositor would (the `data_offer` first, then the
+        // `enter` that names it). `set_selection`/`release`: the app
+        // never uses them here.
+        if let srv_wl_data_device::Request::StartDrag {
+            source: Some(src),
+            origin,
+            ..
+        } = request
+        {
+            state.device = Some(resource.clone());
+            state.source = Some(src.clone());
+            let offer = client
+                .create_resource::<srv_wl_data_offer::WlDataOffer, OfferState, DragSrv>(
+                    dhandle,
+                    3,
+                    OfferState {
+                        data: OWN_DATA.as_bytes().to_vec(),
+                        foreign: false,
+                        source: Some(src.clone()),
+                    },
+                )
+                .expect("create the offer for the app's drag source");
+            resource.data_offer(&offer);
+            resource.enter(0, &origin, 0.0, 0.0, Some(&offer));
+        }
+    }
+}
+
+impl ServerDispatch<srv_wl_data_source::WlDataSource, SourceState> for DragSrv {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        resource: &srv_wl_data_source::WlDataSource,
+        request: srv_wl_data_source::Request,
+        _data: &SourceState,
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // `offer` records the mime; `destroy`/`set_actions` are no-ops.
+        if let srv_wl_data_source::Request::Offer { mime_type } = request {
+            *resource.data::<SourceState>().unwrap().mime.lock().unwrap() = Some(mime_type);
+        }
+    }
+}
+
+impl ServerDispatch<srv_wl_data_offer::WlDataOffer, OfferState> for DragSrv {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &srv_wl_data_offer::WlDataOffer,
+        request: srv_wl_data_offer::Request,
+        data: &OfferState,
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // The app handed us an fd to write the selection into: like a
+        // real compositor, ask the owner (the app) to write the data
+        // into the requester's fd (the app does that on the `send`
+        // event — the relay audits it as a `serve`), then end the drag
+        // (a completed drop: `dnd_drop_performed`, then `dnd_finished`).
+        if let srv_wl_data_offer::Request::Receive { mime_type, fd } = request
+            && let Some(source) = &data.source
+        {
+            source.send(mime_type, fd.as_fd());
+            source.dnd_drop_performed();
+            source.dnd_finished();
+        }
+        // accept / finish / set_actions / destroy: no-ops.
+    }
+}
+
+/// The drag fake compositor: listens on the tagged socket, advertises
+/// `wl_compositor`/`wl_data_device_manager`/`wl_seat`, and completes
+/// the app's drag. Exits when `stop` is set and no clients are live.
+fn run_fake_drag_compositor(
+    tagged_path: PathBuf,
+    ready: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    let tagged = ListeningSocket::bind_absolute(tagged_path)
+        .map_err(|e| std::io::Error::other(format!("bind tagged socket: {e}")))?;
+    let mut display = Display::<DragSrv>::new()
+        .map_err(|e| std::io::Error::other(format!("display init: {e}")))?;
+    let mut handle = display.handle();
+    handle.create_global::<DragSrv, srv_wl_compositor::WlCompositor, ()>(4, ());
+    handle.create_global::<DragSrv, srv_wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
+    handle.create_global::<DragSrv, srv_wl_seat::WlSeat, ()>(10, ());
+    let mut state = DragSrv {
+        device: None,
+        source: None,
+    };
+    ready.store(true, Ordering::SeqCst);
+
+    loop {
+        while let Ok(Some(stream)) = tagged.accept() {
+            let data = Arc::new(ClientDataImpl { live: live.clone() });
+            handle.insert_client(stream, data)?;
+        }
+        display.dispatch_clients(&mut state)?;
+        display.flush_clients()?;
+        if stop.load(Ordering::SeqCst) && live.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The sandboxed app for the drag test: it binds the data-device stack
+/// plus an origin surface, starts a drag from its own source, receives
+/// the drag's offer (the `read`), and — when the (fake) compositor
+/// asks it to — writes its own data into the requester's fd (the
+/// `serve`). It keeps the write target (a memfd), so the test can check
+/// what actually flowed.
+struct DragApp {
+    /// `(global name, interface, version)` from `wl_registry.global`.
+    globals: Vec<(u32, String, u32)>,
+    /// The app's write target for the drag's offer.
+    own_fd: OwnedFd,
+    /// Set when the app has written the drag's data (the serve).
+    served: Arc<AtomicBool>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for DragApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            state.globals.push((name, interface, version));
+        }
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for DragApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // data_offer: creates the offer child (see the macro below).
+        // enter: a drag session has begun with this offer — the app
+        // reads it (this is the `read` the relay audits, labeled
+        // `clipboard`, because a read on the stable protocol is always
+        // the clipboard selection).
+        if let wl_data_device::Event::Enter {
+            id: Some(offer), ..
+        } = event
+        {
+            offer.receive("text/plain".into(), state.own_fd.as_fd());
+        }
+        // data_offer (child) / leave / motion / drop / selection:
+        // unused here.
+    }
+
+    // The `data_offer` event creates a `wl_data_offer` child; the
+    // macro above only handles events, so the user-data
+    // specialization has to be given explicitly.
+    wayland_client::event_created_child!(DragApp, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for DragApp {
+    fn event(
+        state: &mut Self,
+        _resource: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // The (fake) compositor asks the app — the drag's owner — to
+        // write its data into the requester's fd, exactly like a real
+        // compositor would (the per-mime byte flow behind the drag;
+        // the relay audits it as a `serve`, labeled `drag` because
+        // this is the client's active drag source — the 6.5.5
+        // refinement).
+        if let wl_data_source::Event::Send { mime_type, fd } = event
+            && mime_type == "text/plain"
+        {
+            let mut f = std::fs::File::from(fd);
+            f.write_all(OWN_DATA.as_bytes())
+                .expect("write the offered data");
+            state.served.store(true, Ordering::SeqCst);
+        }
+        // target / cancelled / dnd_drop_performed / dnd_finished /
+        // action: unused here.
+    }
+}
+
+no_events!(
+    DragApp,
+    wl_data_device_manager::WlDataDeviceManager,
+    wl_data_device_manager::Event
+);
+no_events!(DragApp, wl_seat::WlSeat, wl_seat::Event);
+no_events!(DragApp, wl_compositor::WlCompositor, wl_compositor::Event);
+no_events!(DragApp, wl_surface::WlSurface, wl_surface::Event);
+no_events!(DragApp, wl_data_offer::WlDataOffer, wl_data_offer::Event);
+
+/// One drag session through the proxy: the app starts a drag from its
+/// own source, reads the drag's offer (the `read`), and serves its own
+/// data into the requester's fd (the `serve`). Returns the contents of
+/// the app's memfd after the session.
+fn one_drag_session(
+    public_path: &Path,
+    settle: Duration,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let own_fd = rustix::fs::memfd_create("wlsctx-test-drag", rustix::fs::MemfdFlags::empty())?;
+
+    let served = Arc::new(AtomicBool::new(false));
+
+    let stream = UnixStream::connect(public_path)?;
+    let conn = Connection::from_socket(stream)?;
+    let mut app = DragApp {
+        globals: Vec::new(),
+        own_fd,
+        served: served.clone(),
+    };
+    let mut eq = conn.new_event_queue::<DragApp>();
+    let qh = eq.handle();
+    let display = conn.display();
+    let registry = display.get_registry(&qh, ());
+    eq.roundtrip(&mut app)?;
+
+    let global_name = |name: &str| -> u32 {
+        app.globals
+            .iter()
+            .find(|(_, iface, _)| iface == name)
+            .unwrap_or_else(|| panic!("no {name} global in the registry"))
+            .0
+    };
+
+    let comp = registry.bind::<wl_compositor::WlCompositor, (), DragApp>(
+        global_name("wl_compositor"),
+        4,
+        &qh,
+        (),
+    );
+    let seat = registry.bind::<wl_seat::WlSeat, (), DragApp>(global_name("wl_seat"), 10, &qh, ());
+    let ddm = registry.bind::<wl_data_device_manager::WlDataDeviceManager, (), DragApp>(
+        global_name("wl_data_device_manager"),
+        3,
+        &qh,
+        (),
+    );
+    let device = ddm.get_data_device(&seat, &qh, ());
+
+    // The app starts a drag: a new source offering text/plain becomes
+    // the drag's source, from an origin surface. The compositor
+    // echoes it with a data_offer + enter pair, and the `enter`
+    // handler below does the read into `own_fd`.
+    let surface = comp.create_surface(&qh, ());
+    let source = ddm.create_data_source(&qh, ());
+    source.offer("text/plain".into());
+    device.start_drag(Some(&source), &surface, None, 0);
+
+    // Pump until the app has served the drag's data (its `send`
+    // handler has written). `blocking_dispatch` flushes the app's
+    // queued requests, blocks until the compositor's events arrive,
+    // and dispatches them — `dispatch_pending` alone would never read
+    // the socket.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        eq.blocking_dispatch(&mut app)?;
+        if served.load(Ordering::SeqCst) {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err("timed out: the drag was never served".into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // The app may hold unflushed requests: wayland-client's
+    // `blocking_dispatch` only flushes when it had to block, so flush
+    // before the settle window, letting the relay's size probe
+    // measure from a settled state.
+    eq.flush()?;
+    if !settle.is_zero() {
+        thread::sleep(settle);
+    }
+
+    // Tear down (the compositor confirms with delete_id); no
+    // protocol error may be pending on either end of the session.
+    source.destroy();
+    device.release();
+    seat.release();
+    surface.destroy();
+    // Each destructor is answered by a `delete_id`, so the blocking
+    // read also surfaces any pending protocol error; the final
+    // `dispatch_pending` drains the rest of the same datagram.
+    eq.blocking_dispatch(&mut app)?;
+    eq.dispatch_pending(&mut app)?;
+    assert!(
+        conn.protocol_error().is_none(),
+        "protocol error: {:?}",
+        conn.protocol_error()
+    );
+
+    let mut own = Vec::new();
+    let mut own_fd = std::fs::File::from(app.own_fd);
+    own_fd.seek(SeekFrom::Start(0))?;
+    own_fd.read_to_end(&mut own)?;
+    Ok(own)
+}
+
+/// Run the whole three-party scenario (compositor, proxy with `audit`,
+/// one app session) for the drag and assert the outcome.
+fn run_drag_session(audit: wlsctx::proxy::AuditConfig) {
+    let _ = env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info)
+        .try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let public_path = dir.path().join("wl-public");
+    let tagged_path = dir.path().join("wl-tagged");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let live: Arc<AtomicUsize> = Arc::default();
+
+    let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
+    let tagged_for_proxy = tagged_path.clone();
+    let stop_proxy = stop.clone();
+    let proxy = thread::Builder::new()
+        .name("wlsctx-proxy".into())
+        .spawn(move || {
+            let _ = wlsctx::proxy::event_loop(
+                &public,
+                &tagged_for_proxy,
+                &wlsctx::proxy::Policy::all(),
+                wlsctx::proxy::ClipboardPolicy::Allow,
+                audit,
+                None,
+                Some(stop_proxy),
+            );
+        })
+        .unwrap();
+
+    let (ready_c, live_c) = (ready.clone(), live.clone());
+    let stop_comp = stop.clone();
+    let comp = thread::Builder::new()
+        .name("fake-drag-compositor".into())
+        .spawn(move || run_fake_drag_compositor(tagged_path, ready_c, stop_comp, live_c))
+        .unwrap();
+
+    wait_until(|| ready.load(Ordering::SeqCst), 10);
+
+    let own =
+        one_drag_session(&public_path, Duration::from_millis(700)).expect("drag session failed");
+
+    // The app disconnected before the shutdown, so the compositor's
+    // view must settle to zero live clients before it exits.
+    wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
+    stop.store(true, Ordering::SeqCst);
+    let _ = comp.join();
+    let _ = proxy.join();
+
+    // The data actually flowed: the app's memfd holds its own data.
+    assert_eq!(
+        own,
+        OWN_DATA.as_bytes(),
+        "the drag's data flowed to the requester"
+    );
+
+    drop(dir);
+}
+
+/// Phase 9 (the 6.5.5 serve-label refinement): the audit log of the
+/// drag session. The session (start_drag, read, serve) produces
+/// exactly three records — one per selection event the relay saw. The
+/// `set` and the `serve` are on the drag source and are labeled
+/// `selection=drag`; the `read` is on the stable-protocol offer and
+/// stays `selection=clipboard` — the exact contrast the refinement
+/// exists to make (before the refinement, the serve also carried
+/// `selection=clipboard`).
+#[test]
+fn drag_serve_is_audited_as_drag() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let audit = wlsctx::proxy::AuditConfig::with_sink(
+        "testapp".into(),
+        "inst".into(),
+        Arc::new(CaptureSink {
+            lines: lines.clone(),
+        }),
+    );
+    run_drag_session(audit);
+
+    let lines = lines.lock().unwrap();
+    assert_eq!(
+        *lines,
+        vec![
+            "app=testapp instance=inst selection=drag action=set origin=own",
+            "app=testapp instance=inst selection=clipboard action=read origin=own mime=text/plain gate=forward fd_kind=memfd payload_bytes=15",
+            "app=testapp instance=inst selection=drag action=serve origin=own mime=text/plain fd_kind=memfd payload_bytes=15",
+        ],
+        "the session's three selection events: the serve is the drag's (6.5.5)"
+    );
+}
+
+// ------------------------------------------------------------------------
 // Two fd-bearing messages in one datagram
 // ------------------------------------------------------------------------
 //

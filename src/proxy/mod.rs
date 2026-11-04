@@ -87,16 +87,21 @@
 //!
 //! Every selection event the relay observes becomes one record under
 //! the `audit` log target (see [`audit`]): a **write** (`set_selection`
-//! with a non-NULL source), a **clear** (a NULL source), a **read**
-//! (`receive`, with the gate's decision), and a **serve** (a `send`
-//! event on one of the app's source objects — the per-mime byte flow
-//! behind a write). The record carries app, instance, selection,
-//! action, origin, mime, the gate's decision, the fd's class, and the
-//! payload *size* — never the contents. The default sink writes one
-//! line per record, which in deployment reaches the host journal via
-//! the unit's `StandardError=journal`: the persistent record, as
-//! opposed to the Phase 6 notification (visible in the moment only).
-//! The audit is always on while the relay runs (one line per event;
+//! with a non-NULL source, or a `start_drag`), a **clear** (a NULL
+//! source), a **read** (`receive`, with the gate's decision), and a
+//! **serve** (a `send` event on one of the app's source objects —
+//! the per-mime byte flow behind a write). A serve on the client's
+//! active drag source is labeled `selection=drag` (the 6.5.5
+//! refinement — a `wl_data_source` is shared by the clipboard and
+//! the drag, and the wire does not say which); every other serve is
+//! `clipboard` (or `primary` for the zwp protocol). The record
+//! carries app, instance, selection, action, origin, mime, the
+//! gate's decision, the fd's class, and the payload *size* — never
+//! the contents. The default sink writes one line per record, which
+//! in deployment reaches the host journal via the unit's
+//! `StandardError=journal`: the persistent record, as opposed to the
+//! Phase 6 notification (visible in the moment only). The audit is
+//! always on while the relay runs (one line per event;
 //! `RUST_LOG=warn` suppresses the stream).
 //!
 //! A payload size is only measurable where a size is reported: a
@@ -944,7 +949,18 @@ impl Relay {
             let selection = if sender.name == "zwp_primary_selection_source_v1" {
                 "primary"
             } else {
-                "clipboard"
+                // A `wl_data_source` is shared by the clipboard and
+                // the drag, and the wire does not say which: this
+                // one is the client's active drag source (a
+                // `start_drag` that has not yet finished or been
+                // destroyed — the 6.5.5 refinement), so its serves
+                // are labeled `drag`; every other source's stays
+                // `clipboard`.
+                if clipboard.active_drag_source() == Some(msg.sender_id) {
+                    "drag"
+                } else {
+                    "clipboard"
+                }
             };
             let mime = msg
                 .args

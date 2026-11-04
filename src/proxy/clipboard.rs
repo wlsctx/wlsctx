@@ -61,6 +61,16 @@
 //!   primary-selection protocol has no drag), so a foreign drag
 //!   cannot feed the sandbox either.
 //!
+//! The gate also tracks the client's **active drag** — the source
+//! argument of the last `wl_data_device.start_drag`, until that
+//! source's `cancelled`/`dnd_finished` event or its `destroy` (a
+//! new `start_drag` replaces it; the protocol allows one drag at a
+//! time). A `wl_data_source` is shared by the clipboard and the
+//! drag, and the wire does not say which — so the audit labels the
+//! `send` (serve) records on that source `selection=drag` rather
+//! than the shared `clipboard` label (the 6.5.5 refinement), while
+//! every other source's serves stay `clipboard`.
+//!
 //! A compromised app cannot forge the proof: it can only create its
 //! own sources and observe compositor events, and an offer is marked
 //! own only if the compositor actually echoed *that app's*
@@ -274,6 +284,16 @@ pub struct ClipboardGate {
     /// The same, for a drag-and-drop (independent window; Phase
     /// 6.5.5 — a `start_drag` is a copy-out like a `set`).
     copy_out_drag: Option<Instant>,
+    /// The source of this client's active drag: the source argument
+    /// of the last `wl_data_device.start_drag`, until that source's
+    /// `cancelled`/`dnd_finished` event or its `destroy` (a new
+    /// `start_drag` replaces it — the protocol allows one drag at a
+    /// time). A `wl_data_source` is shared by the clipboard and the
+    /// drag and the wire does not say which, so the audit labels the
+    /// `send` (serve) records on this source `selection=drag`
+    /// rather than the shared `clipboard` label (the 6.5.5
+    /// refinement).
+    drag_source: Option<u32>,
 }
 
 /// The gate's decision on one `receive`, with the facts the
@@ -327,6 +347,7 @@ impl ClipboardGate {
             copy_out_clipboard: None,
             copy_out_primary: None,
             copy_out_drag: None,
+            drag_source: None,
         }
     }
 
@@ -354,6 +375,16 @@ impl ClipboardGate {
     /// 5). Same use as [`Self::selection_origin`].
     pub(crate) fn primary_selection_origin(&self) -> Option<Origin> {
         self.primary_selection
+    }
+
+    /// The source of this client's active drag, if one is in
+    /// progress (the last `start_drag` whose source has neither been
+    /// cancelled/finished — `cancelled` or `dnd_finished` — nor
+    /// destroyed; the 6.5.5 refinement). The relay uses it to label
+    /// the `send` (serve) records on that source `selection=drag`
+    /// instead of the shared `clipboard` label.
+    pub(crate) fn active_drag_source(&self) -> Option<u32> {
+        self.drag_source
     }
 
     /// The Phase 4 hook: allow all reads — including foreign ones —
@@ -385,6 +416,9 @@ impl ClipboardGate {
             }
             (Dir::ClientToServer, "wl_data_source", "destroy") => {
                 self.own_sources.remove(&msg.sender_id);
+                if self.drag_source == Some(msg.sender_id) {
+                    self.drag_source = None;
+                }
             }
             (Dir::ClientToServer, "wl_data_device", "set_selection")
             | (Dir::ClientToServer, "wl_data_device", "start_drag") => {
@@ -400,6 +434,20 @@ impl ClipboardGate {
                     Some(Argument::Object(id)) if self.own_sources.contains(id) => Some(kind),
                     _ => None,
                 };
+                // A `start_drag` is also what makes a source *the
+                // drag's* source (the 6.5.5 refinement): track it,
+                // so the `send` (serve) records on it are labeled
+                // `drag` rather than the shared `clipboard`. A new
+                // `start_drag` replaces the previous one; the
+                // bookkeeping guarantees the client created the
+                // source.
+                if desc.name == "start_drag"
+                    && let Some(Argument::Object(id)) = msg.args.first()
+                    && *id != 0
+                    && self.own_sources.contains(id)
+                {
+                    self.drag_source = Some(*id);
+                }
             }
             (Dir::ServerToClient, "wl_data_device", "data_offer") => {
                 // The new offer is the first argument; attribute it
@@ -444,6 +492,22 @@ impl ClipboardGate {
                 // A drag-and-drop session (re)starts: the pending
                 // `start_drag` (if any) is consumed by this echo.
                 self.pending = None;
+            }
+            (Dir::ServerToClient, "wl_data_source", "cancelled")
+            | (Dir::ServerToClient, "wl_data_source", "dnd_finished") => {
+                // The drag this source owned has ended (the 6.5.5
+                // refinement): `cancelled` — the source is no longer
+                // valid (replaced, cancelled, or a drop the
+                // destination did not accept) — or `dnd_finished`,
+                // the source is free to be destroyed. (A
+                // `dnd_drop_performed` does *not* end it: a "move"
+                // drop transfers its data on the drop, so the
+                // serve(s) behind it are still the drag's.) If this
+                // source is the active drag's, it no longer is — a
+                // matching event on any other source is a no-op.
+                if self.drag_source == Some(msg.sender_id) {
+                    self.drag_source = None;
+                }
             }
             (Dir::ClientToServer, "wl_data_offer", "destroy") => {
                 self.own_offers.remove(&msg.sender_id);
@@ -767,6 +831,7 @@ mod tests {
     use std::os::fd::{FromRawFd, IntoRawFd};
     use wayland_client::protocol::__interfaces::{
         WL_DATA_DEVICE_INTERFACE, WL_DATA_DEVICE_MANAGER_INTERFACE, WL_DATA_OFFER_INTERFACE,
+        WL_DATA_SOURCE_INTERFACE,
     };
     use wayland_protocols::wp::primary_selection::zv1::client::__interfaces::{
         ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1_INTERFACE,
@@ -803,6 +868,9 @@ mod tests {
     const MGR: u32 = 0xFF00_0001;
     const DEVICE: u32 = 0xFF00_0002;
     const SRC: u32 = 30;
+    /// A second client-owned source (the 6.5.5 test: replacing the
+    /// active drag).
+    const SRC2: u32 = 31;
     const SURFACE: u32 = 40;
     const OFFER_FOREIGN: u32 = 0xFF00_0100;
     const OFFER_OWN: u32 = 0xFF00_0101;
@@ -1445,6 +1513,193 @@ mod tests {
             ),
         );
         assert_eq!(receive(&mut g, OFFER_DRAG).unwrap(), ForwardAction::Forward);
+    }
+
+    /// An event of `name` on the `wl_data_source` interface (the
+    /// 6.5.5 refinement: the `cancelled`/`dnd_finished` that end a
+    /// drag).
+    fn source_event(name: &str) -> (u16, &'static MessageDesc) {
+        let d = &WL_DATA_SOURCE_INTERFACE
+            .events
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        (opcode(&WL_DATA_SOURCE_INTERFACE, "ev", name), d)
+    }
+
+    /// A `wl_data_source.destroy` request on `id` (the 6.5.5
+    /// refinement: the other way a drag's source leaves).
+    fn source_destroy(_id: u32) -> (u16, &'static MessageDesc) {
+        let d = &WL_DATA_SOURCE_INTERFACE
+            .requests
+            .iter()
+            .find(|d| d.name == "destroy")
+            .unwrap();
+        (opcode(&WL_DATA_SOURCE_INTERFACE, "req", "destroy"), d)
+    }
+
+    /// The 6.5.5 refinement: the gate tracks the client's active
+    /// drag source so the relay can label its `send` (serve)
+    /// records `drag`. A `start_drag` sets it; the source's
+    /// `cancelled`/`dnd_finished` event or its `destroy` clears it;
+    /// a new `start_drag` replaces it; a `cancelled` on a
+    /// *different* source does not.
+    #[test]
+    fn the_active_drag_source_lifecycle() {
+        let mut g = ClipboardGate::new(ClipboardPolicy::Allow);
+        // The app's two own sources.
+        let (op, d) = (
+            opcode(
+                &WL_DATA_DEVICE_MANAGER_INTERFACE,
+                "req",
+                "create_data_source",
+            ),
+            &WL_DATA_DEVICE_MANAGER_INTERFACE
+                .requests
+                .iter()
+                .find(|d| d.name == "create_data_source")
+                .unwrap(),
+        );
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_MANAGER_INTERFACE,
+            d,
+            &msg(MGR, op, vec![Argument::NewId(SRC)]),
+        );
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_MANAGER_INTERFACE,
+            d,
+            &msg(MGR, op, vec![Argument::NewId(SRC2)]),
+        );
+        assert_eq!(g.active_drag_source(), None);
+
+        // A `set_selection` with the own source does not make it
+        // the drag's.
+        let (op, d) = request("set_selection");
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(DEVICE, op, vec![Argument::Object(SRC), Argument::Uint(0)]),
+        );
+        assert_eq!(g.active_drag_source(), None);
+
+        // A `start_drag` makes it the active drag source.
+        let (op, d) = request("start_drag");
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(
+                DEVICE,
+                op,
+                vec![
+                    Argument::Object(SRC),
+                    Argument::Object(SURFACE),
+                    Argument::Object(0),
+                    Argument::Uint(1),
+                ],
+            ),
+        );
+        assert_eq!(g.active_drag_source(), Some(SRC));
+
+        // A new `start_drag` (a different source) replaces it.
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(
+                DEVICE,
+                op,
+                vec![
+                    Argument::Object(SRC2),
+                    Argument::Object(SURFACE),
+                    Argument::Object(0),
+                    Argument::Uint(2),
+                ],
+            ),
+        );
+        assert_eq!(g.active_drag_source(), Some(SRC2));
+
+        // A `cancelled` on a *different* source does not clear it.
+        let (op, d) = source_event("cancelled");
+        g.observe(
+            Dir::ServerToClient,
+            &WL_DATA_SOURCE_INTERFACE,
+            d,
+            &msg(SRC, op, vec![]),
+        );
+        assert_eq!(
+            g.active_drag_source(),
+            Some(SRC2),
+            "a different source's cancelled does not clear it"
+        );
+
+        // The active drag source's `cancelled` ends it.
+        g.observe(
+            Dir::ServerToClient,
+            &WL_DATA_SOURCE_INTERFACE,
+            d,
+            &msg(SRC2, op, vec![]),
+        );
+        assert_eq!(g.active_drag_source(), None);
+
+        // …and so does its `dnd_finished`.
+        let (op, d) = request("start_drag");
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(
+                DEVICE,
+                op,
+                vec![
+                    Argument::Object(SRC),
+                    Argument::Object(SURFACE),
+                    Argument::Object(0),
+                    Argument::Uint(2),
+                ],
+            ),
+        );
+        assert_eq!(g.active_drag_source(), Some(SRC));
+        let (op, d) = source_event("dnd_finished");
+        g.observe(
+            Dir::ServerToClient,
+            &WL_DATA_SOURCE_INTERFACE,
+            d,
+            &msg(SRC, op, vec![]),
+        );
+        assert_eq!(g.active_drag_source(), None);
+
+        // …and so does a `destroy` (the drag ends without a
+        // `cancelled`/`dnd_finished`, or the source is destroyed
+        // mid-drag).
+        let (op, d) = request("start_drag");
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_DEVICE_INTERFACE,
+            d,
+            &msg(
+                DEVICE,
+                op,
+                vec![
+                    Argument::Object(SRC),
+                    Argument::Object(SURFACE),
+                    Argument::Object(0),
+                    Argument::Uint(3),
+                ],
+            ),
+        );
+        assert_eq!(g.active_drag_source(), Some(SRC));
+        let (op, d) = source_destroy(SRC);
+        g.observe(
+            Dir::ClientToServer,
+            &WL_DATA_SOURCE_INTERFACE,
+            d,
+            &msg(SRC, op, vec![]),
+        );
+        assert_eq!(g.active_drag_source(), None);
     }
 
     #[test]
