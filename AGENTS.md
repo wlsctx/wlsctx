@@ -328,12 +328,14 @@ phase 8.1).**
   `restart_syscall` — an `SA_RESTART` action is suspected from the
   Rust ELF/dynamic-linker startup), which is not load-bearing while
   the guard exists.
-  Next up: a confined-mode run of the `dbus-proxy`/
-  `xwayland` satellites and the broker (the relay is now verified
-  confined; they are not), then the 6.5.5 `serve`-label drag
-  refinement (the audit itself is closed); 6.4 (the varlink tier)
-  stays parked until a released systemd ships `PIDs` in
-  `StartTransient`.
+  Next up: the 6.5.5 `serve`-label drag refinement (the audit itself
+  is closed); 6.4 (the varlink tier) stays parked until a released
+  systemd ships `PIDs` in `StartTransient`. (Done in this pass:
+  the `dbus-proxy`/`xwayland` satellites and the broker are now
+  **field-verified in confined mode** — enforcing, kernel 7.2.15:
+  the Xwayland satellite boots the server to a full session, real
+  X clients work through the per-instance socket, teardown is
+  clean, zero denials — LESSONS #45-#46.)
 
 ## Commit conventions
 
