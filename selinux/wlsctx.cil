@@ -167,7 +167,12 @@
 (allow wlsctx_app_t user_home_t (process (noatsecure rlimitinh siginh)))
 (allow wlsctx_app_t lib_t (process (noatsecure rlimitinh siginh)))
 (allow wlsctx_app_t usr_t (process (noatsecure rlimitinh siginh)))
-(allow wlsctx_t xserver_t (process (transition dyntransition)))
+; the exec-time SID change into `xserver_t` (the satellite's
+; `typetransition` on `xserver_exec_t`, below) needs the new-process
+; checks against the *new* SID, not just the transition permission
+; itself: without `noatsecure/siginh/rlimitinh` the exec of Xwayland
+; is denied even though the typetransition itself passes.
+(allow wlsctx_t xserver_t (process (transition dyntransition noatsecure rlimitinh siginh)))
 (typetransition wlsctx_t xserver_exec_t process xserver_t)
 (allow wlsctx_t xserver_exec_t (file (entrypoint execute getattr map open read)))
 (allow wlsctx_t wlsctx_exec_t (file (entrypoint execute execute_no_trans getattr map open read)))
@@ -486,7 +491,11 @@
 (allow wlsctx_app_t data_home_t (file (append create getattr map open read write unlink)))
 (allow wlsctx_app_t gconf_home_t (file (append create getattr map open read write unlink)))
 (allow wlsctx_app_t bin_t (file (entrypoint execute execute_no_trans getattr map open read)))
-(allow wlsctx_app_t lib_t (file (entrypoint execute execute_no_trans getattr map open read)))
+; `ioctl`: the shim's `ld.so` runs before the `xserver_t` transition
+; settles, in `wlsctx_app_t`; it probes candidate `.so` files with
+; `TCGETSID` (its `isatty`-style check) and that ioctl is checked
+; against the file's type
+(allow wlsctx_app_t lib_t (file (entrypoint execute execute_no_trans getattr ioctl map open read)))
 ; decision #42: the post-exec pdeathsig-restore shim (the bridle of
 ; the B←A cascade leg). The confined exec into `wlsctx_app_t`
 ; changed the process's SID, so `selinux_bprm_committing_creds`
@@ -573,6 +582,13 @@
 (allow wlsctx_app_t fs_t (filesystem (getattr)))
 (allow wlsctx_app_t xserver_t (unix_stream_socket (connectto read write)))
 (allow xserver_t wlsctx_app_t (unix_stream_socket (read write)))
+; the satellite's fds (the displayfd socketpair, the listening X
+; socket, the /dev/null dup) carry their creator's SID — `wlsctx_t`
+; — and Xwayland reads/writes them after the transition: `fd:use`
+; and the socket object's own `read`/`write` are both checked
+; against the *creator's* type, not the file's
+(allow xserver_t wlsctx_t (fd (use)))
+(allow xserver_t wlsctx_t (unix_stream_socket (accept connectto getattr read write)))
 (allow xserver_t user_tmp_t (file (getattr open read)))
 ; decision #37: the Xwayland satellite's own shim (the same
 ; mechanism, `SIGTERM`): its `xserver_t` transition changes the SID
