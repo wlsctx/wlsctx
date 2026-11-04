@@ -556,7 +556,10 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
       the socket-activation path is unit-tested
 - [ ] 6.4 *(future, #35)* varlink tier once a released systemd ships a
       scope context with `PIDs` in `io.systemd.Unit.StartTransient`
-      (main only as of 2026-10-16, after v262)
+      (main only as of 2026-10-16, after v262; rechecked 2026-11-04:
+      still main-only — v263 is in development, newest release is v262
+      of 2026-09-22, and Fedora 45's 262.1 exposes no user-bus varlink
+      socket at all, `/run/systemd/user/io.systemd.System`)
 
 ### Phase 6.5 — Wayland proxy & prompt broker (clipboard branch, merged `21b26dd`)
 
