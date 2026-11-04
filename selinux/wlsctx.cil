@@ -172,7 +172,7 @@
 ; checks against the *new* SID, not just the transition permission
 ; itself: without `noatsecure/siginh/rlimitinh` the exec of Xwayland
 ; is denied even though the typetransition itself passes.
-(allow wlsctx_t xserver_t (process (transition dyntransition noatsecure rlimitinh siginh)))
+(allow wlsctx_t xserver_t (process (transition dyntransition noatsecure rlimitinh siginh signal sigkill)))
 (typetransition wlsctx_t xserver_exec_t process xserver_t)
 (allow wlsctx_t xserver_exec_t (file (entrypoint execute getattr map open read)))
 (allow wlsctx_t wlsctx_exec_t (file (entrypoint execute execute_no_trans getattr map open read)))
@@ -588,8 +588,11 @@
 ; and the socket object's own `read`/`write` are both checked
 ; against the *creator's* type, not the file's
 (allow xserver_t wlsctx_t (fd (use)))
-(allow xserver_t wlsctx_t (unix_stream_socket (accept connectto getattr read write)))
-(allow xserver_t user_tmp_t (file (getattr open read)))
+(allow xserver_t wlsctx_t (unix_stream_socket (accept connectto getopt getattr read write shutdown)))
+; the `-auth` file: the sidecar leaves it to the server, which creates
+; it on startup (a fresh magic cookie) — needs create/append/write,
+; not just read
+(allow xserver_t user_tmp_t (file (append create getattr open read write)))
 ; decision #37: the Xwayland satellite's own shim (the same
 ; mechanism, `SIGTERM`): its `xserver_t` transition changes the SID
 ; (the belt is cleared), and the satellite's glibc loader maps the
