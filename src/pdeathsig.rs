@@ -254,7 +254,9 @@ fn current_label(so: &std::path::Path) -> Option<String> {
     };
     (0 < n).then(|| {
         let n = n as usize;
-        String::from_utf8_lossy(&buf[..n]).trim_end_matches('\0').to_string()
+        String::from_utf8_lossy(&buf[..n])
+            .trim_end_matches('\0')
+            .to_string()
     })
 }
 
