@@ -46,12 +46,13 @@
 
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::process;
 
 use anyhow::{Context, Result};
-use log::{debug, info};
+use log::{debug, error, info};
 use nix::sys::signal::{
     SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGSYS, SIGTRAP, SigSet, SigmaskHow, Signal,
 };
@@ -300,6 +301,39 @@ pub fn run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating the per-instance runtime dir {dir:?}"))?;
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+
+    // The child (xdg-dbus-proxy) binds the public socket, and it will
+    // not remove a pre-existing file: a stale socket left by a sidecar
+    // that died without a clean teardown (a SIGKILL) makes the child's
+    // bind fail `EADDRINUSE`. Probe first: a path that *connects* is
+    // actively served (a live sidecar for this instance, or a socket
+    // name colliding with another service's socket — unlinking that
+    // would break it), so bail there; `ECONNREFUSED` is the stale
+    // case, unlink it and let the child create a fresh one. The same
+    // discipline as the wayland listener's `bind_socket`.
+    match std::fs::metadata(&socket) {
+        Ok(meta) if meta.file_type().is_socket() => match UnixStream::connect(&socket) {
+            Ok(_) => {
+                anyhow::bail!(
+                    "{socket} is served by a live process (connect succeeded); \
+                     stop that process first (a previous wlsctx still hanging? or a \
+                     socket name pointing at a socket owned by another service?)"
+                )
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                info!("Removing stale socket {socket}");
+                let _ = std::fs::remove_file(&socket)
+                    .inspect_err(|e| error!("Failed to remove stale socket {socket}: {e}"));
+            }
+            Err(e) => anyhow::bail!("probing {socket} failed: {e}"),
+        },
+        Ok(_) => anyhow::bail!(
+            "{socket} already exists and is not a socket; \
+             move or delete it before starting the D-Bus proxy"
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("stat {socket} failed: {e}"),
+    }
 
     let (side_end, child_end) = side_socketpair()?;
     let child_end_fd = child_end.as_fd().as_raw_fd();
