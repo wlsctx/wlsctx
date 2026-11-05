@@ -13,7 +13,9 @@ a selection audit log) and, with `--broker-socket`, a host-side broker
 (`broker`) that serves a consent prompt (dropped *reads*) and a
 fire-and-forget copy-out notification (app *writes*,
 `--notify-copy-out`); `decide` lists/resolves the broker's pending
-prompts. **PLAN.md is the authoritative plan and decisions log — read
+prompts; `dbus-proxy` and `xwayland` run the phase-7.2/7.3 sidecars
+(the `xdg-dbus-proxy` child, the rootless `Xwayland` satellite).
+**PLAN.md is the authoritative plan and decisions log — read
 it before non-trivial changes. LESSONS.md is a short, living record of
 hard-won lessons — skim it before non-trivial changes (the full
 write-ups live in `docs/postmortems/`). README.md is the
@@ -23,9 +25,9 @@ phase 8.1).**
 ## Layout
 
 - `src/main.rs` — binary entry: logging, CLI parse, subcommand
-  dispatch (`run`/`wayland`/`broker`/`decide`/`dbus-proxy`). SIGHUP
-  semantics are
-  mode-dependent: `run` terminates the app and exits 129 (decision
+  dispatch (`run`/`wayland`/`broker`/`decide`/`dbus-proxy`/
+  `xwayland`). SIGHUP semantics are mode-dependent: `run` terminates
+  the app and exits 129 (decision
   #33); the `wayland` modes rebuild (in-place re-exec in `--listen`
   mode, clean exit for a systemd restart when socket-activated)
 - `src/cli.rs` — clap subcommand tree: `run` (sandboxed execution),
@@ -35,8 +37,11 @@ phase 8.1).**
   `--auto-decide`, `--broker-timeout-millis`), `decide`
   (`--decision`, `--prompt`), `dbus-proxy` (`--app-id`,
   `--instance-id`, `--bus-address`, `--socket-name`,
-  `--see`/`--talk`/`--own`/`--call`/`--broadcast`, `--proxy-bin`);
-  cross-field checks live in `validate()`
+  `--see`/`--talk`/`--own`/`--call`/`--broadcast`, `--proxy-bin`),
+  `xwayland` (`--app-id`, `--instance-id`, `--display` (default 97),
+  `--socket-name`, `--auth-name`, `--wayland-display`,
+  `--xwayland-bin`, `--no-rootless`); cross-field checks live in
+  `validate()`
 - `src/lib.rs` — library modules used by the binary:
   - `proxy/` — the `--proxy` relay: wire parser, object bookkeeping
     (convention-adaptive ID layout), interface tables (generated),
@@ -150,6 +155,12 @@ phase 8.1).**
   units in the repo. Per-app proxies are documented manual runs (the
   README), and the phase-7.2/7.3 `dbus-proxy`/`xwayland` sidecars
   would land here
+- `selinux/` — the confined-mode SELinux module: `wlsctx.cil` (the
+  single source of truth and install artifact — `wlsctx_t`,
+  `wlsctx_app_t`, `wlsctx_shim_t`, the `xserver_t` fix, the
+  per-instance MCS categories, `;` line comments) and `README.md`
+  (the design: what the MCS actually isolates, the enforcing-mode
+  tuning history)
 - `PLAN.md` — rework plan: architecture, decisions log, phase/task list
 - `LESSONS.md` — a short, living record of hard-won lessons from past
   work; add a line whenever a change teaches something durable, and
@@ -327,15 +338,17 @@ phase 8.1).**
   is B's own USR1-terminate disposition (B resumed via
   `restart_syscall` — an `SA_RESTART` action is suspected from the
   Rust ELF/dynamic-linker startup), which is not load-bearing while
-  the guard exists.
-  Next up: the 6.5.5 `serve`-label drag refinement (the audit itself
-  is closed); 6.4 (the varlink tier) stays parked until a released
-  systemd ships `PIDs` in `StartTransient`. (Done in this pass:
-  the `dbus-proxy`/`xwayland` satellites and the broker are now
-  **field-verified in confined mode** — enforcing, kernel 7.2.15:
-  the Xwayland satellite boots the server to a full session, real
-  X clients work through the per-instance socket, teardown is
-  clean, zero denials — LESSONS #45-#46.)
+  the guard exists.  6.5.5 (the `serve`-label drag refinement)
+  landed in v2.19 (2026-11-04, LESSONS #47); next up, 6.4 (the
+  varlink tier) stays parked until a released systemd ships `PIDs`
+  in `StartTransient` (re-checked 2026-11-04: v263 is still in
+  development; Fedora 45's 262.1 has no user-bus varlink socket).
+  (Done in this pass: the `dbus-proxy`/`xwayland` satellites and
+  the broker are now **field-verified in confined mode** —
+  enforcing, kernel 7.2.15: the Xwayland satellite boots the
+  server to a full session, real X clients work through the
+  per-instance socket, teardown is clean, zero denials — LESSONS
+  #45-#46.)
 
 ## Commit conventions
 
