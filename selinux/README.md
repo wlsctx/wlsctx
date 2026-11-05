@@ -37,8 +37,9 @@ is the format everything ends up in anyway. Two reasons the old
   narrowing silently degrades, LESSONS #28) and the **`mcs_constrained_type`
   membership** that gives the categories their teeth.
 
-CIL has no comment syntax (the libsepol lexer's comment rule is
-empty), so the file is bare statements only.
+The CIL reader accepts `;` line comments (the libsepol lexer's
+comment rule matches `;`; the parser skips to end of line), and
+the module uses them; otherwise the file is bare statements.
 
 ## What it defines
 
