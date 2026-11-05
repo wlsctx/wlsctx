@@ -131,7 +131,10 @@ volumes" is gone). Working as the mount namespace's root, `A` assembles:
    `full`, `urandom`, `random`, `tty`) **bind-mounted** (not `mknod`'d, so
    they keep their canonical genfs SELinux labels — important for a future
    SELinux module), a **fresh `devpts` instance** isolated from the host's
-   pts, and — with GPU on — `/dev/dri` bound from the host.
+   pts (`/dev/ptmx` is a symlink into it — binding the host's would hand
+   the app the host's pty master), a **fresh private `/dev/shm`** (a
+   `tmpfs`, mode 1777 — the `wl_shm` shared-memory path), and — with GPU
+   on — `/dev/dri` bound from the host.
 3. `/sys` — a fresh tmpfs with read-only binds of `devices/` and `class/`
    (all a GUI app needs for PCI/DRM discovery).
 4. `/run` — a fresh tmpfs carrying **only** the per-instance dir
@@ -228,11 +231,13 @@ both ends. On the way *in* from the app it can apply:
   from steering clipboard data into a file.
 - **`--notify-copy-out`** (requires `--broker-socket`) — fires a one-way
   desktop notification to the broker each time the app *writes* to the
-  clipboard or primary selection (`set_selection`): the copy-*out* signal,
-  since that data is now reachable by every client on the desktop.
-  Rate-limited to at most one notification per second per app (a rapid
-  copier's burst collapses to that; every write still lands in the audit
-  log). Independent of the policy above and fire-and-forget/fail-open: a
+  clipboard or primary selection (`set_selection`), or *starts a drag*
+  (`start_drag`): the copy-*out* signal, since that data is now reachable
+  by every client on the desktop. Rate-limited to at most one
+  notification per second **per selection** (three independent one-second
+  windows — clipboard, primary, drag — so a rapid copier's burst on one
+  of them collapses to that; every write still lands in the audit log).
+  Independent of the policy above and fire-and-forget/fail-open: a
   missing broker only loses the notice; the write is never blocked or
   altered.
 - **The selection audit log** (always on, no flag) writes one structured
@@ -241,7 +246,12 @@ both ends. On the way *in* from the app it can apply:
   with the gate's decision — `forward` / `approved` through the broker /
   `dropped`), `clear` (a NULL `set_selection`), and `serve` (a `send`
   event on one of the app's source objects — the per-mime byte flow behind
-  a write). Fields: `app`, `instance`, `selection`, `action`, `origin`,
+  a write). The `selection` label is `clipboard` or `primary` by protocol,
+  except that a `serve` on the client's **active drag source** (a
+  `start_drag` that has not yet ended) is labelled `drag` — the
+  `wl_data_source` is shared by the clipboard and the drag and the wire
+  does not say which, so the relay tracks the active one (6.5.5). Fields:
+  `app`, `instance`, `selection`, `action`, `origin`,
   `mime`, `gate`, `fd_kind`, `payload_bytes`, under the `audit` log
   target. It records **sizes, never content** (the relay only `fstat`s the
   fd it already holds; a pipe/socket reports no size, a dropped read
@@ -285,7 +295,7 @@ request automatically — a test hook).
 
 ## The `wlsctx` binary
 
-Four subcommands (the relay logic lives in `src/proxy/`, the broker in
+Six subcommands (the relay logic lives in `src/proxy/`, the broker in
 `src/broker.rs`, the sandbox in `src/sandbox/`):
 
 1. **`run`** — run a command inside the sandbox (the `S → A → B`
@@ -317,13 +327,36 @@ Four subcommands (the relay logic lives in `src/proxy/`, the broker in
      (all proxy-only).
 
 3. **`broker`** — the clipboard prompt broker (host user service).
-   `--listen` / `--socket-activation`, `--auto-decide <allow|deny>` (test
-   hook), `--broker-timeout-millis` (default 30000).
+   `--listen <path>` (required unless `--socket-activation`; the
+   `WLSCTX_SOCKET_PATH` environment variable is honoured) /
+   `--socket-activation`, `--auto-decide <allow|deny>` (test hook),
+   `--broker-timeout-millis` (default 30000, `WLSCTX_BROKER_TIMEOUT_MILLIS`
+   honoured).
 
 4. **`decide`** — one-shot client of the broker's decision socket:
    `--decision allow|deny` (without it, lists the pending prompts) and
    `--prompt <id>` (omit: the oldest). Intended for a keybinding or a
    notification action.
+
+5. **`dbus-proxy`** — a host sidecar wrapping `xdg-dbus-proxy` that
+   bridges the session bus to a per-instance public D-Bus socket (the
+   app's `DBUS_SESSION_BUS_ADDRESS` points at it): `--app-id` /
+   `--instance-id` (default `app` / `1`), `--bus-address` (default the
+   `DBUS_SESSION_BUS_ADDRESS` environment variable), `--socket-name`
+   (default `bus.sock`), repeatable `--see` / `--talk` / `--own`
+   (bus-name rules) and `--call` / `--broadcast` (`NAME=RULE` rules),
+   `--proxy-bin` (default `xdg-dbus-proxy` on `PATH`).
+
+6. **`xwayland`** — the optional host-side satellite that gives the
+   sandboxed app a per-instance X display (a host-side Xwayland client
+   of the desktop compositor; the app's `DISPLAY` / `XAUTHORITY` point
+   at the socket and auth file in the instance runtime dir):
+   `--app-id` / `--instance-id` (default `app` / `1`), `--display`
+   (default `97`), `--socket-name` (default `xwayland.sock`),
+   `--auth-name` (default `xwayland-auth`), `--wayland-display`
+   (default the `WAYLAND_DISPLAY` environment variable),
+   `--xwayland-bin` (default `Xwayland`), `--no-rootless` (rootless is
+   the default).
 
 ## Install
 
@@ -556,7 +589,8 @@ MCS layer is process-level, not file-level (objects created under the
   app's own copy-and-paste, so the write is **not blocked**; instead it is
   made *visible*: with `--notify-copy-out` a write fires a desktop
   notification naming the app and the selection (rate-limited, at most one
-  per second per app), and — always on, whenever the relay runs — every
+  per second per selection — clipboard, primary, and drag each have their
+  own one-second window), and — always on, whenever the relay runs — every
   selection event is recorded in the **selection audit log** (one
   structured line per `set`/`read`/`clear`/`serve`, sizes never content) in
   the host journal. The clipboard is treated as shared scratch space, not a
@@ -624,14 +658,13 @@ confirmation), and — once a D-Bus/socket path exists — allow the host's
   terminals that allocate a fresh PTY can fail with `EACCES`. It is a
   kernel-level restriction, not a policy one; under test we use a
   pre-allocated path instead.
-- **Drag-and-drop `serve` is labelled by its source, not its drag.**
-  A `start_drag` is audited as a write (`action=set selection=drag`,
-  with its own copy-out notification — Phase 6.5.5), but the `serve`
-  records for the bytes it then serves are still labelled
-  `selection=clipboard`: `wl_data_source` is shared by the clipboard
-  and the drag, and the relay does not yet track which source is in
-  an active drag. The write is never missed — only the per-mime byte
-  flow behind a drag carries the stable-selection label.
+- **A `read` during a drag is labelled by its protocol, not its drag.**
+  The `set` of a `start_drag` and the `serve` records on the active drag
+  source are both labelled `selection=drag` (the relay tracks the active
+  drag — Phase 6.5.5), but the `read` on the stable-protocol data offer
+  that a drag creates is labelled `selection=clipboard`: the protocol
+  never says which selection or drag a `receive` belongs to, so the
+  stable-protocol offer can only carry the stable-selection label.
 - **The sidecars are opt-in, not on by default.** `wlsctx dbus-proxy`
   (Phase 7.2) and the optional `wlsctx xwayland` host satellite
   (Phase 7.3) are built and run per instance; neither is started by a
