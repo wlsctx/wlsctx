@@ -20,11 +20,12 @@ later phases.
 ```
 host user session (uid 1000, sway)
 │
-├── wlsctx run rustrover          ← supervisor, unsandboxed, host namespaces
+├── wlsctx run --app-id rustrover -- <cmd>  ← supervisor, unsandboxed, host namespaces
 │   │   - optional: registers itself in a systemd user SCOPE via D-Bus
-│   │     (StartTransientUnit, Delegate=app) — or plain cgroup fallback
+│   │     (StartTransientUnit, PIDs=[self] — decision #35) — or plain
+│   │     cgroup fallback
 │   │   - tagged Wayland socket   (wp_security_context_v1, as today)
-│   │   - supervisor IPC listener (nono supervisor socket)
+│   │   - services the app's seccomp-notify fd (decisions #22–#25)
 │   │   - sd-notify, signal forwarding, waits on child
 │   │
 │   └── fork ──► app process      ← the sandbox, runs as UID 1000 (not root)
@@ -34,7 +35,7 @@ host user session (uid 1000, sway)
 │       unshare pid → ipc → uts → cgroup → net
 │       nono: landlock + seccomp
 │       execve  (app is PID 1 of its pidns)
-└── (later phases) wlsctx dbus-proxy / wlsctx xwayland host sidecars
+└── wlsctx dbus-proxy / wlsctx xwayland — host sidecars (Phases 7.2/7.3)
 ```
 
 Compared to the container era:
@@ -172,7 +173,7 @@ root-in-ns behaviour.
 | Target | How | Notes |
 |---|---|---|
 | `/` | one-shot recursive self-bind (ro flag unattainable — #21) | new layer under the overlays below; read-only *semantics* for the app come from its real uid + nono (Phase 4); masks last |
-| `/dev` | fresh tmpfs + **bind-mount** of the host nodes `null`, `zero`, `full`, `urandom`, `random`, `tty`, `ptmx` | bind-mount, not mknod: nodes keep their canonical genfs SELinux labels (`null_t`, `urandom_t`, …) so future confined domains need plain standard `open/read/write` rules; matches the rootless-runc approach. Clear error if a host node is missing. |
+| `/dev` | fresh tmpfs + **bind-mount** of the host nodes `null`, `zero`, `full`, `urandom`, `random`, `tty`; `/dev/ptmx` is a **symlink** into the fresh `devpts` instance (a host bind would hand the app the host's pty master); a fresh private `/dev/shm` tmpfs (mode 1777 — the `wl_shm` path) | bind-mount, not mknod: nodes keep their canonical genfs SELinux labels (`null_t`, `urandom_t`, …) so future confined domains need plain standard `open/read/write` rules; matches the rootless-runc approach. Clear error if a host node is missing. |
 | `/dev/pts` | `mount devpts -o newinstance` | fresh instance, isolated from host pts |
 | `/dev/dri` | bind from host | GPU; user must be in `render` group (same requirement as rootless podman); `--no-gpu` skips |
 | `/proc` | fresh procfs mount | allowed in an unprivileged user ns (namespaced view); verify on target kernel (Phase 2) |
@@ -253,27 +254,32 @@ delegated, so no `io` limits from inside the session.
 ## 5. CLI design & network decision
 
 ```
-wlsctx run  [OPTIONS] <app-id> [APP ARGS...]     # full pipeline, execs app
-wlsctx run  [OPTIONS] -- <command> [ARGS...]     # ad-hoc (no profile)
-wlsctx wayland [OPTIONS]                         # tagged socket only
+wlsctx run      [OPTIONS] -- <command> [ARGS...]  # full pipeline, execs the app
+                                                 # (--app-id selects the profile)
+wlsctx wayland  [OPTIONS]                        # tagged socket only
                                                  # (tag-and-park), or
                                                  # --proxy: the mode A relay
-wlsctx broker  [OPTIONS]                         # the prompt broker daemon
-wlsctx decide  [OPTIONS]                         # list / resolve pending
+wlsctx broker   [OPTIONS]                        # the prompt broker daemon
+wlsctx decide   [OPTIONS]                        # list / resolve pending
                                                  # prompts
-# later phases: dbus-proxy, xwayland, profile show, status/stop
+wlsctx dbus-proxy [OPTIONS]                      # host D-Bus sidecar (7.2)
+wlsctx xwayland   [OPTIONS]                      # host X satellite (7.3)
+# later phases: profile show, status/stop
 ```
 
 Key options: `--app-id`, `--instance-id`,
-`--network={filter|none|host}`, `--gpu/--no-gpu`, `--config=<dir>`,
-`-v/-vv`.
+`--network={shared|none}`, `--gpu/--no-gpu`, `--wayland` with
+`--listen <path>` / `--socket-activation`. There is no `--config` flag
+(profiles are a fixed path) and no verbosity flag — logging is
+`RUST_LOG` via `env_logger`.
 
-**Network (decided):** default `filter` = *shared* host netns with nono's
-network filtering (egress allowed, no bind — matches the old
-"egress allowed" behaviour at zero plumbing cost; nono covers it
-natively). `--network=none` = new netns, `lo` only. `--network=host` =
-no filtering. Private-netns options (veth, pasta/slirp4netns) are a later
-hardening phase, out of scope for now.
+**Network (decided):** `shared` (default) = the *shared* host netns,
+currently **unfiltered** (egress allowed, no bind — matches the old
+"egress allowed" behaviour at zero plumbing cost; nono's network
+filtering would cover it but is a later phase — see the `cli.rs`
+comment). `none` = a bare netns with only loopback, brought up.
+Private-netns options (veth, pasta/slirp4netns) are a later hardening
+phase, out of scope for now.
 
 **App profiles** replace the quadlet drop-ins: TOML in
 `~/.config/wlsctx/apps/<app-id>.toml` (ro binds, rw binds, masked paths,
@@ -300,7 +306,7 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 | 14 | pidns teardown on 7.2 | When the ns leader exits, `zap_pid_ns_processes()` **does run** (`disable_pid_allocation()` proven), but on 7.2.11 the SIGKILL to surviving members is empirically a **no-op** — strays reparent, they don't die. We therefore don't rely on it: A (ns leader, in the *parent* pidns) reaps B and **exits by choice**, so nothing is left behind; exit codes propagate through A reliably (verified 5/5 for 0/42/137, incl. `128+sig` for signals). |
 | 15 | `/sys/class/net` is global | On 7.2 it lists interfaces of **all** netns (a global sysfs tree) — `unshare --net` still shows the host's. Per-netns verification uses `/proc/net/dev` (per-reader view) and netlink (`ip link`); the network tests do exactly that. |
 | 16 | Mount-ns naming/propagation quirks | The mount-ns symlink is `ns/mnt` (not `ns/mount`); `/proc/self/ns/` also contains `pid_for_children`/`time_for_children` entries. In mountinfo the word `private` is **omitted** (it's the default; only `shared:`/`slave:`/`unbindable:` tokens appear — host `/` shows `shared:1`). "View is private" is therefore asserted by *absence* of propagation tokens, gated on a host precondition that `/` is shared. |
-| 17 | The mount-ENOENT "flake" | **Not a kernel bug.** The mount test passed a non-NUL-terminated Rust `&str` to `mount()`/`umount()`; the kernel over-reads until a NUL, and the byte after the heap buffer is usually zero (worked) but occasionally not (garbage-suffixed path → ENOENT, sticky, invisible to `stat()`, stale dir left behind). v7.2 dcache/namei audited and exonerated (incl. the 98b6cf102b35 negative-dentry fix — a real but different bug). Fixed `6d255d1`. Rule: **every path handed to a C interface is NUL-terminated** (`dir_c` pattern). |
+| 17 | The mount-ENOENT "flake" | **Not a kernel bug.** The mount test passed a non-NUL-terminated Rust `&str` to `mount()`/`umount()`; the kernel over-reads until a NUL, and the byte after the heap buffer is usually zero (worked) but occasionally not (garbage-suffixed path → ENOENT, sticky, invisible to `stat()`, stale dir left behind). v7.2 dcache/namei audited and exonerated (incl. the 98b6cf102b35 negative-dentry fix — a real but different bug). Fixed `6d255d1`. Rule: **every path handed to a C interface is NUL-terminated** (the `cstr` helper in `src/sandbox/mounts.rs`). |
 | 18 | Binding mount roots | Binding the **mount root** of devtmpfs/sysfs/ext4 (e.g. `/dev`, `/sys` themselves) is EINVAL unprivileged on 7.2.11; any **subpath** or file binds fine. Hence `/dev`/`/sys` are rebuilt as fresh tmpfs + subpath binds (the scratch dir carries the node files out of the tree before the self-bind). |
 | 19 | `mknod` unprivileged | Unprivileged `mknod` of device nodes is EPERM on 7.2.11 (SELinux enforcing). `/dev` nodes and `/dev/dri` are therefore **bind-mounted** (canonical genfs SELinux labels preserved), never mknod'd. |
 | 20 | Cgroup ns root | The ns root is the unsharing task's cgroup **at unshare time**, so the instance sub-cgroup must be entered *before* `unshare(CLONE_NEWCGROUP)`: the app sees `0::/` (its own cgroup is the root; 7.2 renders it with a trailing slash). The Phase-2 order (unshare → move) rooted the ns at the session cgroup (`0::/app-N`) and is corrected; it must still precede the rootfs build (cgroup2 goes ro with the self-bind). |
@@ -334,6 +340,8 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 - [x] 0.3 Restructure `src/` into a binary crate with modules:
       `cli.rs`, `wayland/{mod,listener,context,signals}.rs` (move current
       code + all its tests, no behaviour change), `sandbox/`, `profile/`
+      (the `wayland` modules have since been reorganised: `signals.rs`
+      is gone, `roundtrip.rs` added)
 - [x] 0.4 Add deps: `nono` (pinned at 0.80.0, default-features off to
       drop `keyring`), `toml`, `serde`
 
@@ -361,9 +369,10 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
 - [x] 2.2 PID ns: extra fork so the app is PID 1; death semantics
       (kill app → whole ns gone) — see #14 for the real teardown story
 - [x] 2.3 IPC ns + UTS ns (hostname `wlsctx-<app>-<instance>`)
-- [x] 2.4 Cgroup ns: unshare in the unit cgroup, then move child to the
-      `app` sub-cgroup; verify `/proc/self/cgroup` view — #12 for the
-      7.2 dance
+- [x] 2.4 Cgroup ns: enter the `app` sub-cgroup **before**
+      `unshare(CLONE_NEWCGROUP)` (the original unshare-then-move order
+      rooted the ns at the session cgroup and is corrected — #20);
+      verify `/proc/self/cgroup` view — #12 for the 7.2 dance
 - [x] 2.5 Network ns per mode (`none` = bare netns + `lo up`)
 - [x] 2.6 Verify full set against a reference
       (`the_full_ns_set_is_fresh`: all 7 ns kinds fresh, `/proc/self/ns`
@@ -413,10 +422,10 @@ env vars, network mode, gpu, tmp size). New deps: `nono` (pinned),
   status. Direct SCM_RIGHTS from B is impossible: its `sendmsg` is
   already trapped (#23). If the handoff fails (B died early) S falls
   back to a plain `waitpid` — landlock still applies.
-- **S (the supervisor):** a poll loop over the notify listener and the
-  supervisor socket (`SupervisorSocket::pair()`, the
-  `CapabilityRequest` channel, auto-deny `ApprovalBackend`). Dispatch by
-  syscall number: openat → resolve the path from `/proc/<pid>/mem`
+- **S (the supervisor):** a `poll(2)` loop directly over the
+  seccomp-notify listener fd (handed off per #23 — there is no separate
+  supervisor socket: the notify fd is the only seccomp channel, #22).
+  Dispatch by syscall number: openat → resolve the path from `/proc/<pid>/mem`
   (`read_notif_path`/`resolve_notif_path`, `read_open_how` for
   openat2), check the capability allowlist → continue or
   EACCES+log; socket syscalls → read the sockaddr, *pathname* AF_UNIX
@@ -608,8 +617,9 @@ is integration-tested (`tests/proxy_integration.rs`,
       record per `set`/`read`/`clear`/`serve` event to the **host
       journal** (the relay logs to stderr); payload recorded as
       **size only, never content**; no rate-limiting (a persistent
-      record, not a digest). Drag-and-drop fully closed (2026-10-24,
-      completed v2.19): a `start_drag` is audited as a write
+      record, not a digest). Drag-and-drop fully closed (the write
+      audit 2026-10-24, v2.13; the `serve`-label drag refinement
+      v2.19, 2026-11-04): a `start_drag` is audited as a write
       (`action=set selection=drag`, its own copy-out notification),
       and the relay tracks the client's active drag source (a
       `start_drag` until that source's `cancelled`/`dnd_finished`/
@@ -710,16 +720,20 @@ audited as a write).
       renumbering is worse than an error. `-auth <instance-dir>/
       xwayland-auth` gives Xwayland a cookie file (the app points
       `XAUTHORITY` at the in-sandbox copy, decision #28's path);
-      `-nolisten tcp` (never a TCP listener); `-once` (the server
-      exits when the *last* X client disconnects — an orphaned
-      Xwayland self-cleans when the sandbox dies); `-rootless` by
+      `-nolisten tcp` (never a TCP listener); **no `-once`** (it
+      turned out to be XDMCP *session* semantics — a no-op for a
+      non-XDMCP rootless Xwayland, which does **not** exit when its
+      last X client disconnects, #37; the lifetime backstop is
+      instead the decision-#42 `PR_SET_PDEATHSIG` belt, which tears
+      Xwayland down whenever the satellite dies); `-rootless` by
       default (the window integrates with the desktop;
       `--no-rootless` for the framed window). The sidecar prints
       the profile env line: `DISPLAY=unix:<in-sandbox socket>`,
-      `XAUTHORITY=<in-sandbox auth>`. Xwayland additionally binds
-      the conventional `/tmp/.X11-unix/X<N>` on the host (it always
-      does, even with `-listenfd` — sway's instance shows it):
-      cookie-gated, owner-reachable, a convenience, not a hole.
+      `XAUTHORITY=<in-sandbox auth>`. The instance socket is the
+      *only* host-visible X path: given `-listenfd`, Xwayland does
+      **not** create the conventional `/tmp/.X11-unix/X<N>` (verified
+      on this box — a live `X0` there was a stale leftover of a dead
+      instance, #37).
 
 ### Phase 8 — Docs, SELinux, hardening
 - [x] 8.1 Rewrite `README.md`: architecture, threat model (what changed
