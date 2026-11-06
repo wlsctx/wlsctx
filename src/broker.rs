@@ -142,7 +142,6 @@ pub struct ClipboardRead {
     pub app: String,
     /// The instance ID from the sandbox's security context.
     pub instance: String,
-    /// The mime type the app asked to read.
     pub mime: String,
     /// Which selection the app was reading: `"clipboard"` (the
     /// stable selection) or `"primary"` (the X-style primary
@@ -165,7 +164,6 @@ fn default_selection() -> String {
 pub struct ClipboardWrite {
     /// The protocol version (currently 1).
     pub v: u8,
-    /// The notification kind ([`NOTIFY_KIND`]).
     pub kind: String,
     /// The app ID from the sandbox's security context.
     pub app: String,
@@ -228,9 +226,7 @@ pub struct PendingPromptView {
     pub app: String,
     /// The instance ID from the sandbox's security context.
     pub instance: String,
-    /// Which selection the app was reading.
     pub selection: String,
-    /// The mime type the app asked to read.
     pub mime: String,
     /// How much of the prompt's deadline is left (milliseconds).
     pub expires_in_ms: u64,
@@ -242,7 +238,6 @@ pub struct PendingPromptView {
 pub struct PendingList {
     /// The protocol version (currently 1).
     pub v: u8,
-    /// The response kind ([`PENDING_KIND`]).
     pub kind: String,
     pub prompts: Vec<PendingPromptView>,
 }
@@ -252,9 +247,7 @@ pub struct PendingList {
 pub struct Resolution {
     /// The protocol version (currently 1).
     pub v: u8,
-    /// The response kind ([`RESOLVED_KIND`]).
     pub kind: String,
-    /// The id of the prompt that was resolved.
     pub prompt: u32,
     /// The decision that was applied (`"allow"` / `"deny"`).
     pub decision: String,
@@ -265,7 +258,6 @@ pub struct Resolution {
 pub struct ErrorReply {
     /// The protocol version (currently 1).
     pub v: u8,
-    /// The response kind ([`ERROR_KIND`]).
     pub kind: String,
     /// The prompt id the failed decide targeted (absent for
     /// [`REASON_NO_PENDING`] and [`REASON_PROTOCOL`]).
@@ -290,7 +282,6 @@ fn decode<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T, String> {
     serde_json::from_str(line.trim()).map_err(|e| format!("malformed line {line:?}: {e}"))
 }
 
-/// Encode a request line (the proxy → broker direction).
 pub fn encode_request(req: &ClipboardRead) -> io::Result<String> {
     encode(req)
 }
@@ -341,22 +332,18 @@ struct Envelope {
     kind: String,
 }
 
-/// Decode just the `kind` of a wire line, for dispatch.
 fn decode_envelope(line: &str) -> Result<Envelope, String> {
     decode::<Envelope>(line)
 }
 
-/// Encode a decision line (the broker → proxy direction).
 pub fn encode_decision(d: &Decision) -> io::Result<String> {
     encode(d)
 }
 
-/// Decode a decision line.
 pub fn decode_decision(line: &str) -> Result<Decision, String> {
     decode(line)
 }
 
-/// Encode a `list` request line (the decider → broker direction).
 pub fn encode_list_request() -> io::Result<String> {
     encode(&DecideRequest {
         v: PROTOCOL_VERSION,
@@ -366,7 +353,6 @@ pub fn encode_list_request() -> io::Result<String> {
     })
 }
 
-/// Encode a `decide` request line (the decider → broker direction);
 /// `prompt` targets a specific pending prompt (the oldest when `None`).
 pub fn encode_decide_request(d: &UserDecision, prompt: Option<u32>) -> io::Result<String> {
     encode(&DecideRequest {
@@ -409,7 +395,6 @@ pub(crate) fn decision_name(d: &UserDecision) -> &'static str {
     }
 }
 
-/// Encode a `pending` response line (the broker → decider direction).
 pub(crate) fn encode_pending_list(list: &PendingList) -> io::Result<String> {
     encode(list)
 }
@@ -429,7 +414,6 @@ pub fn decode_pending_list(line: &str) -> Result<PendingList, String> {
     Ok(list)
 }
 
-/// Encode a `resolved` response line (the broker → decider direction).
 pub(crate) fn encode_resolution(r: &Resolution) -> io::Result<String> {
     encode(r)
 }
@@ -449,7 +433,6 @@ pub fn decode_resolution(line: &str) -> Result<Resolution, String> {
     Ok(r)
 }
 
-/// Encode an `error` response line (the broker → decider direction).
 pub(crate) fn encode_error_reply(e: &ErrorReply) -> io::Result<String> {
     encode(e)
 }
@@ -498,7 +481,6 @@ pub fn read_line(r: &mut impl io::Read, out: &mut String) -> io::Result<usize> {
     Ok(out.len())
 }
 
-/// Parse a decision keyword (`allow`/`deny`) from the CLI.
 pub fn parse_decision(s: &str) -> Result<UserDecision, String> {
     match s {
         "allow" => Ok(UserDecision::Allow),
@@ -548,7 +530,6 @@ struct PendingPrompt {
     instance: String,
     selection: String,
     mime: String,
-    /// The prompt's deadline (its creation + the broker's timeout).
     deadline: Instant,
     /// The user's decision once the main loop records it.
     decision: Mutex<Option<UserDecision>>,
@@ -603,7 +584,6 @@ impl BrokerCore {
         core
     }
 
-    /// Whether the decision socket is unusable.
     pub fn is_degraded(&self) -> bool {
         self.degraded
     }
@@ -730,8 +710,6 @@ pub fn bind_listener(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Take the socket handed by systemd socket activation (LISTEN_FDS),
-/// if any.
 pub fn take_activated_socket() -> Option<UnixListener> {
     sd_notify::listen_fds()
         .ok()
@@ -1000,7 +978,6 @@ pub fn handle_connection(mut stream: UnixStream, args: &BrokerArgs, core: &Broke
     }
 }
 
-/// The consent path (a `clipboard-read` request): decide, then answer.
 fn handle_read(
     stream: &mut UnixStream,
     req: &ClipboardRead,
@@ -1383,13 +1360,11 @@ mod tests {
 
     #[test]
     fn decider_request_roundtrip() {
-        // The list line.
         let list = encode_list_request().unwrap();
         let r = decode_decider_request(&list).unwrap();
         assert_eq!(r.kind, LIST_KIND);
         assert!(r.decision.is_none());
         assert!(r.prompt.is_none());
-        // A decide with no target (the oldest) and with one.
         let no_target = encode_decide_request(&UserDecision::Allow, None).unwrap();
         let r = decode_decider_request(&no_target).unwrap();
         assert_eq!(r.kind, DECIDE_KIND);
@@ -1403,13 +1378,9 @@ mod tests {
 
     #[test]
     fn decider_request_rejects_bad_lines() {
-        // A wrong version.
         assert!(decode_decider_request(r#"{"v":2,"kind":"list"}"#).is_err());
-        // An unknown kind.
         assert!(decode_decider_request(r#"{"v":1,"kind":"bogus"}"#).is_err());
-        // A decide without a decision.
         assert!(decode_decider_request(r#"{"v":1,"kind":"decide"}"#).is_err());
-        // A decide with an unknown decision.
         assert!(decode_decider_request(r#"{"v":1,"kind":"decide","decision":"maybe"}"#).is_err());
     }
 
@@ -1429,7 +1400,6 @@ mod tests {
         };
         let line = encode_pending_list(&list).unwrap();
         assert_eq!(decode_pending_list(&line).unwrap(), list);
-        // A different kind is rejected by the decoder.
         let other_kind = encode_resolution(&Resolution {
             v: PROTOCOL_VERSION,
             kind: RESOLVED_KIND.to_string(),
@@ -1496,7 +1466,6 @@ mod tests {
         );
         assert_eq!(a.id, 1);
         assert_eq!(b.id, 2);
-        // Untargeted: the oldest (id 1) resolves; the newest survives.
         assert_eq!(core.decide(None, UserDecision::Allow).unwrap(), 1);
         assert_eq!(core.decide(None, UserDecision::Deny).unwrap(), 2);
         assert!(core.pending_view().is_empty());
@@ -1519,7 +1488,6 @@ mod tests {
             Duration::from_secs(5),
             2,
         );
-        // Explicit: the newest first, then the rest is oldest-first.
         assert_eq!(core.decide(Some(2), UserDecision::Allow).unwrap(), 2);
         assert_eq!(core.decide(None, UserDecision::Deny).unwrap(), 1);
         // The decided id is gone from the queue: a second decide for
@@ -1613,7 +1581,6 @@ mod tests {
             auto_decide: None,
             timeout,
         };
-        // The proxy's request line, on the client side of the pair.
         let line = encode_request(req).unwrap();
         client.write_all(line.as_bytes()).unwrap();
         // The thread gets its own `Arc` clone; the caller's `Arc`
@@ -1634,7 +1601,6 @@ mod tests {
             "the prompt never reached the queue"
         );
         if decide {
-            // The decider's decision, on the oldest (only) prompt.
             assert_eq!(core.decide(None, UserDecision::Allow).unwrap(), 1);
         }
         let mut reply = String::new();
@@ -1658,7 +1624,6 @@ mod tests {
                 window_ms: INTENT_WINDOW_MS
             }
         );
-        // The prompt resolved: it is out of the queue again.
         assert!(core.pending_view().is_empty());
     }
 
