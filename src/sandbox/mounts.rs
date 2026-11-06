@@ -99,7 +99,6 @@ fn cstr(s: &str) -> Vec<u8> {
     v
 }
 
-/// `mount(2)` with NUL-terminated paths and a reported errno.
 fn mount(src: &str, target: &str, fstype: &str, flags: u64, data: &str) -> Result<()> {
     let (s, t, f, d) = (cstr(src), cstr(target), cstr(fstype), cstr(data));
     // SAFETY: all four are valid NUL-terminated C strings; the
