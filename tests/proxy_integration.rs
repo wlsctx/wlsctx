@@ -627,10 +627,6 @@ fn one_app_session(public_path: &Path) -> Result<(), Box<dyn std::error::Error +
     Ok(())
 }
 
-// ------------------------------------------------------------------------
-// The test
-// ------------------------------------------------------------------------
-
 #[test]
 fn relay_passes_messages_and_fds() {
     // The proxy (and the fake compositor) log via `log`; without a
@@ -669,7 +665,6 @@ fn relay_passes_messages_and_fds() {
         })
         .unwrap();
 
-    // The fake compositor on the tagged socket.
     let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
     let stop_comp = stop.clone();
     let comp = thread::Builder::new()
@@ -687,7 +682,6 @@ fn relay_passes_messages_and_fds() {
     one_app_session(&public_path).expect("app 2 failed");
     wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
 
-    // Shut down the fake compositor, then the proxy.
     stop.store(true, Ordering::SeqCst);
     let _ = comp.join();
     let _ = proxy.join();
@@ -718,7 +712,6 @@ fn allowlist_hides_globals_and_rejects_their_binds() {
     let remove_shm = Arc::new(AtomicBool::new(false));
     let shm_removed = Arc::new(AtomicBool::new(false));
 
-    // The proxy, with an allowlist that shows only `wl_compositor`.
     let public = wlsctx::proxy::bind_listener(&public_path).unwrap();
     let tagged_for_proxy = tagged_path.clone();
     let stop_proxy = stop.clone();
@@ -737,8 +730,6 @@ fn allowlist_hides_globals_and_rejects_their_binds() {
         })
         .unwrap();
 
-    // The fake compositor on the tagged socket, with the on-demand
-    // removal of its `wl_shm` global.
     let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
     let (req_c, done_c) = (remove_shm.clone(), shm_removed.clone());
     let stop_comp = stop.clone();
@@ -778,7 +769,6 @@ fn allowlist_hides_globals_and_rejects_their_binds() {
     // see its (upstream) connection go away.
     wait_until(|| live.load(Ordering::SeqCst) == 0, 10);
 
-    // Shut down the fake compositor, then the proxy.
     stop.store(true, Ordering::SeqCst);
     let _ = comp.join();
     let _ = proxy.join();
@@ -1244,9 +1234,6 @@ no_events!(
 no_events!(BurstApp, wl_seat::WlSeat, wl_seat::Event);
 no_events!(BurstApp, wl_data_offer::WlDataOffer, wl_data_offer::Event);
 
-/// One clipboard session through the proxy: the app copies (its own
-/// selection) and then reads a foreign one. Returns the contents of
-/// the two memfds after the session.
 /// One clipboard session through the proxy: the app copies (its own
 /// selection) and then reads a foreign one. `settle` is a quiet
 /// window after both reads, before the teardown — the audit tests
@@ -2340,7 +2327,6 @@ impl ServerDispatch<srv_wl_data_offer::WlDataOffer, OfferState> for Srv4 {
             f.write_all(&data.data).expect("write the selection data");
             drop(f);
             state.served += 1;
-            // Both serves done: send the app its ack.
             if state.served == 2
                 && !state.ack_sent
                 && let Some(device) = &state.device
@@ -2616,7 +2602,6 @@ fn two_fd_messages_in_one_datagram_keep_their_fds() {
         })
         .unwrap();
 
-    // The fake two-offer compositor on the tagged socket.
     let (ready_c, live_c, recv_c) = (ready.clone(), live.clone(), received.clone());
     let stop_comp = stop.clone();
     let comp = thread::Builder::new()
@@ -2948,7 +2933,6 @@ impl Dispatch<cl_zps_device::ZwpPrimarySelectionDeviceV1, ()> for PrimaryApp {
         if let cl_zps_device::Event::Selection { id: Some(offer) } = event {
             state.selections += 1;
             if state.selections == 1 {
-                // The read-back of the app's own selection.
                 offer.receive("text/plain".into(), state.own_fd.as_fd());
                 state.own_received.store(true, Ordering::SeqCst);
             } else {
@@ -3071,7 +3055,6 @@ fn one_primary_session(
     source.offer("text/plain".into());
     device.set_selection(Some(&source), 0);
 
-    // Pump until the app has performed both reads.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         eq.blocking_dispatch(&mut app)?;
