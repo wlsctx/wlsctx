@@ -71,8 +71,6 @@ fn main() -> Result<()> {
                 Some(p) => p,
                 None => profile::Profile::adhoc(),
             };
-            // The final GPU decision: explicit flags win over the
-            // profile.
             let gpu = if args.gpu {
                 true
             } else if args.no_gpu {
@@ -80,8 +78,7 @@ fn main() -> Result<()> {
             } else {
                 profile.gpu
             };
-            // The tagged Wayland socket (Phase 5.1): enabled by any of
-            // --wayland / --listen / --socket-activation.
+            // The tagged Wayland socket (Phase 5.1).
             let wayland = if args.wayland || args.listen.is_some() || args.socket_activation {
                 Some(sandbox::WaylandSpec {
                     listen: args.listen.map(|p| p.to_string_lossy().into_owned()),
@@ -275,9 +272,7 @@ fn run_proxy(args: &WaylandArgs) -> Result<()> {
     } else {
         info!("Clipboard gate: pass-through (allow)");
     }
-    // The audit identity: every selection event the relay observes is
-    // recorded under the `audit` log target. Always on;
-    // `RUST_LOG=warn` suppresses the stream.
+    // The audit identity. Always on; `RUST_LOG=warn` suppresses the stream.
     let audit = wlsctx::proxy::AuditConfig::new(app_id.clone(), instance_id.clone());
     // The optional prompt broker: when a denied read lands, the
     // relay asks here (a fresh connection per ask) before dropping.
@@ -681,7 +676,6 @@ int main(void) {
             let _ = writeln!(o, "after_set: {after_set}");
             match unsafe { fork() } {
                 Ok(ForkResult::Child) => {
-                    // The fork just now reset the value to 0.
                     let in_child = get();
                     let _ = writeln!(o, "in_child: {in_child}");
                     if !set(10) {
