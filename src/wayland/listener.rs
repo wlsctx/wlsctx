@@ -12,9 +12,6 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path;
 
-/// Get the Unix listener to tag, either from a systemd socket activation
-/// or by binding the socket ourselves (refusing to steal a socket that a
-/// live process still serves). Returns (app_id, instance_id, listener).
 pub fn obtain_listener(args: &WaylandArgs) -> Result<(String, String, UnixListener)> {
     let app_id = args.app_id.clone();
     let instance_id = args.instance_id.clone();
@@ -195,7 +192,6 @@ mod tests {
         }
     }
 
-    /// The bound path of a Unix listener, if it is path-based.
     fn socket_path(listener: &UnixListener) -> Option<path::PathBuf> {
         listener
             .local_addr()
