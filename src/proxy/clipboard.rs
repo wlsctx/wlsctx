@@ -136,7 +136,6 @@ pub enum ClipboardPolicy {
 }
 
 impl ClipboardPolicy {
-    /// Parse a policy from the command line / environment.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "allow" => Ok(Self::Allow),
@@ -305,10 +304,7 @@ pub(crate) struct ReceiveDecision {
     /// Relay the request as-is, or consume it (the app's fd
     /// stays empty and the read comes back empty).
     pub action: ForwardAction,
-    /// The receive fd's class (the always-on sanity check
-    /// guarantees it is an in-memory channel).
     pub fd_kind: FdKind,
-    /// Who the data behind this read belongs to.
     pub origin: OriginInfo,
 }
 
@@ -371,18 +367,10 @@ impl ClipboardGate {
         self.selection
     }
 
-    /// The origin of the current primary selection, if any (Phase
-    /// 5). Same use as [`Self::selection_origin`].
     pub(crate) fn primary_selection_origin(&self) -> Option<Origin> {
         self.primary_selection
     }
 
-    /// The source of this client's active drag, if one is in
-    /// progress (the last `start_drag` whose source has neither been
-    /// cancelled/finished — `cancelled` or `dnd_finished` — nor
-    /// destroyed; the 6.5.5 refinement). The relay uses it to label
-    /// the `send` (serve) records on that source `selection=drag`
-    /// instead of the shared `clipboard` label.
     pub(crate) fn active_drag_source(&self) -> Option<u32> {
         self.drag_source
     }
@@ -407,7 +395,6 @@ impl ClipboardGate {
     ) {
         match (dir, sender.name, desc.name) {
             (Dir::ClientToServer, "wl_data_device_manager", "create_data_source") => {
-                // The NewId is the first argument of the request.
                 if let Some(Argument::NewId(id)) = msg.args.first()
                     && *id != 0
                 {
@@ -608,7 +595,6 @@ impl ClipboardGate {
         let fd_kind = fd_kind(fd)?;
         let origin = Self::read_origin(self, msg.sender_id, primary);
 
-        // 2. The policy.
         match self.policy {
             ClipboardPolicy::Allow => Ok(ReceiveDecision {
                 action: ForwardAction::Forward,
@@ -839,8 +825,6 @@ mod tests {
         ZWP_PRIMARY_SELECTION_SOURCE_V1_INTERFACE,
     };
 
-    /// The 0-based opcode a request/event of `name` has in `table`
-    /// (the on-wire convention this proxy enforces).
     fn opcode(table: &Interface, kind: &str, name: &str) -> u16 {
         let arr = if kind == "req" {
             table.requests
@@ -923,7 +907,6 @@ mod tests {
         )
     }
 
-    /// The app created a zwp primary-selection source.
     fn app_creates_psel_source(g: &mut ClipboardGate) {
         let (op, d) = ps_mgr_request("create_source");
         g.observe(
@@ -964,9 +947,6 @@ mod tests {
         );
     }
 
-    /// The compositor announces a *foreign* primary selection (an
-    /// offer the compositor created for a source another client
-    /// owns).
     fn foreign_psel(g: &mut ClipboardGate, offer: u32) {
         let (op, d) = ps_event("data_offer");
         g.observe(
@@ -1035,9 +1015,6 @@ mod tests {
         (opcode(&WL_DATA_DEVICE_INTERFACE, "req", name), d)
     }
 
-    /// The app created a `wl_data_source` (client object `SRC`) and
-    /// the compositor announced a *foreign* selection (an offer the
-    /// compositor created for a source owned by another client).
     fn own_source_then_foreign_selection(g: &mut ClipboardGate) {
         let (op, d) = (
             opcode(
@@ -1057,7 +1034,7 @@ mod tests {
             d,
             &msg(MGR, op, vec![Argument::NewId(SRC)]),
         );
-        // data_offer(foreign) — no pending request is live.
+        // No pending request is live.
         let (op, d) = event("data_offer");
         g.observe(
             Dir::ServerToClient,
@@ -1065,7 +1042,6 @@ mod tests {
             d,
             &msg(DEVICE, op, vec![Argument::NewId(OFFER_FOREIGN)]),
         );
-        // selection(foreign offer).
         let (op, d) = event("selection");
         g.observe(
             Dir::ServerToClient,
@@ -1258,13 +1234,11 @@ mod tests {
     fn fd_kind_classifies_each_channel() {
         assert_eq!(fd_kind(&memfd()).unwrap(), FdKind::Memfd);
 
-        // Anonymous pipe.
         let (pipe_read, _pipe_write) = std::io::pipe().unwrap();
         let pipe_fd = unsafe { OwnedFd::from_raw_fd(pipe_read.into_raw_fd()) };
         assert_eq!(fd_kind(&pipe_fd).unwrap(), FdKind::Pipe);
         drop(pipe_fd);
 
-        // Unix socket pair end.
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let socket_fd = unsafe { OwnedFd::from_raw_fd(a.into_raw_fd()) };
         assert_eq!(fd_kind(&socket_fd).unwrap(), FdKind::Socket);
@@ -1334,13 +1308,11 @@ mod tests {
     fn fd_classification() {
         assert_eq!(fd_class(&memfd()), Some(FdKind::Memfd));
 
-        // Anonymous pipe.
         let (pipe_read, _pipe_write) = std::io::pipe().unwrap();
         let pipe_fd = unsafe { OwnedFd::from_raw_fd(pipe_read.into_raw_fd()) };
         assert_eq!(fd_class(&pipe_fd), Some(FdKind::Pipe));
         drop(pipe_fd);
 
-        // Unix socket pair end.
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let socket_fd = unsafe { OwnedFd::from_raw_fd(a.into_raw_fd()) };
         assert_eq!(fd_class(&socket_fd), Some(FdKind::Socket));
