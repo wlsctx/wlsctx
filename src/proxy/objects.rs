@@ -462,16 +462,12 @@ mod tests {
         }
     }
 
-    /// Rust (wayland-backend) convention: the first message is
-    /// addressed to the display at ID 1.
     fn rust_tables() -> ObjectTables {
         let mut t = ObjectTables::new();
         assert_eq!(t.sender_interface(1).unwrap().name, "wl_display");
         t
     }
 
-    /// C (libwayland) convention: the first message is addressed to the
-    /// display at ID 0.
     fn c_tables() -> ObjectTables {
         let mut t = ObjectTables::new();
         assert_eq!(t.sender_interface(0).unwrap().name, "wl_display");
@@ -582,7 +578,6 @@ mod tests {
     #[test]
     fn typed_newid_learns_child_interface() {
         let mut t = rust_tables();
-        // seed: client object 10 is a wl_compositor
         t.client.insert(
             10,
             Entry {
@@ -675,7 +670,6 @@ mod tests {
             },
         );
 
-        // The client half: the destructor request.
         let destroy = &wl_surface_iface()
             .requests
             .iter()

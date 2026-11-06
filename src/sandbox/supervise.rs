@@ -53,8 +53,6 @@ const POLL_TIMEOUT_MS: i32 = 50;
 // Channel construction
 // ---------------------------------------------------------------------
 
-/// Create a pipe; returns `(read_end, write_end)`.
-///
 /// `O_CLOEXEC` is set so neither end can leak across an `exec` into
 /// the app; B closes its write end explicitly before exec anyway.
 pub(crate) fn create_pipe() -> Result<(OwnedFd, OwnedFd)> {
@@ -69,8 +67,6 @@ pub(crate) fn create_pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok((r, w))
 }
 
-/// Create a `AF_UNIX`/`SOCK_STREAM` socketpair; returns
-/// `(end_a, end_b)`.
 pub(crate) fn create_socketpair() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-slot out array for socketpair(2).
@@ -120,8 +116,6 @@ pub(crate) fn write_fdnum(w: RawFd, fdnum: i32) -> Result<()> {
     Ok(())
 }
 
-/// Read one `i32` fd number from the pipe.
-///
 /// Returns `None` on EOF (the writer closed without sending — B died
 /// before the handoff) so the caller can fall back to a plain wait.
 pub(crate) fn read_fdnum(r: RawFd) -> Result<Option<i32>> {
@@ -312,8 +306,6 @@ pub(crate) fn send_fd(sock: RawFd, fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Receive one fd from the peer of `sock` via `SCM_RIGHTS`.
-///
 /// Returns `None` on EOF (the sender closed without sending — the
 /// handoff did not happen) so the caller can skip the supervisor.
 pub(crate) fn recv_fd(sock: RawFd) -> Result<Option<OwnedFd>> {
@@ -451,7 +443,7 @@ pub(crate) fn supervisor(notify: OwnedFd, caps: CapabilitySet, stop: Arc<AtomicB
             break;
         }
         if n == 0 {
-            continue; // timeout: re-check `stop`
+            continue;
         }
         if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
             continue;
@@ -476,7 +468,6 @@ pub(crate) fn supervisor(notify: OwnedFd, caps: CapabilitySet, stop: Arc<AtomicB
     }
 }
 
-/// Dispatch one notification by its syscall number and respond.
 fn handle_notif(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<()> {
     match notif.data.nr {
         SYS_OPENAT | SYS_OPENAT2 => handle_open(fd, notif, caps),
@@ -612,7 +603,7 @@ fn handle_send(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
 
     for dest in &dests {
         let Some((name_ptr, namelen)) = dest else {
-            continue; // connected socket, no address to check
+            continue;
         };
         // A zero-length "address" is an unnamed socket — fine.
         if *namelen == 0 {
@@ -656,7 +647,6 @@ fn handle_send(fd: RawFd, notif: &SeccompNotif, caps: &CapabilitySet) -> Result<
     continue_notif(fd, notif.id).map_err(anyhow::Error::from)
 }
 
-/// `io::Error::last_os_error` wrapped as `anyhow`, with a label.
 fn io_err(what: &str) -> anyhow::Error {
     let e = std::io::Error::last_os_error();
     anyhow!(format!("{what}: {e}"))
@@ -813,7 +803,6 @@ mod tests {
             out.contains("ctrl"),
             "the instance-dir write must be readable back from the app, got:\n{out}\n{err}"
         );
-        // The denied write never materialized.
         assert!(
             !std::path::Path::new(&denied).exists(),
             "the denied write must not have created {denied}"

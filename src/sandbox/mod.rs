@@ -774,7 +774,6 @@ pub(crate) fn run_sandboxed(command: &[OsString], config: &SandboxConfig) -> Res
                             );
                         }
                     }
-                    // 5.4: the forwarder thread (see its docs).
                     forwarder = arm_signal_forwarder(
                         fwd_mask.as_ref(),
                         app_pid,
@@ -1495,7 +1494,6 @@ mod tests {
         remove_runtime_dir(dir.path().join("nope").to_str().unwrap(), None);
     }
 
-    /// The tagged-socket run used by the live test below.
     fn tagged_config() -> SandboxConfig {
         SandboxConfig {
             app_id: "wlt".to_string(),
