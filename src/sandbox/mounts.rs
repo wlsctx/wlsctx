@@ -627,8 +627,8 @@ mod tests {
             "the in-ns uid must be the real uid:\n{out}"
         );
         // / is not masked away and the XDG rw self-bind worked: the
-        // home dir is writable from the app.
-        let home = std::env::var("HOME").unwrap_or_default();
+        // home dir is writable from the app (the probe uses $HOME
+        // from the inherited environment).
         let (code2, out2, err2) = run_cmd(
             &[
                 "/bin/sh",
@@ -644,7 +644,6 @@ mod tests {
                 "the XDG rw self-bind must make $HOME writable:\n{out2}"
             );
         }
-        let _ = &home; // (the probe used $HOME from the inherited env)
     }
 
     /// 3.3: the GPU path — in the `render` group, `/dev/dri` is built
