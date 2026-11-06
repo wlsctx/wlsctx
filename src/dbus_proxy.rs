@@ -118,7 +118,6 @@ pub fn host_instance_dir(app_id: &str, instance_id: &str) -> String {
     format!("{xdg}/wlsctx/{}", instance_name(app_id, instance_id))
 }
 
-/// The public socket path inside the instance runtime dir.
 pub fn public_socket_path(cfg: &Config) -> String {
     format!(
         "{}/{}",
@@ -127,7 +126,6 @@ pub fn public_socket_path(cfg: &Config) -> String {
     )
 }
 
-/// The bus address, defaulting to the session bus in the environment.
 pub fn bus_address(cfg: &Config) -> String {
     if cfg.bus_address.is_empty() {
         std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_| {
@@ -167,7 +165,6 @@ fn signal_mask() -> SigSet {
     mask
 }
 
-/// Block the mask on the calling thread and create the signalfd.
 fn setup_signalfd() -> Result<SignalFd> {
     let mask = signal_mask();
     mask.thread_block().map_err(io::Error::other)?;
