@@ -65,7 +65,6 @@ pub fn instance_category(app_id: &str, instance_id: &str) -> u32 {
     h as u32 % NUM_CATEGORIES
 }
 
-/// Parse `/proc/self/attr/current` into (user, role, type, range).
 fn current_label() -> Option<(String, String, String, String)> {
     let s = std::fs::read_to_string("/proc/self/attr/current").ok()?;
     parse_label(&s)

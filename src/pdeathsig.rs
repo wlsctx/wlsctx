@@ -86,8 +86,6 @@
 
 use std::path::PathBuf;
 
-/// The C source of the pdeathsig-restore shim for `sig` (numeric
-/// signal number).
 pub(crate) fn shim_src(sig: i32) -> String {
     format!(
         r#"
@@ -231,8 +229,6 @@ fn shim_context() -> Option<String> {
     Some(format!("{user}:object_r:wlsctx_shim_t:s0"))
 }
 
-/// Read the file's current SELinux label (the `security.selinux`
-/// xattr), or `None` (SELinux off or the xattr absent).
 fn current_label(so: &std::path::Path) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
     // A `CString`: the kernel reads the path as a NUL-terminated

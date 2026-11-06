@@ -60,8 +60,8 @@ use log::info;
 /// host journal. Tests use a capturing sink to assert on the
 /// rendered lines.
 pub trait AuditSink: Send + Sync {
-    /// Emit one record. `app` and `instance` are the relay's audit
-    /// identity (the security-context values it was started with).
+    /// `app` and `instance` are the relay's audit identity (the
+    /// security-context values it was started with).
     fn audit(&self, app: &str, instance: &str, record: &AuditRecord);
 }
 
@@ -101,8 +101,6 @@ impl Default for AuditConfig {
 }
 
 impl AuditConfig {
-    /// The production config: records go to the `audit` log target
-    /// (the host journal in deployment).
     pub fn new(app: String, instance: String) -> Self {
         Self {
             app,
@@ -120,7 +118,6 @@ impl AuditConfig {
         }
     }
 
-    /// Emit one record through the configured sink.
     pub fn audit(&self, record: &AuditRecord) {
         self.sink.audit(&self.app, &self.instance, record);
     }

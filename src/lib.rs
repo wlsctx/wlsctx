@@ -14,8 +14,9 @@
 //!   answers the relay's `clipboard-read` prompts and fires the
 //!   `clipboard-write` notifications.
 //! * [`mcs`] — per-instance MCS categories (phase 8.2): each app
-//!   instance runs in its own SELinux category so its files are
-//!   unreachable from other instances (confined mode only).
+//!   instance runs in its own SELinux category, so its processes are
+//!   unreachable from other instances (confined mode only; object
+//!   separation is the namespaced rootfs's job).
 
 pub mod broker;
 pub mod dbus_proxy;
