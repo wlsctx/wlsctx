@@ -167,7 +167,6 @@ pub fn sandbox_instance_dir(app_id: &str, instance_id: &str) -> String {
     )
 }
 
-/// The X socket path inside the instance runtime dir.
 pub fn listen_socket_path(cfg: &Config) -> String {
     format!(
         "{}/{}",
@@ -176,7 +175,6 @@ pub fn listen_socket_path(cfg: &Config) -> String {
     )
 }
 
-/// The auth file path inside the instance runtime dir.
 pub fn auth_path(cfg: &Config) -> String {
     format!(
         "{}/{}",
@@ -185,7 +183,6 @@ pub fn auth_path(cfg: &Config) -> String {
     )
 }
 
-/// The Wayland display to connect to, defaulting to the environment.
 pub fn wayland_display(cfg: &Config) -> Result<String> {
     if !cfg.wayland_display.is_empty() {
         return Ok(cfg.wayland_display.clone());
@@ -234,7 +231,6 @@ fn signal_mask() -> SigSet {
     mask
 }
 
-/// Block the mask on the calling thread and create the signalfd.
 fn setup_signalfd() -> Result<SignalFd> {
     let mask = signal_mask();
     mask.thread_block().map_err(io::Error::other)?;
@@ -328,7 +324,6 @@ fn create_listen_socket(path: &str) -> Result<OwnedFd> {
     Ok(fd)
 }
 
-/// `socket(2)`, `AF_UNIX`/`SOCK_STREAM`/`SOCK_CLOEXEC`.
 fn socket_cloexec() -> Result<OwnedFd> {
     // SAFETY: socket(2) with valid family/type/protocol; returns a
     // new fd or -1.
