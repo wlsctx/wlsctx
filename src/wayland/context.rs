@@ -84,8 +84,6 @@ pub fn create_security_context(
     app_id: &str,
     instance_id: &str,
 ) -> Result<OwnedFd> {
-    // Create a Wayland connection by connecting to the server through the
-    // environment-provided configuration.
     let conn = Connection::connect_to_env().context(
         "connecting to the upstream Wayland compositor failed (NoCompositor); \
          check that WAYLAND_DISPLAY/WAYLAND_SOCKET reach the host compositor",
