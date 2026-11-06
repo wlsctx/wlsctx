@@ -26,7 +26,6 @@ pub struct Cli {
     pub(crate) command: Command,
 }
 
-/// The subcommands.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Run a command inside the wlsctx sandbox
@@ -127,7 +126,6 @@ impl Cli {
     }
 }
 
-/// Arguments of `wlsctx run`.
 #[derive(Args, Debug)]
 pub(crate) struct RunArgs {
     /// Application ID: part of the instance hostname
@@ -273,7 +271,6 @@ pub(crate) struct WaylandArgs {
     pub(crate) notify_copy_out: bool,
 }
 
-/// Arguments of `wlsctx broker`.
 #[derive(Args, Debug)]
 pub(crate) struct BrokerArgs {
     /// Listen on Unix socket (required unless --socket-activation is
@@ -445,7 +442,6 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    /// Parse in `wayland` subcommand form and extract the args.
     fn parse_wayland(argv: &[&str]) -> Result<WaylandArgs, clap::Error> {
         let cli = Cli::try_parse_from(argv)?;
         Ok(match cli.command {
@@ -454,7 +450,6 @@ mod tests {
         })
     }
 
-    /// Parse in `broker` subcommand form and extract the args.
     fn parse_broker(argv: &[&str]) -> Result<BrokerArgs, clap::Error> {
         let cli = Cli::try_parse_from(argv)?;
         Ok(match cli.command {
@@ -463,7 +458,6 @@ mod tests {
         })
     }
 
-    /// Parse in `decide` subcommand form and extract the args.
     fn parse_decide(argv: &[&str]) -> Result<DecideArgs, clap::Error> {
         let cli = Cli::try_parse_from(argv)?;
         Ok(match cli.command {
