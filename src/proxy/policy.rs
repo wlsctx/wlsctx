@@ -22,7 +22,6 @@
 use std::collections::HashSet;
 use std::fmt;
 
-/// A global-allowlist policy.
 #[derive(Clone)]
 pub struct Policy {
     /// `None`: allow everything (the pass-through default).
@@ -50,12 +49,10 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// The pass-through default: every interface is shown to clients.
     pub fn all() -> Self {
         Self { allowlist: None }
     }
 
-    /// A policy that shows only the given interface names.
     pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
         Self {
             allowlist: Some(HashSet::from_iter(names)),
@@ -72,7 +69,6 @@ impl Policy {
         )
     }
 
-    /// Whether the policy is active (i.e. actually filtering).
     pub fn is_active(&self) -> bool {
         self.allowlist.is_some()
     }

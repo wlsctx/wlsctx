@@ -16,9 +16,6 @@ use anyhow::{Context, Result};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 
-/// The tagged Wayland socket of a `run` pipeline (Phase 5.1): created
-/// by S before the first fork, held by S for as long as the app
-/// lives, untagged when S exits.
 pub(crate) struct TaggedWayland {
     /// The path the listener is bound at (host-side).
     pub host_path: String,

@@ -79,8 +79,6 @@ impl Profile {
     }
 }
 
-/// The built-in defaults for the known apps, used when no TOML file
-/// exists.
 pub(crate) fn builtin(app_id: &str) -> Option<Profile> {
     let mut p = Profile::default();
     match app_id {

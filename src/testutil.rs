@@ -84,8 +84,6 @@ pub fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
 /// ones in `Drop` (which also runs when the protected closure
 /// panics). Must only be used while holding `ENV_LOCK`.
 pub struct EnvGuard<'a> {
-    /// (name, previous value) pairs to restore on drop, in the
-    /// original order.
     restore: Vec<(&'a str, Option<String>)>,
 }
 

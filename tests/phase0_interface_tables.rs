@@ -94,8 +94,6 @@ fn a1_signature_table_is_usable() {
 
 #[test]
 fn a2_registry_bind_expansion() {
-    // The untyped `new_id` of wl_registry.bind expands on the wire to
-    // (name: uint, interface: str, version: uint, id: new_id).
     let bind = &WL_REGISTRY_INTERFACE.requests[0];
     assert_eq!(bind.name, "bind");
     assert_eq!(
