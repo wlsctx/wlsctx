@@ -39,7 +39,6 @@ use crate::broker::{
     encode_notification, encode_request,
 };
 
-/// The broker the relay consults about dropped foreign reads.
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
     /// The broker's listening socket (the relay connects to it per

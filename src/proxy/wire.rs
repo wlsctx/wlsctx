@@ -26,10 +26,8 @@ use std::os::fd::OwnedFd;
 
 use wayland_backend::protocol::{Argument, ArgumentType, Message};
 
-/// Size of the message header: `sender_id` + `(len << 16) | opcode`.
 pub const HEADER_SIZE: usize = 2 * 4;
 
-/// Error produced while inspecting or serializing Wayland wire data.
 #[derive(Debug)]
 pub enum Error {
     /// The stream does not contain a complete message yet.
@@ -79,7 +77,6 @@ pub fn parse_message<'a>(
     signature: &[ArgumentType],
     fds: &mut VecDeque<OwnedFd>,
 ) -> Result<(Message<u32, OwnedFd>, &'a [u8]), Error> {
-    // Helper function to read arrays
     fn read_array_from_payload(array_len: usize, payload: &[u8]) -> Result<(&[u8], &[u8]), Error> {
         let len = next_multiple_of(array_len, 4);
         if len > payload.len() {
@@ -176,7 +173,6 @@ pub fn write_message(
 ) -> Result<usize, Error> {
     let orig_payload_len = payload.len();
 
-    // Helper function to write a u32 to its buffer
     fn write_buf(u: u32, payload: &mut [u8]) -> Result<&mut [u8], Error> {
         if payload.len() >= 4 {
             let (head, tail) = payload.split_at_mut(4);
@@ -187,7 +183,6 @@ pub fn write_message(
         }
     }
 
-    // Helper function to write byte arrays in payload
     fn write_array_to_payload<'a>(
         array: &[u8],
         payload: &'a mut [u8],
@@ -195,7 +190,6 @@ pub fn write_message(
         // size header
         let payload = write_buf(array.len() as u32, payload)?;
 
-        // Handle padding
         let len = next_multiple_of(array.len(), 4);
 
         if payload.len() < len {
