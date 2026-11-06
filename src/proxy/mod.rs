@@ -228,9 +228,6 @@ impl ProxySocket {
         sendmsg(self.fd.as_fd(), &iov, &mut cmsg_buffer, flags).map_err(Into::into)
     }
 
-    /// Read up to one chunk of the stream into `buf`, delivering any
-    /// out-of-band fds (SCM_RIGHTS) to `fds`, in the order they arrive.
-    ///
     /// Returns 0 on clean EOF.
     fn recv(&self, buf: &mut [u8], fds: &mut VecDeque<OwnedFd>) -> io::Result<usize> {
         let flags = RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC;
@@ -280,7 +277,6 @@ pub enum RelayEnd {
     /// The peer closed the connection cleanly (the app quit, or the
     /// compositor closed the tagged connection).
     Eof,
-    /// An I/O error on either end.
     Io(io::Error),
     /// A protocol violation (parse/bookkeeping failure, partial send).
     Protocol(String),
@@ -290,7 +286,7 @@ pub enum RelayEnd {
 /// one parsed message.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ForwardAction {
-    /// Relay the original bytes to the peer (the default).
+    /// The default action.
     Forward,
     /// Consume the message silently (a hidden global, or the matching
     /// `global_remove` of one); the client never sees it.
@@ -343,18 +339,15 @@ const PROBE_STABLE: u32 = 2;
 /// a probe is resolved at once, without a size), and a writer that
 /// never writes leaves 0 (the record says so).
 struct SizeProbe {
-    /// The retained duplicate (closed when the probe resolves).
     fd: OwnedFd,
     /// Whether the size is measurable at all (a memfd: yes).
     measurable: bool,
     /// The audit fields captured at the decision point; the
     /// `payload_bytes` is filled in as the probe settles.
     record: AuditRecord,
-    /// The last measured size.
     last_size: u64,
     /// Consecutive measurements at the current non-zero size.
     stable: u32,
-    /// Resolve by this instant at the latest (whatever was measured).
     deadline: Instant,
 }
 
@@ -572,8 +565,6 @@ impl Relay {
         self.probes.clear();
     }
 
-    /// Read one chunk from the given direction and relay every complete
-    /// message it yields to the other side.
     fn pump(&mut self, dir: Dir) -> Result<(), RelayEnd> {
         let (sock, reassembled, fds) = match dir {
             Dir::ClientToServer => (&self.down, &mut self.down_buf, &mut self.down_fds),
@@ -1090,7 +1081,6 @@ impl Relay {
             return Ok(());
         }
 
-        // Forward the original bytes with the fds the parse consumed.
         let mut out_fds = Vec::with_capacity(msg.args.len());
         for a in &msg.args {
             if let Argument::Fd(f) = a {
@@ -1313,7 +1303,6 @@ pub fn event_loop(
                 }
             }
         }
-        // Test hook: the stop flag is checked on every 200 ms tick.
         let stopped = stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst));
         if stopped {
             return Ok(LoopEnd::Stopped);
@@ -1366,7 +1355,6 @@ pub enum SignalAction {
     ReExec,
 }
 
-/// Why a loop returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopEnd {
     /// Asked to stop: SIGTERM/SIGINT, or the test stop flag.
@@ -1440,7 +1428,6 @@ pub fn interpret_signal(signal: Signal) -> SignalAction {
     }
 }
 
-/// Read one signal from the signalfd and interpret it.
 fn handle_signal(sigfd: &SignalFd) -> io::Result<SignalAction> {
     let siginfo = sigfd
         .read_signal()
