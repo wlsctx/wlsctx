@@ -71,7 +71,6 @@ use log::{debug, info, warn};
 
 use zbus::{Array, Connection, OwnedVariant, Proxy, Variant};
 
-/// The outcome of the scope-attachment attempt.
 #[derive(Debug)]
 pub(crate) enum ScopeTier {
     /// The supervisor now lives in this transient scope unit.
@@ -166,7 +165,6 @@ type ManagerArgs = (
 /// writing properties (a stop in progress may clear the stored
 /// `PIDs`).
 const STOP_SETTLE: Duration = Duration::from_millis(200);
-/// How long to wait for the pid move to land after starting.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(3);
 const MOVE_POLL: Duration = Duration::from_millis(5);
 
