@@ -166,7 +166,6 @@ pub(crate) fn full_cgroup_path() -> Result<String> {
     let contents =
         std::fs::read_to_string("/proc/self/cgroup").context("reading /proc/self/cgroup")?;
     for line in contents.lines() {
-        // cgroup v2: "0::<path>"
         let Some(hierarchies) = line.strip_prefix("0::") else {
             continue;
         };
