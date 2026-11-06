@@ -47,12 +47,8 @@ use anyhow::{Context, Result, bail};
 
 /// The real (host) credentials to map into the user namespace.
 pub(crate) struct Credentials {
-    /// The real uid; also the in-ns uid (the map is one extent).
     pub uid: u32,
-    /// The real gid; also the in-ns gid (the map is one extent).
     pub gid: u32,
-    // (A subuid range for file ownership would need a second map
-    // extent and a setuid helper; deferred — decision #10.)
 }
 
 impl Credentials {
@@ -138,7 +134,6 @@ pub(crate) fn verify_locked(creds: &Credentials) -> Result<()> {
     Ok(())
 }
 
-/// Verify the ruid/euid/suid (and gid) triple.
 fn check_resids(creds: &Credentials) -> Result<()> {
     let mut ruid: u32 = 0;
     let mut euid: u32 = 0;
@@ -167,7 +162,6 @@ fn check_resids(creds: &Credentials) -> Result<()> {
     Ok(())
 }
 
-/// The process's effective capability set (from /proc/self/status).
 fn cap_eff() -> Result<u64> {
     let status =
         std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
@@ -268,7 +262,6 @@ pub(crate) mod tests {
     }
 
     impl ChildOut {
-        /// A writer for the child's *stderr* pipe (diagnostics).
         pub(crate) fn err(&mut self) -> ErrWriter<'_> {
             ErrWriter {
                 fd: self.err_fd,
@@ -277,7 +270,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// An unbuffered writer to the child's stderr pipe.
     pub(crate) struct ErrWriter<'a> {
         fd: i32,
         _marker: std::marker::PhantomData<&'a ()>,
@@ -399,7 +391,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Fetch the credentials or abort the test.
     pub(crate) fn creds() -> Result<Credentials> {
         Credentials::current()
     }
@@ -449,7 +440,6 @@ pub(crate) mod tests {
         };
 
         let (code, out, err) = run_in_child(move |o| {
-            // 1. Enter: unshare + setgroups + the single map write.
             let rc = enter_or_classify(o, &creds);
             if rc != 0 {
                 return rc;
@@ -483,8 +473,6 @@ pub(crate) mod tests {
                 return 4;
             }
 
-            // The creator holds the full ns capability set, and the
-            // design relies on it (it is never cleared on this path).
             match cap_eff() {
                 Err(e) => {
                     let _ = writeln!(o, "FAIL reading CapEff: {e:#}");
@@ -507,14 +495,11 @@ pub(crate) mod tests {
                 Ok(_) => {}
             }
 
-            // 2. Verify the lock (identity is the real uid by
-            //    construction; 0 is unmapped and unreachable).
             if let Err(e) = verify_locked(&creds) {
                 let _ = writeln!(o, "SETUP-FAIL verify_locked: {e:#}");
                 return 6;
             }
 
-            // 3. The result.
             let _ = writeln!(
                 o,
                 "OK: uid locked at {} / gid {} (0 unmapped, setresuid(0) EINVAL, ns cap set retained for phase 3/4)",
